@@ -1,0 +1,4 @@
+/noderati
+/cmd/noderati/noderati
+*.exe
+.DS_Store

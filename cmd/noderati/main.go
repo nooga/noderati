@@ -1,0 +1,167 @@
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/nooga/noderati/internal/host"
+	"github.com/nooga/paserati/pkg/driver"
+	"github.com/nooga/paserati/pkg/errors"
+	"github.com/nooga/paserati/pkg/vm"
+)
+
+func main() {
+	eval := flag.String("e", "", "evaluate script")
+	printEval := flag.String("p", "", "evaluate script and print the result")
+	flag.Parse()
+
+	execPath, err := os.Executable()
+	if err != nil {
+		execPath = os.Args[0]
+	}
+
+	switch {
+	case *printEval != "":
+		os.Exit(runEval(execPath, *printEval, true, flag.Args()))
+	case *eval != "":
+		os.Exit(runEval(execPath, *eval, false, flag.Args()))
+	case flag.NArg() >= 1:
+		os.Exit(runFile(execPath, flag.Arg(0), flag.Args()[1:]))
+	default:
+		os.Exit(runREPL(execPath))
+	}
+}
+
+func newHost(argv []string) *driver.Paserati {
+	return host.New(argv)
+}
+
+func runEval(execPath, source string, print bool, rest []string) int {
+	argv := append([]string{execPath, "-e"}, rest...)
+	if print {
+		argv[1] = "-p"
+	}
+	p := newHost(argv)
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(source, driver.RunOptions{Filename: "[eval]", Script: false, ModuleName: "[eval]"})
+	if len(errs) > 0 {
+		errors.DisplayErrors(errs, source)
+		return 1
+	}
+	if print && val != vm.Undefined {
+		fmt.Println(val.Inspect())
+	}
+	return 0
+}
+
+func runFile(execPath, filename string, extra []string) int {
+	abs, err := filepath.Abs(filename)
+	if err != nil {
+		abs = filename
+	}
+	srcBytes, err := os.ReadFile(filename)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "noderati: %s\n", err)
+		return 1
+	}
+	source := string(srcBytes)
+
+	argv := append([]string{execPath, abs}, extra...)
+	p := newHost(argv)
+	ext := strings.ToLower(filepath.Ext(filename))
+	if ext == ".js" || ext == ".cjs" || ext == ".mjs" {
+		p.SetSkipTypeCheck(true)
+	}
+
+	var val vm.Value
+	var errs []errors.PaseratiError
+	if ext == ".cjs" || (ext == ".js" && !looksLikeESM(source)) {
+		val, errs = runAsCJS(p, source, abs)
+	} else {
+		val, errs = p.RunCode(source, driver.RunOptions{ModuleName: abs})
+	}
+	_ = val
+	if len(errs) > 0 {
+		errors.DisplayErrors(errs, source)
+		return 1
+	}
+	return 0
+}
+
+func looksLikeESM(source string) bool {
+	for _, line := range strings.Split(source, "\n") {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "import ") || strings.HasPrefix(trim, "export ") {
+			return true
+		}
+	}
+	return false
+}
+
+func runAsCJS(p *driver.Paserati, source, filename string) (vm.Value, []errors.PaseratiError) {
+	wrapped := "(function (exports, require, module, __filename, __dirname) {\n" + source + "\n})"
+	fn, errs := p.RunScript(wrapped, filename)
+	if len(errs) > 0 {
+		return vm.Undefined, errs
+	}
+	vmInst := p.GetVM()
+	exportsVal := vm.NewObject(vmInst.ObjectPrototype)
+	moduleVal := vm.NewObject(vmInst.ObjectPrototype)
+	moduleVal.AsPlainObject().SetOwn("exports", exportsVal)
+	requireFn := vm.NewNativeFunction(1, false, "require", func(args []vm.Value) (vm.Value, error) {
+		spec := ""
+		if len(args) > 0 {
+			spec = args[0].ToString()
+		}
+		return vm.Undefined, fmt.Errorf("Cannot find module '%s'", spec)
+	})
+	_, err := vmInst.Call(fn, vm.Undefined, []vm.Value{
+		exportsVal,
+		requireFn,
+		moduleVal,
+		vm.String(filename),
+		vm.String(filepath.Dir(filename)),
+	})
+	if err != nil {
+		return vm.Undefined, []errors.PaseratiError{&errors.RuntimeError{
+			Msg: err.Error(),
+		}}
+	}
+	exp, _ := moduleVal.AsPlainObject().GetOwn("exports")
+	return exp, nil
+}
+
+func runREPL(execPath string) int {
+	p := newHost([]string{execPath})
+	p.SetSkipTypeCheck(true)
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Println("noderati (Ctrl+D to exit)")
+	for {
+		fmt.Print("> ")
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				fmt.Println()
+				return 0
+			}
+			fmt.Fprintf(os.Stderr, "noderati: %s\n", err)
+			return 1
+		}
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		val, errs := p.RunCode(line, driver.RunOptions{})
+		if len(errs) > 0 {
+			errors.DisplayErrors(errs, line)
+			continue
+		}
+		if val != vm.Undefined {
+			fmt.Println(val.Inspect())
+		}
+	}
+}
