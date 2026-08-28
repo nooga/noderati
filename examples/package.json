@@ -1,0 +1,9 @@
+{
+  "name": "noderati-examples",
+  "private": true,
+  "type": "module",
+  "description": "Demo scripts for noderati",
+  "dependencies": {
+    "escape-string-regexp": "^5.0.0"
+  }
+}

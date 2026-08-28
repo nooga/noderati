@@ -2,3 +2,4 @@
 /cmd/noderati/noderati
 *.exe
 .DS_Store
+node_modules/

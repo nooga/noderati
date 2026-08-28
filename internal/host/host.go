@@ -1,6 +1,8 @@
 package host
 
 import (
+	"path/filepath"
+
 	"github.com/nooga/paserati/pkg/builtins"
 	"github.com/nooga/paserati/pkg/driver"
 )
@@ -13,11 +15,31 @@ func New(argv []string) *driver.Paserati {
 	)
 	p := driver.NewPaseratiWithInitializers(inits)
 	installModules(p)
+	p.AddResolver(NewNodeModulesResolver(entryScriptDirs(argv)...))
 	return p
+}
+
+func entryScriptDirs(argv []string) []string {
+	if len(argv) < 2 {
+		return nil
+	}
+	script := argv[1]
+	if script == "-e" || script == "-p" {
+		return nil
+	}
+	abs, err := filepath.Abs(script)
+	if err != nil {
+		return nil
+	}
+	return []string{filepath.Dir(abs)}
 }
 
 func installModules(p *driver.Paserati) {
 	declarePath(p)
 	declareOS(p)
 	declareUtil(p)
+	declareFS(p)
+	declareURL(p)
+	declareQuerystring(p)
+	declareAssert(p)
 }

@@ -73,10 +73,9 @@ func runFile(execPath, filename string, extra []string) int {
 
 	argv := append([]string{execPath, abs}, extra...)
 	p := newHost(argv)
+	// Native builtins (variadic Go funcs) and npm JS are not fully typed yet.
+	p.SetSkipTypeCheck(true)
 	ext := strings.ToLower(filepath.Ext(filename))
-	if ext == ".js" || ext == ".cjs" || ext == ".mjs" {
-		p.SetSkipTypeCheck(true)
-	}
 
 	var val vm.Value
 	var errs []errors.PaseratiError
