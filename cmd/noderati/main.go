@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +18,12 @@ import (
 )
 
 func main() {
+	if addr := os.Getenv("NODERATI_PPROF"); addr != "" {
+		go func() {
+			_ = http.ListenAndServe(addr, nil)
+		}()
+	}
+
 	eval := flag.String("e", "", "evaluate script")
 	printEval := flag.String("p", "", "evaluate script and print the result")
 	flag.Parse()
@@ -69,7 +77,7 @@ func runFile(execPath, filename string, extra []string) int {
 		fmt.Fprintf(os.Stderr, "noderati: %s\n", err)
 		return 1
 	}
-	source := string(srcBytes)
+	source := host.StripShebang(string(srcBytes))
 
 	argv := append([]string{execPath, abs}, extra...)
 	p := newHost(argv)
@@ -79,10 +87,10 @@ func runFile(execPath, filename string, extra []string) int {
 
 	var val vm.Value
 	var errs []errors.PaseratiError
-	if ext == ".cjs" || (ext == ".js" && !looksLikeESM(source)) {
-		val, errs = runAsCJS(p, source, abs)
-	} else {
+	if ext == ".ts" || ext == ".mts" || looksLikeESM(source) {
 		val, errs = p.RunCode(source, driver.RunOptions{ModuleName: abs})
+	} else {
+		val, errs = host.RunCJS(p, source, abs)
 	}
 	_ = val
 	if len(errs) > 0 {
@@ -100,39 +108,6 @@ func looksLikeESM(source string) bool {
 		}
 	}
 	return false
-}
-
-func runAsCJS(p *driver.Paserati, source, filename string) (vm.Value, []errors.PaseratiError) {
-	wrapped := "(function (exports, require, module, __filename, __dirname) {\n" + source + "\n})"
-	fn, errs := p.RunScript(wrapped, filename)
-	if len(errs) > 0 {
-		return vm.Undefined, errs
-	}
-	vmInst := p.GetVM()
-	exportsVal := vm.NewObject(vmInst.ObjectPrototype)
-	moduleVal := vm.NewObject(vmInst.ObjectPrototype)
-	moduleVal.AsPlainObject().SetOwn("exports", exportsVal)
-	requireFn := vm.NewNativeFunction(1, false, "require", func(args []vm.Value) (vm.Value, error) {
-		spec := ""
-		if len(args) > 0 {
-			spec = args[0].ToString()
-		}
-		return vm.Undefined, fmt.Errorf("Cannot find module '%s'", spec)
-	})
-	_, err := vmInst.Call(fn, vm.Undefined, []vm.Value{
-		exportsVal,
-		requireFn,
-		moduleVal,
-		vm.String(filename),
-		vm.String(filepath.Dir(filename)),
-	})
-	if err != nil {
-		return vm.Undefined, []errors.PaseratiError{&errors.RuntimeError{
-			Msg: err.Error(),
-		}}
-	}
-	exp, _ := moduleVal.AsPlainObject().GetOwn("exports")
-	return exp, nil
 }
 
 func runREPL(execPath string) int {

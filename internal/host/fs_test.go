@@ -121,7 +121,7 @@ func TestFSStatSync(t *testing.T) {
 	js := `
 		import { statSync } from "fs";
 		const s = statSync("` + file + `");
-		s.size === 4 && s.isFile && !s.isDirectory
+		s.size === 4 && s.isFile() && !s.isDirectory()
 	`
 	val, errs := p.RunCode(js, driver.RunOptions{})
 	if len(errs) > 0 {
@@ -186,5 +186,27 @@ func TestFSUnlinkRmdir(t *testing.T) {
 	}
 	if !val.IsBoolean() || !val.AsBoolean() {
 		t.Errorf("unlink/rmdir = %v", val)
+	}
+}
+
+func TestFSAccessSyncAndConstants(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "ok.txt")
+	if err := os.WriteFile(file, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := newWithFS()
+	js := `
+		import { accessSync, constants, existsSync } from "fs";
+		accessSync("` + file + `", constants.F_OK);
+		existsSync("` + file + `")
+	`
+	val, errs := p.RunCode(js, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if !val.IsBoolean() || !val.AsBoolean() {
+		t.Errorf("accessSync = %v", val)
 	}
 }

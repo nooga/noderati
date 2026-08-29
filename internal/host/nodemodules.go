@@ -1,10 +1,13 @@
 package host
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/nooga/paserati/pkg/modules"
@@ -79,7 +82,7 @@ func (r *NodeModulesResolver) Resolve(specifier string, fromPath string) (*modul
 		return nil, fmt.Errorf("failed to absolutize %q: %w", entryPath, err)
 	}
 
-	source, err := os.Open(absPath)
+	source, err := openMaybeCJS(absPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %q: %w", absPath, err)
 	}
@@ -307,4 +310,51 @@ func tryExistingFile(pkgDir, subpath string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func openMaybeCJS(absPath string) (io.ReadCloser, error) {
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, err
+	}
+	src := StripShebang(string(data))
+	if shouldWrapCJS(absPath, src) {
+		return io.NopCloser(strings.NewReader(cjsESMWrapper(absPath))), nil
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func shouldWrapCJS(absPath, source string) bool {
+	ext := strings.ToLower(filepath.Ext(absPath))
+	switch ext {
+	case ".mjs", ".ts", ".mts", ".json":
+		return false
+	case ".cjs":
+		return true
+	}
+	if looksLikeESMSource(source) {
+		return false
+	}
+	return looksLikeCJSSource(source) || ext == ".js"
+}
+
+func looksLikeESMSource(source string) bool {
+	for _, line := range strings.Split(source, "\n") {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "import ") || strings.HasPrefix(trim, "export ") {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeCJSSource(source string) bool {
+	return strings.Contains(source, "module.exports") ||
+		strings.Contains(source, "exports.") ||
+		strings.Contains(source, "require(")
+}
+
+func cjsESMWrapper(absPath string) string {
+	return "const __cjs = process.__noderatiCJSRequire(" + strconv.Quote(absPath) + ");\n" +
+		"export default __cjs;\n"
 }

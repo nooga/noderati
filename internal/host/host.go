@@ -1,6 +1,8 @@
 package host
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
 
 	"github.com/nooga/paserati/pkg/builtins"
@@ -15,7 +17,11 @@ func New(argv []string) *driver.Paserati {
 	)
 	p := driver.NewPaseratiWithInitializers(inits)
 	installModules(p)
+	if err := p.PreloadAllNativeModules(); err != nil {
+		fmt.Fprintf(os.Stderr, "noderati: preload native modules: %v\n", err)
+	}
 	p.AddResolver(NewNodeModulesResolver(entryScriptDirs(argv)...))
+	p.AddResolver(NewOSPathResolver())
 	return p
 }
 
@@ -42,4 +48,6 @@ func installModules(p *driver.Paserati) {
 	declareURL(p)
 	declareQuerystring(p)
 	declareAssert(p)
+	declareChildProcess(p)
+	declareCJSInterop(p)
 }

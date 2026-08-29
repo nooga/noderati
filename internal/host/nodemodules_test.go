@@ -190,3 +190,30 @@ func TestNodeModulesResolverResolveSubpath(t *testing.T) {
 		t.Errorf("subpath result = %q, want %q", val.ToString(), "ok")
 	}
 }
+
+func TestNodeModulesCJSDefaultImport(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "node_modules", "cjs-pkg", "package.json"), `{
+		"name": "cjs-pkg",
+		"main": "index.js"
+	}`)
+	writeFile(t, filepath.Join(root, "node_modules", "cjs-pkg", "index.js"), `
+		module.exports = function greet(name) { return "hello " + name; };
+	`)
+	appPath := filepath.Join(root, "app.js")
+	writeFile(t, appPath, `import greet from "cjs-pkg"; greet("world")`)
+
+	p := New([]string{"noderati", appPath})
+	p.SetSkipTypeCheck(true)
+	source, err := os.ReadFile(appPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	val, errs := p.RunCode(string(source), driver.RunOptions{ModuleName: appPath, Filename: appPath})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "hello world" {
+		t.Errorf("cjs default import = %q, want %q", val.ToString(), "hello world")
+	}
+}

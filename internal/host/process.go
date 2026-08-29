@@ -8,6 +8,7 @@ import (
 	"github.com/nooga/paserati/pkg/builtins"
 	"github.com/nooga/paserati/pkg/types"
 	"github.com/nooga/paserati/pkg/vm"
+	"golang.org/x/term"
 )
 
 // ProcessInitializer is noderati’s process global. Do not grow Paserati’s stub.
@@ -34,8 +35,12 @@ func (p *ProcessInitializer) InitTypes(ctx *builtins.TypeContext) error {
 		WithProperty("execPath", types.String).
 		WithProperty("execArgv", &types.ArrayType{ElementType: types.String}).
 		WithProperty("cwd", types.NewSimpleFunction([]types.Type{}, types.String)).
+		WithProperty("nextTick", types.NewSimpleFunction([]types.Type{types.Any}, types.Undefined)).
 		WithProperty("exit", types.NewSimpleFunction([]types.Type{types.Number}, types.Undefined))
-	return ctx.DefineGlobal("process", processType)
+	if err := ctx.DefineGlobal("process", processType); err != nil {
+		return err
+	}
+	return ctx.DefineGlobal("global", types.Any)
 }
 
 func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
@@ -69,6 +74,11 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		}
 		return vm.True, nil
 	}))
+	cols, tty := stdoutColumnsAndTTY()
+	stdoutObj.SetOwn("isTTY", tty)
+	if cols != vm.Undefined {
+		stdoutObj.SetOwn("columns", cols)
+	}
 
 	stderrObj := vm.NewObject(vmInstance.ObjectPrototype).AsPlainObject()
 	stderrObj.SetOwn("write", vm.NewNativeFunction(1, false, "write", func(args []vm.Value) (vm.Value, error) {
@@ -90,12 +100,28 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 	processObj.SetOwn("env", vm.NewValueFromPlainObject(envObj))
 	processObj.SetOwn("stdout", vm.NewValueFromPlainObject(stdoutObj))
 	processObj.SetOwn("stderr", vm.NewValueFromPlainObject(stderrObj))
+	processObj.SetOwn("title", vm.NewString("noderati"))
+	processObj.SetOwn("emitWarning", vm.NewNativeFunction(1, false, "emitWarning", func(args []vm.Value) (vm.Value, error) {
+		return vm.Undefined, nil
+	}))
 	processObj.SetOwn("cwd", vm.NewNativeFunction(0, false, "cwd", func(args []vm.Value) (vm.Value, error) {
 		cwd, err := os.Getwd()
 		if err != nil {
 			return vm.NewString(""), nil
 		}
 		return vm.NewString(cwd), nil
+	}))
+	rt := vmInstance.GetAsyncRuntime()
+	processObj.SetOwn("nextTick", vm.NewNativeFunction(1, true, "nextTick", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 || !args[0].IsCallable() {
+			return vm.Undefined, nil
+		}
+		fn := args[0]
+		fnArgs := args[1:]
+		rt.ScheduleNextTick(func() {
+			_, _ = vmInstance.Call(fn, vm.Undefined, fnArgs)
+		})
+		return vm.Undefined, nil
 	}))
 	processObj.SetOwn("exit", vm.NewNativeFunction(1, false, "exit", func(args []vm.Value) (vm.Value, error) {
 		code := 0
@@ -106,5 +132,20 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		return vm.Undefined, nil
 	}))
 
-	return ctx.DefineGlobal("process", vm.NewValueFromPlainObject(processObj))
+	if err := ctx.DefineGlobal("process", vm.NewValueFromPlainObject(processObj)); err != nil {
+		return err
+	}
+	return ctx.DefineGlobal("global", vm.NewValueFromPlainObject(vmInstance.GlobalObject))
+}
+
+func stdoutColumnsAndTTY() (columns vm.Value, isTTY vm.Value) {
+	fd := int(os.Stdout.Fd())
+	if !term.IsTerminal(fd) {
+		return vm.Undefined, vm.False
+	}
+	w, _, err := term.GetSize(fd)
+	if err != nil || w <= 0 {
+		return vm.NumberValue(80), vm.True
+	}
+	return vm.NumberValue(float64(w)), vm.True
 }

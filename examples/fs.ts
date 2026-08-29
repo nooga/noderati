@@ -22,7 +22,7 @@ console.log("read:", readFileSync(file));
 console.log("exists:", existsSync(file));
 
 const st = statSync(file);
-console.log("stat size:", st.size, "isFile:", st.isFile, "isDirectory:", st.isDirectory);
+console.log("stat size:", st.size, "isFile:", st.isFile(), "isDirectory:", st.isDirectory());
 console.log("readdir:", readdirSync(dir).join(","));
 
 unlinkSync(file);
