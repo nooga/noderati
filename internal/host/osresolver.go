@@ -2,6 +2,7 @@ package host
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,14 +42,15 @@ func (r *OSPathResolver) Resolve(specifier string, fromPath string) (*modules.Re
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve %s: %w", specifier, err)
 	}
-	f, err := os.Open(resolved)
+	data, err := os.ReadFile(resolved)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s: %w", resolved, err)
 	}
+	src := patchModuleSource(StripShebang(string(data)), resolved)
 	return &modules.ResolvedModule{
 		Specifier:    specifier,
 		ResolvedPath: resolved,
-		Source:       f,
+		Source:       io.NopCloser(strings.NewReader(src)),
 		Resolver:     r.Name(),
 	}, nil
 }

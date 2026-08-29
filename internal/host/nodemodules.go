@@ -1,12 +1,12 @@
 package host
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -99,6 +99,7 @@ type packageJSON struct {
 	Main    string          `json:"main"`
 	Module  string          `json:"module"`
 	Exports json.RawMessage `json:"exports"`
+	Imports json.RawMessage `json:"imports"`
 }
 
 func resolverStartDir(fromPath string) (string, error) {
@@ -253,14 +254,22 @@ func resolveExportTarget(raw json.RawMessage) (string, bool, error) {
 		return asString, true, nil
 	}
 
-	var asMap map[string]string
+	var asMap map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &asMap); err != nil {
 		return "", false, fmt.Errorf("unsupported export target format")
 	}
 
-	for _, candidate := range []string{"import", "default", "require"} {
-		if entry, ok := asMap[candidate]; ok && entry != "" {
-			return entry, true, nil
+	for _, candidate := range []string{"node", "import", "require", "default"} {
+		entry, ok := asMap[candidate]
+		if !ok {
+			continue
+		}
+		resolved, found, err := resolveExportTarget(entry)
+		if err != nil {
+			return "", false, err
+		}
+		if found && resolved != "" {
+			return resolved, true, nil
 		}
 	}
 
@@ -319,9 +328,11 @@ func openMaybeCJS(absPath string) (io.ReadCloser, error) {
 	}
 	src := StripShebang(string(data))
 	if shouldWrapCJS(absPath, src) {
-		return io.NopCloser(strings.NewReader(cjsESMWrapper(absPath))), nil
+		src = patchCJSSource(src, absPath)
+		return io.NopCloser(strings.NewReader(cjsESMWrapper(absPath, src))), nil
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
+	src = patchModuleSource(src, absPath)
+	return io.NopCloser(strings.NewReader(src)), nil
 }
 
 func shouldWrapCJS(absPath, source string) bool {
@@ -354,7 +365,59 @@ func looksLikeCJSSource(source string) bool {
 		strings.Contains(source, "require(")
 }
 
-func cjsESMWrapper(absPath string) string {
-	return "const __cjs = process.__noderatiCJSRequire(" + strconv.Quote(absPath) + ");\n" +
-		"export default __cjs;\n"
+func cjsESMWrapper(absPath, source string) string {
+	var b strings.Builder
+	b.WriteString("const __cjs = process.__noderatiCJSRequire(")
+	b.WriteString(strconv.Quote(absPath))
+	b.WriteString(");\nexport default __cjs;\n")
+	for _, name := range extractCJSExportNames(source) {
+		alias := "__cjs_named_" + name
+		b.WriteString("const ")
+		b.WriteString(alias)
+		b.WriteString(" = __cjs[")
+		b.WriteString(strconv.Quote(name))
+		b.WriteString("];\nexport { ")
+		b.WriteString(alias)
+		b.WriteString(" as ")
+		b.WriteString(cjsExportAlias(name))
+		b.WriteString(" };\n")
+	}
+	return b.String()
+}
+
+func extractCJSExportNames(source string) []string {
+	seen := make(map[string]bool)
+	var names []string
+	add := func(name string) {
+		if name == "" || name == "default" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+
+	for _, m := range regexp.MustCompile(`exports\.(\w+)\s*=`).FindAllStringSubmatch(source, -1) {
+		add(m[1])
+	}
+
+	if m := regexp.MustCompile(`module\.exports\s*=\s*\{([\s\S]*?)\n\}`).FindStringSubmatch(source); len(m) == 2 {
+		body := m[1]
+		for _, part := range regexp.MustCompile(`(?m)^\s*(\w+)\s*,?\s*$`).FindAllStringSubmatch(body, -1) {
+			add(part[1])
+		}
+		for _, part := range regexp.MustCompile(`(?m)^\s*(\w+)\s*:`).FindAllStringSubmatch(body, -1) {
+			add(part[1])
+		}
+	}
+	return names
+}
+
+// cjsExportAlias quotes export names that collide with TS keywords.
+func cjsExportAlias(name string) string {
+	switch name {
+	case "satisfies", "is", "as", "type", "declare", "module", "namespace", "interface", "enum":
+		return strconv.Quote(name)
+	default:
+		return name
+	}
 }

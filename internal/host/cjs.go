@@ -2,8 +2,10 @@ package host
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/nooga/paserati/pkg/driver"
@@ -14,7 +16,12 @@ import (
 var nativeRequireNames = map[string]bool{
 	"fs": true, "path": true, "os": true, "util": true,
 	"assert": true, "url": true, "querystring": true,
-	"child_process": true,
+	"child_process": true, "readline": true, "tty": true, "process": true, "buffer": true,
+	"events": true, "stream": true, "crypto": true, "undici": true,
+	"fs/promises": true,
+	"module": true, "worker_threads": true,
+	"perf_hooks": true, "string_decoder": true,
+	"stream/promises": true,
 }
 
 type cjsLoader struct {
@@ -68,6 +75,44 @@ func declareCJSInterop(p *driver.Paserati) {
 		}
 		return val, nil
 	}))
+	obj.SetOwn("__noderatiCreateRequire", vm.NewNativeFunction(1, false, "__noderatiCreateRequire", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vm.Undefined, fmt.Errorf("createRequire: missing filename")
+		}
+		fromFile, err := resolveRequireFilename(args[0].ToString())
+		if err != nil {
+			return vm.Undefined, err
+		}
+		abs, err := filepath.Abs(fromFile)
+		if err != nil {
+			abs = fromFile
+		}
+		return loader.bindRequire(abs), nil
+	}))
+}
+
+func resolveRequireFilename(filenameOrURL string) (string, error) {
+	if strings.HasPrefix(filenameOrURL, "file://") {
+		u, err := url.Parse(filenameOrURL)
+		if err != nil {
+			return "", err
+		}
+		if u.Scheme != "file" {
+			return "", fmt.Errorf("createRequire: filename must be a file URL or path")
+		}
+		return filepath.FromSlash(u.Path), nil
+	}
+	return filenameOrURL, nil
+}
+
+func (l *cjsLoader) bindRequire(fromFile string) vm.Value {
+	return vm.NewNativeFunction(1, false, "require", func(args []vm.Value) (vm.Value, error) {
+		spec := ""
+		if len(args) > 0 {
+			spec = args[0].ToString()
+		}
+		return l.require(spec, fromFile)
+	})
 }
 
 func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.PaseratiError) {
@@ -76,8 +121,10 @@ func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.Pasera
 		abs = filename
 	}
 	if cached, ok := l.cache[abs]; ok {
-		return moduleExports(cached), nil
+		return l.moduleExports(cached), nil
 	}
+
+	source = patchCJSSource(source, abs)
 
 	vmInst := l.p.GetVM()
 	exportsVal := vm.NewObject(vmInst.ObjectPrototype)
@@ -88,13 +135,7 @@ func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.Pasera
 	l.cache[abs] = moduleVal
 
 	fromFile := abs
-	requireFn := vm.NewNativeFunction(1, false, "require", func(args []vm.Value) (vm.Value, error) {
-		spec := ""
-		if len(args) > 0 {
-			spec = args[0].ToString()
-		}
-		return l.require(spec, fromFile)
-	})
+	requireFn := l.bindRequire(fromFile)
 
 	wrapped := "(function (exports, require, module, __filename, __dirname) {\n" + source + "\n})"
 	fn, errs := l.p.RunScript(wrapped, abs)
@@ -112,7 +153,7 @@ func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.Pasera
 	if err != nil {
 		return vm.Undefined, []errors.PaseratiError{&errors.RuntimeError{Msg: formatCallError(err)}}
 	}
-	return moduleExports(moduleVal), nil
+	return l.moduleExports(moduleVal), nil
 }
 
 func formatCallError(err error) string {
@@ -122,12 +163,18 @@ func formatCallError(err error) string {
 	return err.Error()
 }
 
-func moduleExports(moduleVal vm.Value) vm.Value {
+func (l *cjsLoader) moduleExports(moduleVal vm.Value) vm.Value {
 	obj := moduleVal.AsPlainObject()
 	if obj == nil {
 		return moduleVal
 	}
-	exp, ok := obj.GetOwn("exports")
+	if getter, _, ok, _, _ := obj.GetOwnAccessor("exports"); ok && getter.IsCallable() {
+		val, err := l.p.GetVM().Call(getter, moduleVal, nil)
+		if err == nil {
+			return val
+		}
+	}
+	exp, ok := obj.Get("exports")
 	if !ok {
 		return vm.Undefined
 	}
@@ -136,6 +183,11 @@ func moduleExports(moduleVal vm.Value) vm.Value {
 
 func (l *cjsLoader) require(specifier, fromFile string) (vm.Value, error) {
 	spec := strings.TrimPrefix(specifier, "node:")
+	if spec == "process" {
+		if proc, ok := l.p.GetVM().GetGlobal("process"); ok {
+			return proc, nil
+		}
+	}
 	if nativeRequireNames[spec] {
 		return l.requireNative(spec)
 	}
@@ -145,7 +197,7 @@ func (l *cjsLoader) require(specifier, fromFile string) (vm.Value, error) {
 		return vm.Undefined, fmt.Errorf("Cannot find module '%s'", specifier)
 	}
 	if cached, ok := l.cache[resolved]; ok {
-		return moduleExports(cached), nil
+		return l.moduleExports(cached), nil
 	}
 
 	data, err := os.ReadFile(resolved)
@@ -170,12 +222,12 @@ func (l *cjsLoader) requireNative(spec string) (vm.Value, error) {
 		return vm.Undefined, fmt.Errorf("Cannot find module '%s'", spec)
 	}
 	if rec.GetError() != nil {
-		return vm.Undefined, rec.GetError()
+		return vm.Undefined, fmt.Errorf("Cannot find module '%s'", spec)
 	}
 
 	vals := rec.GetExportValues()
 	var ns vm.Value
-	if def, ok := vals["default"]; ok {
+	if def, ok := vals["default"]; ok && !def.IsUndefined() && def.Type() != vm.TypeNull {
 		ns = def
 	} else {
 		obj := vm.NewObject(l.p.GetVM().ObjectPrototype).AsPlainObject()
@@ -226,4 +278,59 @@ func existingJSFile(target string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("not found: %s", target)
+}
+
+// patchCJSSource applies small source transforms for known third-party CJS quirks.
+func patchCJSSource(source, filename string) string {
+	source = patchCJSSatisfiesKeyword(source)
+	source = patchCJSClassSelfInstanceOf(source, filename)
+	source = patchCJSClassStaticAccess(source, filename)
+	return source
+}
+
+// patchCJSSatisfiesKeyword works around Paserati parsing `satisfies` as a TS keyword.
+func patchCJSSatisfiesKeyword(source string) string {
+	if !strings.Contains(source, "satisfies") {
+		return source
+	}
+	reConst := regexp.MustCompile(`\bconst\s+satisfies\s*=`)
+	source = reConst.ReplaceAllString(source, "const satisfiesFn =")
+
+	reCall := regexp.MustCompile(`\bsatisfies\s*\(`)
+	source = reCall.ReplaceAllString(source, "satisfiesFn(")
+
+	source = strings.ReplaceAll(source, "module.exports = satisfies", "module.exports = satisfiesFn")
+	reShorthand := regexp.MustCompile(`(?m)^(\s*)satisfies,\s*$`)
+	source = reShorthand.ReplaceAllString(source, `${1}satisfies: satisfiesFn,`)
+	return source
+}
+
+// patchCJSClassSelfInstanceOf rewrites `instanceof ClassName` self-checks to use
+// module.exports — Paserati does not bind hoisted class names inside constructors.
+func patchCJSClassSelfInstanceOf(source, filename string) string {
+	switch filepath.Base(filename) {
+	case "comparator.js":
+		source = strings.ReplaceAll(source, "instanceof Comparator", "instanceof module.exports")
+	case "range.js":
+		source = strings.ReplaceAll(source, "instanceof Range", "instanceof module.exports")
+	case "semver.js":
+		source = strings.ReplaceAll(source, "instanceof SemVer", "instanceof module.exports")
+	}
+	return source
+}
+
+// patchCJSClassStaticAccess rewrites Class.static inside yaml's Directives
+// constructor — Paserati does not bind the class name in that scope.
+func patchCJSClassStaticAccess(source, filename string) string {
+	if filepath.Base(filename) != "directives.js" {
+		return source
+	}
+	source = strings.ReplaceAll(source, "Directives.defaultYaml =", "__ASSIGN_DIR_YAML__")
+	source = strings.ReplaceAll(source, "Directives.defaultTags =", "__ASSIGN_DIR_TAGS__")
+	source = strings.ReplaceAll(source, "new Directives(", "new module.exports.Directives(")
+	source = strings.ReplaceAll(source, "Directives.defaultYaml", "module.exports.Directives.defaultYaml")
+	source = strings.ReplaceAll(source, "Directives.defaultTags", "module.exports.Directives.defaultTags")
+	source = strings.ReplaceAll(source, "__ASSIGN_DIR_YAML__", "Directives.defaultYaml =")
+	source = strings.ReplaceAll(source, "__ASSIGN_DIR_TAGS__", "Directives.defaultTags =")
+	return source
 }

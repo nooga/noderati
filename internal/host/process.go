@@ -2,10 +2,13 @@ package host
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"runtime"
+	"sync/atomic"
 
 	"github.com/nooga/paserati/pkg/builtins"
+	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/types"
 	"github.com/nooga/paserati/pkg/vm"
 	"golang.org/x/term"
@@ -40,6 +43,9 @@ func (p *ProcessInitializer) InitTypes(ctx *builtins.TypeContext) error {
 	if err := ctx.DefineGlobal("process", processType); err != nil {
 		return err
 	}
+	if err := ctx.DefineGlobal("structuredClone", types.NewSimpleFunction([]types.Type{types.Any}, types.Any)); err != nil {
+		return err
+	}
 	return ctx.DefineGlobal("global", types.Any)
 }
 
@@ -67,40 +73,35 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		}
 	}
 
-	stdoutObj := vm.NewObject(vmInstance.ObjectPrototype).AsPlainObject()
-	stdoutObj.SetOwn("write", vm.NewNativeFunction(1, false, "write", func(args []vm.Value) (vm.Value, error) {
-		if len(args) > 0 {
-			fmt.Print(args[0].ToString())
-		}
-		return vm.True, nil
-	}))
+	stdoutObj := newStdioWritable(vmInstance, os.Stdout)
 	cols, tty := stdoutColumnsAndTTY()
 	stdoutObj.SetOwn("isTTY", tty)
 	if cols != vm.Undefined {
 		stdoutObj.SetOwn("columns", cols)
 	}
 
-	stderrObj := vm.NewObject(vmInstance.ObjectPrototype).AsPlainObject()
-	stderrObj.SetOwn("write", vm.NewNativeFunction(1, false, "write", func(args []vm.Value) (vm.Value, error) {
-		if len(args) > 0 {
-			fmt.Fprint(os.Stderr, args[0].ToString())
-		}
-		return vm.True, nil
-	}))
+	stderrObj := newStdioWritable(vmInstance, os.Stderr)
+	stderrObj.SetOwn("isTTY", stdinOrFdIsTTY(os.Stderr))
 
-	processObj := vm.NewObject(vmInstance.ObjectPrototype).AsPlainObject()
+	stdinObj := newStdinObject(vmInstance)
+
+	processObj := newEventEmitterObject(vmInstance)
 	processObj.SetOwn("argv", argvArray)
 	processObj.SetOwn("execArgv", vm.NewArray())
 	processObj.SetOwn("execPath", vm.NewString(execPath))
 	processObj.SetOwn("platform", vm.NewString(runtime.GOOS))
 	processObj.SetOwn("arch", vm.NewString(runtime.GOARCH))
+	versionsObj := vm.NewObject(vmInstance.ObjectPrototype).AsPlainObject()
+	versionsObj.SetOwn("node", vm.NewString("22.0.0"))
 	processObj.SetOwn("version", vm.NewString("v22.0.0"))
-	processObj.SetOwn("versions", vm.NewObject(vmInstance.ObjectPrototype))
+	processObj.SetOwn("versions", vm.NewValueFromPlainObject(versionsObj))
 	processObj.SetOwn("pid", vm.IntegerValue(int32(os.Getpid())))
 	processObj.SetOwn("env", vm.NewValueFromPlainObject(envObj))
 	processObj.SetOwn("stdout", vm.NewValueFromPlainObject(stdoutObj))
 	processObj.SetOwn("stderr", vm.NewValueFromPlainObject(stderrObj))
+	processObj.SetOwn("stdin", vm.NewValueFromPlainObject(stdinObj))
 	processObj.SetOwn("title", vm.NewString("noderati"))
+	processObj.SetOwn("exitCode", vm.IntegerValue(0))
 	processObj.SetOwn("emitWarning", vm.NewNativeFunction(1, false, "emitWarning", func(args []vm.Value) (vm.Value, error) {
 		return vm.Undefined, nil
 	}))
@@ -135,6 +136,9 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 	if err := ctx.DefineGlobal("process", vm.NewValueFromPlainObject(processObj)); err != nil {
 		return err
 	}
+	if err := ctx.DefineGlobal("structuredClone", structuredCloneFn(vmInstance)); err != nil {
+		return err
+	}
 	return ctx.DefineGlobal("global", vm.NewValueFromPlainObject(vmInstance.GlobalObject))
 }
 
@@ -148,4 +152,142 @@ func stdoutColumnsAndTTY() (columns vm.Value, isTTY vm.Value) {
 		return vm.NumberValue(80), vm.True
 	}
 	return vm.NumberValue(float64(w)), vm.True
+}
+
+func stdinOrFdIsTTY(f *os.File) vm.Value {
+	if term.IsTerminal(int(f.Fd())) {
+		return vm.True
+	}
+	return vm.False
+}
+
+func newStdioWritable(vmInstance *vm.VM, out *os.File) *vm.PlainObject {
+	obj := newEventEmitterObject(vmInstance)
+	obj.SetOwn("writable", vm.True)
+	obj.SetOwn("writableLength", vm.IntegerValue(0))
+	obj.SetOwn("fd", vm.IntegerValue(int32(out.Fd())))
+	rt := vmInstance.GetAsyncRuntime()
+	obj.SetOwn("write", vm.NewNativeFunction(1, true, "write", func(args []vm.Value) (vm.Value, error) {
+		chunk := ""
+		if len(args) > 0 && !args[0].IsUndefined() && args[0].Type() != vm.TypeNull {
+			chunk = args[0].ToString()
+		}
+		cb := writeCallback(args)
+		if chunk != "" {
+			_, _ = fmt.Fprint(out, chunk)
+		}
+		if cb.IsCallable() {
+			fn := cb
+			rt.ScheduleNextTick(func() {
+				_, _ = vmInstance.Call(fn, vm.Undefined, nil)
+			})
+		}
+		return vm.True, nil
+	}))
+	self := vm.NewValueFromPlainObject(obj)
+	obj.SetOwn("cork", vm.NewNativeFunction(0, false, "cork", func(_ []vm.Value) (vm.Value, error) {
+		return vm.Undefined, nil
+	}))
+	obj.SetOwn("uncork", vm.NewNativeFunction(0, false, "uncork", func(_ []vm.Value) (vm.Value, error) {
+		return vm.Undefined, nil
+	}))
+	obj.SetOwn("end", vm.NewNativeFunction(0, true, "end", func(args []vm.Value) (vm.Value, error) {
+		if len(args) > 0 && args[0].IsCallable() {
+			_, _ = vmInstance.Call(args[0], vm.Undefined, nil)
+		} else if len(args) > 0 {
+			if writeFn, ok := obj.GetOwn("write"); ok && writeFn.IsCallable() {
+				_, _ = vmInstance.Call(writeFn, self, args[:1])
+			}
+		}
+		emitOnObject(vmInstance, obj, "finish")
+		return self, nil
+	}))
+	return obj
+}
+
+func writeCallback(args []vm.Value) vm.Value {
+	if len(args) >= 2 && args[1].IsCallable() {
+		return args[1]
+	}
+	if len(args) >= 3 && args[2].IsCallable() {
+		return args[2]
+	}
+	return vm.Undefined
+}
+
+func newStdinObject(vmInstance *vm.VM) *vm.PlainObject {
+	obj := newEventEmitterObject(vmInstance)
+	isTTY := stdinOrFdIsTTY(os.Stdin)
+	obj.SetOwn("isTTY", isTTY)
+	obj.SetOwn("fd", vm.IntegerValue(0))
+	obj.SetOwn("isRaw", vm.False)
+	obj.SetOwn("readable", vm.True)
+	self := vm.NewValueFromPlainObject(obj)
+	noopSelf := func(_ []vm.Value) (vm.Value, error) {
+		return self, nil
+	}
+	obj.SetOwn("setEncoding", vm.NewNativeFunction(1, false, "setEncoding", noopSelf))
+	obj.SetOwn("pause", vm.NewNativeFunction(0, false, "pause", noopSelf))
+	obj.SetOwn("setRawMode", vm.NewNativeFunction(1, false, "setRawMode", func(args []vm.Value) (vm.Value, error) {
+		if len(args) > 0 {
+			obj.SetOwn("isRaw", args[0])
+		}
+		return self, nil
+	}))
+	obj.SetOwn("read", vm.NewNativeFunction(0, false, "read", func(_ []vm.Value) (vm.Value, error) {
+		return vm.Null, nil
+	}))
+
+	var started atomic.Bool
+	rt := vmInstance.GetAsyncRuntime()
+	obj.SetOwn("resume", vm.NewNativeFunction(0, false, "resume", func(_ []vm.Value) (vm.Value, error) {
+		if isTTY.IsTruthy() || !started.CompareAndSwap(false, true) {
+			return self, nil
+		}
+		rt.BeginExternalOp()
+		go pumpProcessStdin(vmInstance, obj, rt)
+		return self, nil
+	}))
+	return obj
+}
+
+func pumpProcessStdin(vmInstance *vm.VM, stream *vm.PlainObject, rt interface {
+	EndExternalOp()
+}) {
+	defer rt.EndExternalOp()
+	buf := make([]byte, 4096)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if n > 0 {
+			scheduleEmit(vmInstance, stream, "data", vm.NewString(string(buf[:n])))
+		}
+		if err != nil {
+			if err != io.EOF {
+				scheduleEmit(vmInstance, stream, "error", vm.NewString(err.Error()))
+			}
+			scheduleEmit(vmInstance, stream, "end")
+			return
+		}
+	}
+}
+
+// ProcessExitCode reads process.exitCode after the script event loop drains.
+func ProcessExitCode(p *driver.Paserati) int {
+	vmInst := p.GetVM()
+	if vmInst == nil || vmInst.GlobalObject == nil {
+		return 0
+	}
+	procVal, ok := vmInst.GlobalObject.GetOwn("process")
+	if !ok {
+		return 0
+	}
+	proc := procVal.AsPlainObject()
+	if proc == nil {
+		return 0
+	}
+	code, ok := proc.GetOwn("exitCode")
+	if !ok || !code.IsNumber() {
+		return 0
+	}
+	return int(code.ToFloat())
 }

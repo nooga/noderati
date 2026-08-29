@@ -61,10 +61,11 @@ func runEval(execPath, source string, print bool, rest []string) int {
 		errors.DisplayErrors(errs, source)
 		return 1
 	}
+	drainAsync(p)
 	if print && val != vm.Undefined {
 		fmt.Println(val.Inspect())
 	}
-	return 0
+	return host.ProcessExitCode(p)
 }
 
 func runFile(execPath, filename string, extra []string) int {
@@ -97,7 +98,14 @@ func runFile(execPath, filename string, extra []string) int {
 		errors.DisplayErrors(errs, source)
 		return 1
 	}
-	return 0
+	drainAsync(p)
+	return host.ProcessExitCode(p)
+}
+
+func drainAsync(p *driver.Paserati) {
+	if vmInst := p.GetVM(); vmInst != nil {
+		vmInst.DrainUntilIdle()
+	}
 }
 
 func looksLikeESM(source string) bool {

@@ -2,7 +2,9 @@ package host
 
 import (
 	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/nooga/paserati/pkg/driver"
 )
@@ -24,6 +26,9 @@ func declareOS(p *driver.Paserati) {
 			return h
 		})
 		m.Function("tmpdir", os.TempDir)
+		m.Function("release", func() string {
+			return releaseVersion()
+		})
 		m.Function("hostname", func() string {
 			h, err := os.Hostname()
 			if err != nil {
@@ -34,4 +39,23 @@ func declareOS(p *driver.Paserati) {
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:os", "os")
+}
+
+func releaseVersion() string {
+	switch runtime.GOOS {
+	case "darwin":
+		out, err := exec.Command("uname", "-r").Output()
+		if err != nil {
+			return "0.0.0"
+		}
+		return strings.TrimSpace(string(out))
+	case "windows":
+		return "10.0.0"
+	default:
+		out, err := exec.Command("uname", "-r").Output()
+		if err != nil {
+			return "0.0.0"
+		}
+		return strings.TrimSpace(string(out))
+	}
 }
