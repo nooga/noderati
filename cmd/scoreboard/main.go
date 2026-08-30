@@ -45,12 +45,13 @@ var fakeNames = []string{
 	"typebox", "diff", "jiti", "glob", "minimatch", "proper-lockfile",
 }
 
-// patchNames mirrors patchModuleSource()'s per-rewrite knobs.
+// patchNames mirrors patchModuleSource()'s per-rewrite knobs. Was twelve;
+// ten were deleted 2026-08-30 (Phase 1 close-out) after the first scoreboard
+// run confirmed each dead. Keep this list in sync with esmpatch.go's apply()
+// calls — a stale entry here just silently no-ops (isDisabled matches
+// nothing), which reads as "clean" without actually testing anything.
 var patchNames = []string{
-	"keybindings-alias", "syntax-highlight-stub", "theme-typebox-stub",
-	"sdk-reexports", "extension-loader-stub", "pi-agent-core-reexports",
-	"pi-ai-index-reexports", "pi-ai-compat-reexports", "pi-ai-oauth-reexports",
-	"pi-ai-oauth-index-reexports", "pi-ai-syntax-compat", "pi-ai-auth-context",
+	"sdk-reexports", "syntax-highlight-stub",
 }
 
 type invocation struct {

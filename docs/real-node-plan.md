@@ -57,21 +57,22 @@ a build task, and it's most of `internal/host/`'s file count.
 
 **C. `esmpatch.go` per-file source rewrites.** Was twelve rewrites keyed by
 filename, each patching around one specific parser/compiler gap or the
-package fakes in (B); ten were deleted 2026-08-30 (Phase 1 close-out, below)
-after the Phase 2 scoreboard confirmed each dead against the real,
-unmodified `pi-coding-agent@0.80.2` tree. **Two remain:** `sdk-reexports`
-(a real, still-needed compile-error workaround, misidentified in an earlier
-pass of this doc as an `export *` issue — it isn't) and
-`syntax-highlight-stub` (was blocking a register-allocator compiler bug,
-[paserati#121](https://github.com/nooga/paserati/issues/121), fixed upstream
-2026-08-30 — but re-enabling the real `highlight.js` uncovered two *more*
-real gaps behind it, one filed as
-[paserati#122](https://github.com/nooga/paserati/issues/122), so it still
-stays for now — see Phase 2 below for the full account). Delete a
-rewrite only when its underlying bug is fixed *and* verified via the
-scoreboard, including against the other patches still standing — see Phase 2
-below for why individual verification isn't sufficient on its own, even once
-the *first* blocking bug is fixed.
+package fakes in (B). Eleven are now deleted (2026-08-30): ten in the
+original Phase 1 close-out once the Phase 2 scoreboard confirmed each dead,
+and `syntax-highlight-stub` the same day once
+[paserati#121](https://github.com/nooga/paserati/issues/121) (a
+register-allocator compiler bug) and
+[paserati#122](https://github.com/nooga/paserati/issues/122) (a stale
+frozen-property flag) were both fixed upstream and the real `highlight.js`
+was confirmed to register 190/191 bundled languages — the one exception
+(`latex`, needing regex lookahead Go's RE2 doesn't support) is a documented,
+linked, architectural gap, not a reason to keep faking the whole module.
+**One remains:** `sdk-reexports` — a real, still-needed compile-error
+workaround, misidentified in an earlier pass of this doc as an `export *`
+issue (it isn't). Delete it only when its underlying bug is fixed *and*
+verified via the scoreboard, including against `latex`'s existing gap — see
+Phase 2 below for why individual verification isn't sufficient on its own,
+even once a blocking bug is fixed (it happened twice in a row here).
 
 **D. Resolver-side dirty tricks, independent of the above:**
 - `findPiCodingAgentNodeModulesRoots()` (`piai.go`) hardcodes
@@ -520,28 +521,48 @@ logged (not crashed) by `highlight.js`'s own per-language try/catch around
   = STRING.contains.slice()`) — which real Node handles fine and paserati
   doesn't yet.
 
-So `syntax-highlight-stub` **stays in `esmpatch.go` for now** — #121 being
-fixed was necessary but not sufficient to delete it; #122 blocks a clean
-deletion (and `latex` will keep printing that one registration error
-regardless, unless highlight.js's own per-language catch is judged
-acceptable noise on its own — a call for whoever revisits this).
+**Fixed upstream, 2026-08-30** — `a1e5e22e` on `origin/main` ("Object.freeze/
+seal/defineProperty mutated a *shared* Shape"), part of a larger batch that
+also landed `#123` (freeze/seal/preventExtensions on functions, RegExps,
+Maps, Sets) and `#126` (`Object.defineProperty` throwing on a rejected
+redefinition). Re-verified: the `#122` repro now prints the correct
+`[9,9,3]`; `mercury.js` registers cleanly; the full, real, unmodified
+`highlight.js/lib/index.js` now registers **190 of 191** bundled languages —
+the only failure left is `latex`, and that's the documented, architectural
+RE2-lookahead gap above, not something further upstream work fixes.
+
+**`syntax-highlight-stub` deleted, 2026-08-30.** One documented gap
+(`latex`, linked, architectural, not a silent fake) clears the project's own
+bar ("a real implementation or a linked issue, never a silent fake") more
+than a wholesale no-op stub does. `esmpatch.go` is down to one patch,
+`sdk-reexports`.
 
 **Consequence for Phase 3: "clean individually" is necessary but not
 sufficient — always confirm the actual batch before deleting, and again after
 deleting.** Patches interact through the shared module graph, and fixing the
-bug that made a patch *look* removable can uncover the next one behind it.
+bug that made a patch *look* removable can uncover the next one behind it —
+this happened twice in a row here (#121 fixed → #122 found; #122 fixed →
+clean modulo one architectural gap).
 
-**Phase 1 close-out, done 2026-08-30:** deleted the 10 confirmed-safe patches
-from `esmpatch.go` (all of the 11-clean set above except `syntax-highlight-stub`,
-which stays — see above, still blocking real gaps, just different ones than
-originally thought). `sdk-reexports` and `syntax-highlight-stub` are the
-only two rewrites left in `esmpatch.go`, both with real, current
-justifications recorded in their doc comments. Re-verified against the real
-build (not just the env-var
-toggle) after deletion: `--version`/`--help`/`-p "hello"` all still match
-baseline exactly, `go test ./...` clean. Phase 1 is now fully done except
-item 5 (error-location diagnostics), which remains a fix-when-convenient, not
-a gate.
+**A second instance of that same interaction, found by the Phase 2 scoreboard
+after this deletion:** `fake-off:jiti` went from clean (first scoreboard run)
+to a real parse-error `DIFF` (second run) — not a regression, a previously
+Phase-1-close-out-hidden real gap. `extension-loader-stub` (deleted in Phase
+1 close-out, above) used to intercept `core/extensions/loader.js` before it
+ever reached `jiti`; with that patch gone, the real extension loader is
+unconditionally live, and it really does need `jiti` for real. Not
+investigated further yet — flagged for whoever picks up Phase 3's `jiti`
+item.
+
+**Phase 1 close-out, done 2026-08-30 (revised same day once `syntax-highlight-stub`
+also cleared):** `esmpatch.go` is down to one patch, `sdk-reexports` — the
+only one of the original twelve confirmed to still guard a real,
+still-unfixed compile error. Re-verified against the real build after each
+deletion (not just the env-var toggle): `--version`/`--help`/`-p "hello"`
+match baseline exactly (`--help`/`--version` now with one extra, documented,
+architectural `latex` error line — see above); `go test ./...` clean. Phase
+1 is now fully done except item 5 (error-location diagnostics), which
+remains a fix-when-convenient, not a gate.
 
 ### Phase 3 — delete the third-party fakes (ledger group B)
 One at a time, in dependency order (leaves first): `hosted-git-info`,
