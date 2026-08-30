@@ -576,6 +576,53 @@ is a multi-week engine project, and note the patch's tracker link. Expect
 `pi-tui` and `pi-ai` to surface the most new gaps — they're the largest fakes
 and the real packages are large, real-world ESM.
 
+**Exploration pass, 2026-08-30 (findings recorded, no fakes deleted yet —
+each hits a real, currently-unfixed gap):**
+
+- **`hosted-git-info`** — bisected to a real, significant, general paserati
+  bug, isolated to a 4-line dependency-free repro (no self-reference or
+  even `hosted-git-info` involved) and filed as
+  [paserati#128](https://github.com/nooga/paserati/issues/128): a `class`
+  declared inside a function body isn't visible to *any* closure nested in
+  that function (not just its own methods) — the reference resolves as a
+  bogus, never-written global instead of an upvalue capture. Confirmed via
+  `-bytecode`: the closure compiles to `OpGetGlobal` for a class that's
+  actually a real, local, already-populated register in the enclosing
+  frame. Root-caused to `compile_class.go`'s local-class path pre-defining
+  the class's own name with a placeholder `nilRegister` that isn't updated
+  to the real register until *after* the whole class body (all its methods)
+  has already compiled — the same "not-yet-finalized binding falls through
+  to a global fallback" shape as #117/#119, but for function-scoped classes
+  captured by upvalue rather than module-level ones read via `OpGetGlobal`.
+  `hosted-git-info`'s `GitHost` class hits this on its own static methods
+  (`addHost`, `fromUrl`, ...) because noderati's CJS interop function-wraps
+  every `require()`d file. Given how common "class declared inside a
+  function, referenced by its own or a sibling closure" is in real-world
+  CJs, likely blocks more than just this one package.
+- **`proper-lockfile`** — depends on `graceful-fs`, which fails standalone
+  (no `hosted-git-info` needed to reproduce) with an unhelpfully vague
+  `runtime error during user function execution` and no file/line. Not yet
+  bisected within the file (448 lines, no classes at all — a different,
+  not-yet-diagnosed bug, unrelated to #128). Not filed yet.
+- **`pi-agent-core`** — `Agent`, imported directly by name from `agent.js`,
+  loads fine. The package's real `index.js` (an `export *` barrel,
+  multiple hops deep) does not: `import * as mod from ".../index.js"`
+  throws `TypeError: Class extends value undefined is not a constructor or
+  null`. This looks like a deeper instance of the same family the original,
+  now-deleted `patchESMPiAgentCoreReexports` patch was working around
+  ("skip-typecheck cannot harvest class names from `export *`") — but the
+  single-hop case was independently verified fixed while investigating
+  #119 (see "already fixed upstream" above), so this needs its own
+  multi-hop repro before filing. Not yet bisected or filed.
+
+Net: no group-B fake deleted yet. Each of the three actually tried hits a
+real, currently-unfixed engine gap — exactly the outcome this phase expects
+to find (see the phase's own note above: "Expect `pi-tui` and `pi-ai` to
+surface the most new gaps"), just found one leaf earlier than expected.
+`#128` in particular looks worth fixing before continuing this phase
+further — it's general enough that it may silently unblock several of the
+others too.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
