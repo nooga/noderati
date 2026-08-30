@@ -601,25 +601,61 @@ each hits a real, currently-unfixed gap):**
   CJs, likely blocks more than just this one package.
 - **`proper-lockfile`** — depends on `graceful-fs`, which fails standalone
   (no `hosted-git-info` needed to reproduce) with an unhelpfully vague
-  `runtime error during user function execution` and no file/line. Not yet
-  bisected within the file (448 lines, no classes at all — a different,
-  not-yet-diagnosed bug, unrelated to #128). Not filed yet.
+  `runtime error during user function execution` and no file/line. Bisected
+  to `graceful-fs`'s `polyfills.js`, which does `require('constants')` —
+  **two** separate things behind that one vague message:
+  1. `constants` is a real Node builtin noderati doesn't implement yet
+     (ledger group A, a noderati-side gap — not a paserati issue, just not
+     built).
+  2. That `Cannot find module 'constants'` error, thrown from *inside* a
+     nested `require()` call (`a.js` requires `polyfills.js`, which requires
+     `'constants'`), never reaches the top — it gets replaced by the useless
+     generic message. Isolated to a 2-file, no-npm-package repro (`a.js`
+     requires `b.js`; `b.js` just does `throw new Error(...)`), traced
+     through noderati's CJS loader into `vm.Call`/`executeUserFunctionSafe`,
+     and filed as
+     [paserati#130](https://github.com/nooga/paserati/issues/130): a
+     **reentrant** `vm.Call()` (a native call, itself already running
+     inside another `vm.Call`, that throws) loses the real exception —
+     `executeUserFunctionSafe`'s `InterpretRuntimeError` branch doesn't see
+     `vm.unwinding`/`vm.currentException` in the state it expects, even
+     though a real exception clearly occurred, and falls through to a fixed
+     literal Go error string. Same failure *shape* as the four leaks #118
+     fixed (a real exception replaced by a fixed-literal string before
+     reaching the embedder), a fifth, distinct trigger. Once `#130` is
+     fixed, `constants` will very likely need to actually be implemented too
+     — the *real* error will surface, and it'll be exactly that.
 - **`pi-agent-core`** — `Agent`, imported directly by name from `agent.js`,
-  loads fine. The package's real `index.js` (an `export *` barrel,
-  multiple hops deep) does not: `import * as mod from ".../index.js"`
-  throws `TypeError: Class extends value undefined is not a constructor or
-  null`. This looks like a deeper instance of the same family the original,
-  now-deleted `patchESMPiAgentCoreReexports` patch was working around
-  ("skip-typecheck cannot harvest class names from `export *`") — but the
-  single-hop case was independently verified fixed while investigating
-  #119 (see "already fixed upstream" above), so this needs its own
-  multi-hop repro before filing. Not yet bisected or filed.
+  loads fine. The package's real `index.js` (an `export *` barrel) doesn't:
+  `import * as mod from ".../index.js"` throws `TypeError: Class extends
+  value undefined is not a constructor or null`. **Turned out to be a false
+  lead** — that reproduces because noderati's *own* `@earendil-works/pi-ai`
+  fake (still active during this test) doesn't re-export `EventStream` the
+  way the real `pi-ai` package does; disabling the `pi-ai` fake too (so
+  `index.js`'s `import { EventStream } from "@earendil-works/pi-ai"`
+  resolves against the real package) makes the "Class extends undefined"
+  disappear entirely — replaced by an earlier, real blocker: a genuine
+  parse error in `@earendil-works/pi-ai/dist/auth/context.js`. Bisected that
+  down to a clean, minimal, dependency-free repro and filed as
+  [paserati#129](https://github.com/nooga/paserati/issues/129): a
+  parenthesized `await` — `(await foo())` — fails to parse, but *only*
+  inside an object-literal shorthand async method (`{ async run() { (await
+  foo()); } }`); the identical expression works in a class method, an arrow
+  function, or a top-level `async function`. Root-caused precisely:
+  `p.inAsyncFunction` (the parser's "currently inside an async body"
+  counter, correctly saved/incremented/restored at four other call sites)
+  is never touched by the object-literal shorthand-method branch, so an
+  `isAwaitParam` lookahead check elsewhere in the parser wrongly treats
+  `await` as a candidate arrow-function parameter name. `auth/context.js`'s
+  `fileExists` method (returned from an object literal) hits this on `const
+  fs = (await importNodeModule(...))`.
 
 Net: no group-B fake deleted yet. Each of the three actually tried hits a
 real, currently-unfixed engine gap — exactly the outcome this phase expects
 to find (see the phase's own note above: "Expect `pi-tui` and `pi-ai` to
 surface the most new gaps"), just found one leaf earlier than expected.
-`#128` in particular looks worth fixing before continuing this phase
+Filed three issues today (`#128`, `#129`, `#130`); `#128` in particular
+looks worth fixing before continuing this phase
 further — it's general enough that it may silently unblock several of the
 others too.
 
