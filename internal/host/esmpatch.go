@@ -44,13 +44,15 @@ export function supportsLanguage(_lang) { return false; }
 `
 
 // patchESMSyntaxHighlightStub replaces highlight.js-backed syntax highlighting
-// with a no-op stub — the real module hits a real paserati compiler bug
-// (register allocator exhaustion compiling a long expression chain), not yet
-// filed. Confirmed still required 2026-08-30: individually this patch looked
-// dead (the real file is never reached with patchESMThemeTypeboxImport still
-// stubbing theme.js's own highlightCode), but disabling both together
-// reaches the real highlight.js via the real theme.js and panics. Keep until
-// the compiler bug is filed and fixed.
+// with a no-op stub — the real module hits a real paserati compiler bug,
+// filed as paserati#121 (github.com/nooga/paserati/issues/121): a
+// left-associative binary-operator chain past ~248 terms exhausts the
+// register allocator, and highlight.js's lib/languages/gml.js builds its
+// built_in keyword string as one ~610-term `+` chain. Confirmed still
+// required 2026-08-30: individually this patch looked dead (the real file is
+// never reached with patchESMThemeTypeboxImport still stubbing theme.js's
+// own highlightCode), but disabling both together reaches the real
+// highlight.js via the real theme.js and panics. Keep until #121 is fixed.
 func patchESMSyntaxHighlightStub(source, filename string) string {
 	if filepath.Base(filename) != "syntax-highlight.js" {
 		return source

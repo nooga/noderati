@@ -62,8 +62,10 @@ after the Phase 2 scoreboard confirmed each dead against the real,
 unmodified `pi-coding-agent@0.80.2` tree. **Two remain:** `sdk-reexports`
 (a real, still-needed compile-error workaround, misidentified in an earlier
 pass of this doc as an `export *` issue — it isn't) and
-`syntax-highlight-stub` (blocks a live, unfiled paserati compiler bug —
-register-allocator exhaustion compiling the real `highlight.js`). Delete a
+`syntax-highlight-stub` (blocks a live paserati compiler bug — a
+left-associative binary-operator chain past ~248 terms exhausts the register
+allocator, [paserati#121](https://github.com/nooga/paserati/issues/121)).
+Delete a
 rewrite only when its underlying bug is fixed *and* verified via the
 scoreboard, including against the other patches still standing — see Phase 2
 below for why individual verification isn't sufficient on its own.
@@ -463,9 +465,21 @@ alone reaches the real `highlight.js` (with `theme-typebox-stub` still
 active, `syntax-highlight-stub`'s own real file is never imported; with
 `syntax-highlight-stub` still active, real `theme.js`'s import of it resolves
 to the trivial stub instead), but with both real, `theme.js` really does
-import the real `highlight.js`, and the compiler can't compile it. Not yet
-filed upstream — needs a minimal repro extracted from the real `highlight.js`
-source before filing (next up).
+import the real `highlight.js`, and the compiler can't compile it.
+
+Bisected further, isolated to a minimal, dependency-free repro, and filed as
+[paserati#121](https://github.com/nooga/paserati/issues/121): the real
+culprit inside `highlight.js` is `lib/languages/gml.js`'s `built_in` field, a
+~610-term chain of string-literal `+` concatenation. `compileInfixExpression`
+allocates a fresh register for its own left operand *before* recursing into
+it (`compile_expression.go:1222`), and can only free that register after the
+whole recursive call returns — so a left-associative chain needs `O(chain
+depth)` simultaneously-live registers, not `O(1)`, against
+`RegisterAllocator`'s fixed 256-register ceiling. Confirmed via a
+plain-`paserati` repro (no noderati involved): a bare top-level `const s = "a"
++ "b" + ... ;` compiles fine at 248 terms, panics at 249 — and the same
+symptom reproduces for a numeric `+` chain and for an `&&` chain of the same
+length, so it's not string-`+`-specific. Not yet fixed.
 
 **Consequence for Phase 3: "clean individually" is necessary but not
 sufficient — always confirm the actual batch before deleting, and again after
@@ -473,8 +487,9 @@ deleting.** Patches interact through the shared module graph.
 
 **Phase 1 close-out, done 2026-08-30:** deleted the 10 confirmed-safe patches
 from `esmpatch.go` (all of the 11-clean set above except `syntax-highlight-stub`,
-which stays — it's the one blocking the live register-allocator bug, not
-dead). `sdk-reexports` and `syntax-highlight-stub` are the only two rewrites
+which stays — it's the one blocking the live register-allocator bug,
+[paserati#121](https://github.com/nooga/paserati/issues/121), not dead).
+`sdk-reexports` and `syntax-highlight-stub` are the only two rewrites
 left in `esmpatch.go`, both with real, current justifications recorded in
 their doc comments. Re-verified against the real build (not just the env-var
 toggle) after deletion: `--version`/`--help`/`-p "hello"` all still match
