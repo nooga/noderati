@@ -62,13 +62,16 @@ after the Phase 2 scoreboard confirmed each dead against the real,
 unmodified `pi-coding-agent@0.80.2` tree. **Two remain:** `sdk-reexports`
 (a real, still-needed compile-error workaround, misidentified in an earlier
 pass of this doc as an `export *` issue — it isn't) and
-`syntax-highlight-stub` (blocks a live paserati compiler bug — a
-left-associative binary-operator chain past ~248 terms exhausts the register
-allocator, [paserati#121](https://github.com/nooga/paserati/issues/121)).
-Delete a
+`syntax-highlight-stub` (was blocking a register-allocator compiler bug,
+[paserati#121](https://github.com/nooga/paserati/issues/121), fixed upstream
+2026-08-30 — but re-enabling the real `highlight.js` uncovered two *more*
+real gaps behind it, one filed as
+[paserati#122](https://github.com/nooga/paserati/issues/122), so it still
+stays for now — see Phase 2 below for the full account). Delete a
 rewrite only when its underlying bug is fixed *and* verified via the
 scoreboard, including against the other patches still standing — see Phase 2
-below for why individual verification isn't sufficient on its own.
+below for why individual verification isn't sufficient on its own, even once
+the *first* blocking bug is fixed.
 
 **D. Resolver-side dirty tricks, independent of the above:**
 - `findPiCodingAgentNodeModulesRoots()` (`piai.go`) hardcodes
@@ -479,19 +482,62 @@ depth)` simultaneously-live registers, not `O(1)`, against
 plain-`paserati` repro (no noderati involved): a bare top-level `const s = "a"
 + "b" + ... ;` compiles fine at 248 terms, panics at 249 — and the same
 symptom reproduces for a numeric `+` chain and for an `&&` chain of the same
-length, so it's not string-`+`-specific. Not yet fixed.
+length, so it's not string-`+`-specific.
+
+**Fixed upstream, 2026-08-30** — `acd1d7fa` on `origin/main`
+([comment on #121](https://github.com/nooga/paserati/issues/121)): both the
+standard-operator and logical-operator branches now fold a left-associative
+run through a single accumulator register instead of recursing with a fresh
+`Alloc()` per level. Verified after pulling the fix: the exact repro above
+now handles 200,000+ terms (was ~248); `pkg/compiler.(*RegisterAllocator)`'s
+max register at n=5/50/300/2000 stays flat at R3 instead of growing with n;
+test262 `language`/`built-ins` both `+0/−0`.
+
+Re-verified end to end with the fix pulled in: enabling both
+`syntax-highlight-stub` and `theme-typebox-stub` together against the real
+`pi` CLI no longer panics — `--version`/`--help` succeed, `-p "hello"`
+reaches the expected network-dial failure. **But two more real gaps
+surfaced now that the real `highlight.js` actually loads**, both caught and
+logged (not crashed) by `highlight.js`'s own per-language try/catch around
+`registerLanguage`, so they show up as extra `ERROR: Language definition for
+'X' could not be registered` noise on every run rather than a crash:
+
+- **`latex`**: `error parsing regexp: invalid or unsupported Perl syntax:
+  `(?!`` — Go's `regexp` package (RE2) has no lookahead support at all, by
+  design (it trades that expressiveness for guaranteed-linear-time
+  matching). This isn't a bug to fix, it's an architectural boundary of the
+  regex engine noderati/paserati is built on; supporting it would mean a
+  different regex engine or a lookahead-emulation layer, out of scope here.
+- **`mercury`**: `TypeError: Cannot assign to read only property 'length' of
+  object` — a genuinely new paserati bug, isolated to a 5-line
+  dependency-free repro and filed as
+  [paserati#122](https://github.com/nooga/paserati/issues/122): a property
+  slot that once held a value read from a *frozen* object stays frozen even
+  after being reassigned a brand-new, unrelated, unfrozen value.
+  `highlight.js`'s own `core.js` deliberately deep-freezes its shared mode
+  objects (a bundled `deep-freeze-es6`) so language plugins can't mutate
+  them, and `mercury.js` works around that the normal way (`STRING.contains
+  = STRING.contains.slice()`) — which real Node handles fine and paserati
+  doesn't yet.
+
+So `syntax-highlight-stub` **stays in `esmpatch.go` for now** — #121 being
+fixed was necessary but not sufficient to delete it; #122 blocks a clean
+deletion (and `latex` will keep printing that one registration error
+regardless, unless highlight.js's own per-language catch is judged
+acceptable noise on its own — a call for whoever revisits this).
 
 **Consequence for Phase 3: "clean individually" is necessary but not
 sufficient — always confirm the actual batch before deleting, and again after
-deleting.** Patches interact through the shared module graph.
+deleting.** Patches interact through the shared module graph, and fixing the
+bug that made a patch *look* removable can uncover the next one behind it.
 
 **Phase 1 close-out, done 2026-08-30:** deleted the 10 confirmed-safe patches
 from `esmpatch.go` (all of the 11-clean set above except `syntax-highlight-stub`,
-which stays — it's the one blocking the live register-allocator bug,
-[paserati#121](https://github.com/nooga/paserati/issues/121), not dead).
-`sdk-reexports` and `syntax-highlight-stub` are the only two rewrites
-left in `esmpatch.go`, both with real, current justifications recorded in
-their doc comments. Re-verified against the real build (not just the env-var
+which stays — see above, still blocking real gaps, just different ones than
+originally thought). `sdk-reexports` and `syntax-highlight-stub` are the
+only two rewrites left in `esmpatch.go`, both with real, current
+justifications recorded in their doc comments. Re-verified against the real
+build (not just the env-var
 toggle) after deletion: `--version`/`--help`/`-p "hello"` all still match
 baseline exactly, `go test ./...` clean. Phase 1 is now fully done except
 item 5 (error-location diagnostics), which remains a fix-when-convenient, not
