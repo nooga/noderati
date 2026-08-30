@@ -66,19 +66,43 @@ func installModules(p *driver.Paserati) {
 	declareFSPromises(p)
 	declareModule()
 	declareWorkerThreads(p)
-	declarePiTui()
-	declarePiAi()
-	declarePiAgentCore()
-	declareHostedGitInfo()
+
+	// Ledger group B (docs/real-node-plan.md): third-party npm package
+	// fakes, individually toggleable for the Phase 2 scoreboard.
+	disabledFakes := disabledSet("NODERATI_DISABLE_FAKES")
+	if !isDisabled(disabledFakes, "pi-tui") {
+		declarePiTui()
+	}
+	if !isDisabled(disabledFakes, "pi-ai") {
+		declarePiAi()
+	}
+	if !isDisabled(disabledFakes, "pi-agent-core") {
+		declarePiAgentCore()
+	}
+	if !isDisabled(disabledFakes, "hosted-git-info") {
+		declareHostedGitInfo()
+	}
 	declarePerfHooks()
 	declareStringDecoder()
-	declareTypeboxCompile()
-	declareTypebox()
-	declareTypeboxValue()
-	declareDiff()
-	declareJiti()
-	declareGlob()
-	declareMinimatch()
-	declareProperLockfile()
+	if !isDisabled(disabledFakes, "typebox") {
+		declareTypeboxCompile()
+		declareTypebox()
+		declareTypeboxValue()
+	}
+	if !isDisabled(disabledFakes, "diff") {
+		declareDiff()
+	}
+	if !isDisabled(disabledFakes, "jiti") {
+		declareJiti()
+	}
+	if !isDisabled(disabledFakes, "glob") {
+		declareGlob()
+	}
+	if !isDisabled(disabledFakes, "minimatch") {
+		declareMinimatch()
+	}
+	if !isDisabled(disabledFakes, "proper-lockfile") {
+		declareProperLockfile()
+	}
 	declareCJSInterop(p)
 }
