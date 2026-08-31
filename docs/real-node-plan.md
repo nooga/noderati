@@ -800,6 +800,85 @@ Five issues filed across this investigation (`#128`, `#129`, `#130`,
 six now fixed. Still no group-B fake deleted — `minimatch` came the closest
 and turned out to be actively unsafe to delete right now.
 
+**`#141`/`#142` fixed and verified, 2026-08-31** —
+[paserati#143](https://github.com/nooga/paserati/pull/143), CI green on all
+three platforms (still open, not merged at verification time). Re-verified
+against the original repros — both fixed, no regressions on `#128`'s own
+repro either. `go test ./...` clean.
+
+**`#144` fixed in the same PR, verified same day.** The real `minimatch`
+package now works when actually exercised
+(`minimatch("foo/bar.js", "foo/**")` correctly returns `true`/`false`) —
+confirmed by direct functional test, not just the scoreboard's signal
+(learning last time's lesson).
+
+**Follow-on noderati-side fix, same day: `require()`'s own error message
+was still double/triple-wrapped even with `#142` fixed upstream.**
+`execFile`'s `vmInst.Call` failure got string-formatted once
+(`formatCallError`) into an `errors.RuntimeError`, then `require()`
+string-formatted *that* again into a plain `fmt.Errorf` — so a nested
+`require()`'s real, now-correctly-surviving exception still came out as an
+unreadable `Runtime Error (...): VM exception: {...full Inspect() dump...}`
+instead of the plain original message. Added `moduleThrow`
+(`internal/host/cjs.go`): implements both `errors.PaseratiError` (so
+`execFile`'s normal return channel and the top-level `RunCJS` entry point's
+error display keep working) and `vm.ExceptionError` (so `require()`'s own
+Go-error return hands the *raw* exception value straight back to
+paserati's native-function-error handling instead of forcing it to
+construct a new wrapper `Error` from an already-stringified message).
+Verified: a throw inside a required file now reports its exact original
+message at any nesting depth (tested to 3 levels), caught or uncaught.
+
+**Practical effect, re-verified with `#141`/`#142`/`#144` and the
+`moduleThrow` fix all in place:**
+
+- `proper-lockfile` — **loads and its main functions run** (`lockSync`,
+  `checkSync`, `unlockSync` all execute) once noderati's own `constants`
+  builtin (implemented same day, described below) closed its last blocker.
+  But real functional exercise (not just "does it load") found a **new,
+  larger, systemic noderati gap**: `fs`
+  errors don't set `.code` (`'ENOENT'`, etc.) the way real Node's `fs`
+  errors always do. `proper-lockfile`'s own `checkSync` relies on catching
+  `err.code === 'ENOENT'` to mean "not locked, return `false`"; with no
+  `.code`, it can't tell that error apart from a real failure and rethrows
+  it instead. This is bigger than `proper-lockfile` — every real package
+  that checks `fs` error codes (an extremely common Node idiom) hits the
+  same wall. Not filed or fixed here; flagged for its own pass (ledger
+  group A — real builtin, needs hardening, not a paserati issue).
+  **Still not deleting this fake** — it's demonstrably not equivalent to
+  the real, working package yet.
+- `hosted-git-info` — unchanged, still blocked by `lru-cache`'s
+  not-yet-bisected parse error.
+
+**Implemented the `constants` builtin, 2026-08-31.** `internal/host/constants.go`:
+registers the legacy, standalone `constants` module (real Node deprecated
+it in favor of `fs.constants`/`os.constants`, but real packages —
+`graceful-fs` among them — still `require()` it directly). Shares one list
+(`fsConstantEntries()`) with `fs.constants` so the two can't drift: the
+`F_OK`/`X_OK`/`W_OK`/`R_OK` access-mode constants (already existed) plus
+the common `O_*` open flags via Go's own `syscall` package (correctly
+platform-dispatched by Go itself). `O_SYMLINK` is gated to
+`runtime.GOOS == "darwin"`, matching real Node — it only exists on
+BSD-family platforms there too, and `graceful-fs` already feature-detects
+it via `constants.hasOwnProperty('O_SYMLINK')`, so omitting it elsewhere is
+correct, not a gap. Registered in `nativeRequireNames` (`cjs.go`) so
+`require('constants')` resolves to it. Verified: `graceful-fs` now loads
+cleanly end to end (previously blocked on this one missing builtin, itself
+previously hidden behind `#130`/`#142`'s exception-swallowing).
+
+**Also added: `fs.Stats.mtime` as a real `Date`, not just `.mtimeMs`.**
+`fsStats` (`fs.go`) only exposed `.mtimeMs` (a number) — real Node's
+`fs.Stats` has both, and real code (`proper-lockfile`'s own
+`mtime-precision.js`) calls `.mtime.getTime()` directly, which surfaced
+this while chasing `proper-lockfile`'s functional exercise above. Added
+`newFsStats(vmInst, info)`, shared by `fs.statSync` and
+`fs/promises.stat`, constructing a real `Date` via `vm.Construct` (a Go
+method/field returning `vm.Value` passes straight through paserati's
+struct-marshaling reflection unwrapped — confirmed by reading
+`native_module.go`'s `reflectValueToVM`, not just assumed). Verified:
+`stats.mtime instanceof Date` is `true`, `.getTime()` returns the same
+value as `.mtimeMs`.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

@@ -9,17 +9,40 @@ import (
 	"time"
 
 	"github.com/nooga/paserati/pkg/driver"
+	"github.com/nooga/paserati/pkg/vm"
 )
 
 type fsStats struct {
-	Size    int64   `json:"size"`
-	MtimeMs float64 `json:"mtimeMs"`
+	Size    int64    `json:"size"`
+	MtimeMs float64  `json:"mtimeMs"`
+	Mtime   vm.Value `json:"mtime"`
 	file    bool
 	dir     bool
 }
 
 func (s *fsStats) IsFile() bool      { return s.file }
 func (s *fsStats) IsDirectory() bool { return s.dir }
+
+// newFsStats builds an fsStats from a Go os.FileInfo, including a real JS
+// Date for .mtime — real Node's fs.Stats has both .mtimeMs (a number) and
+// .mtime (a Date); real packages call .mtime.getTime() directly
+// (proper-lockfile's mtime-precision.js is what surfaced this gap).
+func newFsStats(vmInst *vm.VM, info os.FileInfo) *fsStats {
+	mtimeMs := float64(info.ModTime().UnixMilli())
+	mtime := vm.Undefined
+	if dateCtor, ok := vmInst.GetGlobal("Date"); ok {
+		if v, err := vmInst.Construct(dateCtor, []vm.Value{vm.NumberValue(mtimeMs)}); err == nil {
+			mtime = v
+		}
+	}
+	return &fsStats{
+		Size:    info.Size(),
+		MtimeMs: mtimeMs,
+		Mtime:   mtime,
+		file:    !info.IsDir(),
+		dir:     info.IsDir(),
+	}
+}
 
 var (
 	fsFDs  sync.Map
@@ -86,6 +109,7 @@ func fsWrite(fd int64, data string) (int64, error) {
 }
 
 func declareFS(p *driver.Paserati) {
+	vmInst := p.GetVM()
 	p.DeclareModule("fs", func(m *driver.ModuleBuilder) {
 		m.Function("readFileSync", func(path string, _ ...interface{}) (string, error) {
 			fsTouch("read", path)
@@ -121,10 +145,9 @@ func declareFS(p *driver.Paserati) {
 			return nil, os.Chmod(path, os.FileMode(mode))
 		})
 		m.Namespace("constants", func(ns *driver.NamespaceBuilder) {
-			ns.Const("F_OK", 0)
-			ns.Const("X_OK", 1)
-			ns.Const("W_OK", 2)
-			ns.Const("R_OK", 4)
+			for _, c := range fsConstantEntries() {
+				ns.Const(c.Name, c.Value)
+			}
 		})
 		m.Function("mkdirSync", func(path string, _ ...interface{}) (interface{}, error) {
 			return nil, os.MkdirAll(path, 0755)
@@ -153,12 +176,7 @@ func declareFS(p *driver.Paserati) {
 			if err != nil {
 				return nil, err
 			}
-			return &fsStats{
-				Size:    info.Size(),
-				MtimeMs: float64(info.ModTime().UnixMilli()),
-				file:    !info.IsDir(),
-				dir:     info.IsDir(),
-			}, nil
+			return newFsStats(vmInst, info), nil
 		})
 		m.Function("realpathSync", func(path string, _ ...interface{}) (string, error) {
 			return filepath.EvalSymlinks(path)

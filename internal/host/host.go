@@ -48,6 +48,7 @@ func entryScriptDirs(argv []string) []string {
 
 func installModules(p *driver.Paserati) {
 	declarePath(p)
+	declareConstants(p)
 	declareOS(p)
 	declareUtil(p)
 	declareFS(p)

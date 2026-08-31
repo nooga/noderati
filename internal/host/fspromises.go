@@ -8,6 +8,7 @@ import (
 )
 
 func declareFSPromises(p *driver.Paserati) {
+	vmInst := p.GetVM()
 	p.DeclareModule("fs/promises", func(m *driver.ModuleBuilder) {
 		m.AsyncFunction("readFile", func(path string, _ ...interface{}) (string, error) {
 			fsTouch("read", path)
@@ -41,12 +42,7 @@ func declareFSPromises(p *driver.Paserati) {
 			if err != nil {
 				return nil, err
 			}
-			return &fsStats{
-				Size:    info.Size(),
-				MtimeMs: float64(info.ModTime().UnixMilli()),
-				file:    !info.IsDir(),
-				dir:     info.IsDir(),
-			}, nil
+			return newFsStats(vmInst, info), nil
 		})
 		m.AsyncFunction("access", func(path string, _ ...interface{}) (interface{}, error) {
 			fsTouch("stat", path)

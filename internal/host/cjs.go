@@ -21,7 +21,7 @@ var nativeRequireNames = map[string]bool{
 	"fs/promises": true,
 	"module": true, "worker_threads": true,
 	"perf_hooks": true, "string_decoder": true,
-	"stream/promises": true,
+	"stream/promises": true, "constants": true,
 }
 
 type cjsLoader struct {
