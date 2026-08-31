@@ -115,21 +115,21 @@ func declareFS(p *driver.Paserati) {
 			fsTouch("read", path)
 			b, err := os.ReadFile(path)
 			if err != nil {
-				return "", err
+				return "", wrapFsErr(vmInst, "open", path, err)
 			}
 			return string(b), nil
 		})
 		m.Function("writeFileSync", func(path string, data string, _ ...interface{}) (interface{}, error) {
-			return nil, os.WriteFile(path, []byte(data), 0644)
+			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, []byte(data), 0644))
 		})
 		m.Function("appendFileSync", func(path string, data string) (interface{}, error) {
 			f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err != nil {
-				return nil, err
+				return nil, wrapFsErr(vmInst, "open", path, err)
 			}
 			defer f.Close()
 			_, err = f.WriteString(data)
-			return nil, err
+			return nil, wrapFsErr(vmInst, "write", path, err)
 		})
 		m.Function("existsSync", func(path string) bool {
 			fsTouch("stat", path)
@@ -139,10 +139,10 @@ func declareFS(p *driver.Paserati) {
 		m.Function("accessSync", func(path string, _ ...interface{}) (interface{}, error) {
 			fsTouch("stat", path)
 			_, err := os.Stat(path)
-			return nil, err
+			return nil, wrapFsErr(vmInst, "access", path, err)
 		})
 		m.Function("chmodSync", func(path string, mode int64) (interface{}, error) {
-			return nil, os.Chmod(path, os.FileMode(mode))
+			return nil, wrapFsErr(vmInst, "chmod", path, os.Chmod(path, os.FileMode(mode)))
 		})
 		m.Namespace("constants", func(ns *driver.NamespaceBuilder) {
 			for _, c := range fsConstantEntries() {
@@ -150,13 +150,13 @@ func declareFS(p *driver.Paserati) {
 			}
 		})
 		m.Function("mkdirSync", func(path string, _ ...interface{}) (interface{}, error) {
-			return nil, os.MkdirAll(path, 0755)
+			return nil, wrapFsErr(vmInst, "mkdir", path, os.MkdirAll(path, 0755))
 		})
 		m.Function("readdirSync", func(path string, _ ...interface{}) ([]string, error) {
 			fsTouch("readdir", path)
 			entries, err := os.ReadDir(path)
 			if err != nil {
-				return nil, err
+				return nil, wrapFsErr(vmInst, "scandir", path, err)
 			}
 			names := make([]string, len(entries))
 			for i, e := range entries {
@@ -165,39 +165,42 @@ func declareFS(p *driver.Paserati) {
 			return names, nil
 		})
 		m.Function("unlinkSync", func(path string) (interface{}, error) {
-			return nil, os.Remove(path)
+			return nil, wrapFsErr(vmInst, "unlink", path, os.Remove(path))
 		})
 		m.Function("rmdirSync", func(path string) (interface{}, error) {
-			return nil, os.Remove(path)
+			return nil, wrapFsErr(vmInst, "rmdir", path, os.Remove(path))
 		})
 		m.Function("statSync", func(path string, _ ...interface{}) (*fsStats, error) {
 			fsTouch("stat", path)
 			info, err := os.Stat(path)
 			if err != nil {
-				return nil, err
+				return nil, wrapFsErr(vmInst, "stat", path, err)
 			}
 			return newFsStats(vmInst, info), nil
 		})
 		m.Function("realpathSync", func(path string, _ ...interface{}) (string, error) {
-			return filepath.EvalSymlinks(path)
+			resolved, err := filepath.EvalSymlinks(path)
+			return resolved, wrapFsErr(vmInst, "realpath", path, err)
 		})
 		m.Function("openSync", func(path string, _ ...interface{}) (int64, error) {
-			return fsOpen(path)
+			fd, err := fsOpen(path)
+			return fd, wrapFsErr(vmInst, "open", path, err)
 		})
 		m.Function("closeSync", func(fd int64, _ ...interface{}) (interface{}, error) {
-			return nil, fsClose(fd)
+			return nil, wrapFsErr(vmInst, "close", "", fsClose(fd))
 		})
 		m.Function("writeSync", func(fd int64, data string, _ ...interface{}) (int64, error) {
-			return fsWrite(fd, data)
+			n, err := fsWrite(fd, data)
+			return n, wrapFsErr(vmInst, "write", "", err)
 		})
 		m.Function("copyFileSync", func(src, dst string) (interface{}, error) {
-			return nil, copyFile(src, dst)
+			return nil, wrapFsErr(vmInst, "copyfile", src, copyFile(src, dst))
 		})
 		m.Function("renameSync", func(oldPath, newPath string) (interface{}, error) {
-			return nil, os.Rename(oldPath, newPath)
+			return nil, wrapFsErr(vmInst, "rename", oldPath, os.Rename(oldPath, newPath))
 		})
 		m.Function("rmSync", func(path string) (interface{}, error) {
-			return nil, os.RemoveAll(path)
+			return nil, wrapFsErr(vmInst, "rm", path, os.RemoveAll(path))
 		})
 		m.Default(nil)
 	})

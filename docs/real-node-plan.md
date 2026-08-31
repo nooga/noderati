@@ -895,6 +895,72 @@ matching baseline exactly. `glob`'s fake (a separate, sibling shim in the
 same file, still genuinely broken — `fake-off:glob` hits a real, unfixed
 parse error) is untouched.
 
+**Implemented real Node-shaped `fs` errors, 2026-08-31.** New
+`internal/host/fs_errors.go`: `wrapFsErr(vmInst, syscallName, path, err)`
+classifies a Go stdlib `fs`/`os` error (via `errors.As` into
+`syscall.Errno`, mapped through a small, portable `errnoToCode` table —
+same "Go's own platform-dispatched constants" pattern as `constants.go`'s
+`O_*` flags) and constructs a real JS `Error` shaped like Node's
+`SystemError`: `.code` (`'ENOENT'` etc.), `.errno`, `.syscall`, `.path`,
+plus a message formatted to match
+(`"ENOENT: no such file or directory, stat '/path'"`). Wired through
+every `fs`/`fs/promises` function that can fail (`fs.go`,
+`fspromises.go`) — previously every one of them just returned the bare Go
+error, which the VM stringifies into a generic `Error` with no `.code` at
+all. Real Node code overwhelmingly branches on `.code`
+(`if (e.code === 'ENOENT')`), not `.message` — this was invisible to that
+extremely common idiom before. Verified: `fs.statSync` on a missing path
+throws with `.code === 'ENOENT'` and the exact real-Node message format;
+`proper-lockfile`'s full **sync** cycle (`lockSync`/`checkSync`/
+`unlockSync` on a real file) now runs correctly end to end, including the
+`checkSync`-after-`unlock` case that used to throw instead of returning
+`false`.
+
+**Found while verifying: a real, separate paserati bug on the `fs/promises`
+(async) side.** The identical fix, wired through `fs/promises`, does *not*
+work — a rejected async `fs/promises` call's `.catch()` handler receives a
+bare JS **string**, not the real `Error` object with `.code`/`.message`
+(`typeof e === "string"`, `e.code === undefined`). Traced to
+`pkg/driver/native_module.go`'s `wrapNativeAsAsync` (`ModuleBuilder.
+AsyncFunction`'s wrapper): it always does
+`vmInst.NewRejectedPromise(vm.NewString(err.Error()))`, discarding
+whatever real exception value a Go error carries — unlike the synchronous
+native-function path (`vm.go`'s main interpreter loop), which correctly
+checks for `vm.ExceptionError` first. Filed as
+[paserati#147](https://github.com/nooga/paserati/issues/147), with a
+minimal repro reduced to the driver API directly (no `fs` involved).
+
+**`proper-lockfile`'s own async API (`lock`/`unlock`/`check`, not the
+`*Sync` variants) is separately, still broken** — `await
+lockfile.lock(path)` throws `TypeError: undefined is not a function`, a
+different failure from the `#147` promise-rejection issue above (this one
+happens on the *success* path, before any error/rejection is even in
+play). Not yet bisected. **Still not deleting this fake** — the sync API
+genuinely works now, but the package as a whole doesn't yet, and the
+scoreboard's own "clean" signal would have been a second false-positive if
+trusted on its own, exactly like `minimatch` was — this time caught by
+checking the *async* surface specifically before acting on it, per the
+lesson written down after the first one.
+
+**Filed the Phase 1 item 5 diagnostics gap, finally, 2026-08-31**
+([paserati#148](https://github.com/nooga/paserati/issues/148)) — noted
+since the very first session (`isBunBinary`'s fabricated `line 1, column
+1`) but never actually filed until a clean, minimal, 2-file repro was in
+hand (a `.mjs` importing a sibling `.mjs` with a real syntax error on line
+4): the error *message* correctly reports the real inner position
+(`Syntax Error at 4:11`), but the *displayed* context snippet and final
+`at line X, column Y` are unrelated — the entry file's own line 1, always.
+Root-caused precisely: `vm.runtimeError()` hardcodes `Column: 1` and never
+attaches `Position.Source`, so `errors.DisplayErrors` falls back to
+whichever source the embedder happened to pass it (typically the
+top-level entry script), not the module that actually failed — even
+though the real position was sitting right there in the original error
+being wrapped. This is very likely the same mechanism behind
+`hosted-git-info`'s nonsensical `lru-cache` position (`2:2510` in a file
+whose real line 2 is a 37-character sourcemap comment) and several other
+"`Syntax Error at N:M`" positions seen throughout Phase 3 that never quite
+lined up with the file's real content.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
