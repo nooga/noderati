@@ -654,10 +654,75 @@ Net: no group-B fake deleted yet. Each of the three actually tried hits a
 real, currently-unfixed engine gap — exactly the outcome this phase expects
 to find (see the phase's own note above: "Expect `pi-tui` and `pi-ai` to
 surface the most new gaps"), just found one leaf earlier than expected.
-Filed three issues today (`#128`, `#129`, `#130`); `#128` in particular
-looks worth fixing before continuing this phase
-further — it's general enough that it may silently unblock several of the
-others too.
+Filed three issues today (`#128`, `#129`, `#130`).
+
+**Fixed upstream, same day** — `357881e2` (#128), `f49b07e2` (#129),
+`fa0d5451` (#130), plus more not asked for: `a88125c2` (#132, per-iteration
+`let`/`const`/`class` bindings in loop bodies), `b1958dd8` (#133, stale
+`frame.promiseObj` on generator/async-generator resume), `504e7e87` (#135,
+constructor stack overflow now a catchable `RangeError`). Re-pulled and
+re-verified against the original repros:
+
+- `#129` — fully fixed. `pi-ai/dist/auth/context.js` now loads cleanly on
+  its own, and its real `index.js` barrel loads cleanly too (`Object.keys`
+  reports all 40 exports). The `proxy.js` "Class extends value undefined"
+  from the earlier exploration pass was re-confirmed as the already-known
+  false lead (noderati's own incomplete `pi-ai` fake, still active in that
+  specific isolated test) — not a real blocker once the real package is
+  used throughout.
+- `#128` — fixed for the case that motivated it (arrow functions, methods,
+  immediately-nested closures referencing a function-scoped class), but
+  **not** for a hoisted function *declaration* referencing a sibling
+  function-scoped class — same symptom, same `OpGetGlobal`-not-upvalue
+  bytecode shape, isolated to a repro that differs from #128's own
+  passing regression test by exactly one thing (`function inner() {}`
+  instead of `const inner = () => {}` in the identical position). Filed as
+  a distinct follow-up,
+  [paserati#141](https://github.com/nooga/paserati/issues/141).
+- `#130` — fixed for the case it targeted (an internal-invariant VM failure
+  — corrupted bytecode, stack overflow — with no JS exception value to
+  report; confirmed via the issue's own added tests, which now pass). An
+  **ordinary JS `throw`** propagating through a *reentrant* `vm.Call()`
+  (noderati's `require()` calling into another `require()`, i.e. two-plus
+  nested `vm.Call()` invocations on the Go stack) still isn't fixed —
+  worse than before, actually: caught, the exception value is now literally
+  `null`, not even a wrong `Error`. The #130 fix's own commit message
+  explicitly says it investigated and ruled out a reentrancy-based cause —
+  for the trigger it tested (single `vm.Call()`, `runtimeError()` path).
+  This is a different trigger (ordinary throw, nested `vm.Call()`) with
+  real evidence of a *third* nested `vm.Call()` involved (`vm.go:11288`,
+  converting a native function's returned Go `error` into a thrown `Error`
+  object also calls `vm.Call(errCtor, ...)`). Filed as
+  [paserati#142](https://github.com/nooga/paserati/issues/142).
+
+**Practical effect on the three original blockers:**
+
+- **`hosted-git-info`** — still blocked, but progress: `GitHost`'s own
+  class-self-reference bug (#128's core case) is fixed. What's left is a
+  `require('lru-cache')` deep inside `index.js`; `lru-cache`'s own bundled
+  CJS file has a genuine parse error, previously invisible — masked by
+  `#142`'s exception-swallowing (a require()-of-a-require() shape) until
+  bisected past it. Not yet root-caused: the reported position (`2:2510`)
+  is meaningless (the file is a 19KB single-line minified bundle plus a
+  `//# sourceMappingURL=` comment on line 2 — the *real* diagnostics gap
+  from Phase 1 item 5, still unfiled, striking again). Needs proper
+  bisection (the file's too dense for line/col-based narrowing) or a
+  reformatting pass before it's fileable.
+- **`proper-lockfile`** — still blocked by the same `graceful-fs` →
+  `require('constants')` chain from the previous exploration pass; #130's
+  fix doesn't reach it either, since it's the same reentrant-ordinary-throw
+  shape as `#142`, not the `runtimeError()` shape #130 actually fixed.
+- **`pi-agent-core`** — `proxy.js`'s "Class extends value undefined" is
+  confirmed a false lead (see `#129` note above) *once the real `pi-ai`
+  package is used*; with the `pi-ai` fake still active (as in a
+  `fake-off:pi-agent-core`-only scoreboard run), it still reproduces,
+  correctly, since that's still testing against the incomplete fake.
+
+Two new issues filed today (`#141`, `#142`) on top of the three from the
+previous pass, three of five now fixed. No group-B fake deleted yet — every
+one of these is a real engine or noderati-side gap, still being found faster
+than fixed, which is the whole point of doing this exploration before
+committing to deletions.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory

@@ -51,7 +51,7 @@ var fakeNames = []string{
 // calls — a stale entry here just silently no-ops (isDisabled matches
 // nothing), which reads as "clean" without actually testing anything.
 var patchNames = []string{
-	"sdk-reexports", "syntax-highlight-stub",
+	"sdk-reexports",
 }
 
 type invocation struct {
