@@ -1,0 +1,10 @@
+{
+	"compilerOptions": {
+		"skipLibCheck": true,
+		"types": [],
+		"typeRoots": [],
+		"noEmit": true,
+		"lib": ["es2018"]
+	},
+	"files": ["hello-tsc.ts"]
+}

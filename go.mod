@@ -14,4 +14,4 @@ require (
 	golang.org/x/text v0.41.0 // indirect
 )
 
-replace github.com/nooga/paserati => ../paserati-noderati-host
+replace github.com/nooga/paserati => ../paserati

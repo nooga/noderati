@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "noLib": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "target": "es2018",
+    "module": "commonjs",
+    "types": ["connect"],
+    "typeRoots": ["./node_modules/.pnpm/@types+connect@3.4.38/node_modules/@types"]
+  },
+  "files": ["lib.stub.d.ts", "hello-tsc.ts"]
+}

@@ -1,0 +1,13 @@
+{
+	"compilerOptions": {
+		"noLib": true,
+		"skipLibCheck": true,
+		"types": [],
+		"typeRoots": [],
+		"noEmit": false,
+		"outDir": "/tmp/noderati-tsc-out",
+		"target": "es2018",
+		"module": "commonjs"
+	},
+	"files": ["lib.stub.d.ts", "hello-tsc.ts"]
+}
