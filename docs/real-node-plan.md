@@ -34,10 +34,14 @@ proud of and building on.
 
 **A-minus. Real builtin name, fake body — needs a real implementation, not
 deletion:** `string_decoder` (`stringdecoder.go` — `write()` just does
-`String(c)`, no actual UTF-8 multibyte/incremental decoding), `glob`/`minimatch`
-(real Node/npm surface, but `globSync` always returns `[]` and `minimatch`
-always returns `false` — silently *wrong*, worse than missing). `stream.go`
-also hand-rolls its own `EventEmitter` instead of reusing `events.go`'s — pick
+`String(c)`, no actual UTF-8 multibyte/incremental decoding), `glob`
+(real Node/npm surface, but `globSync` always returns `[]` — silently
+*wrong*, worse than missing). `minimatch`'s equivalent fake was resolved the
+group-B way instead, 2026-08-31 — deleted outright, real `node_modules`
+resolution now loads the genuine package (see Phase 3 below); it never
+needed a real from-scratch implementation here, just deleting the shim.
+`stream.go` also hand-rolls its own `EventEmitter` instead of reusing
+`events.go`'s — pick
 one.
 
 **B. Third-party npm package fakes — delete the shim, load the real
@@ -49,9 +53,8 @@ from-scratch reimplementation of the real LLM client, including its own model
 catalog and provider fetch calls), `@earendil-works/pi-agent-core` (a
 from-scratch reimplementation of the actual agent loop), `typebox` /
 `typebox/value` / `typebox/compile`, `diff`, `jiti/static`, `glob`,
-`minimatch` (as a *third-party npm shim* — separate from the A-minus concern
-about implementing the real Node `glob`-alike surface if we choose to keep
-that name meaning something else), `proper-lockfile`, `hosted-git-info`.
+`proper-lockfile`, `hosted-git-info`. (`minimatch` was here too — deleted
+2026-08-31, see Phase 3 below, first of this group actually gone.)
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
@@ -878,6 +881,19 @@ struct-marshaling reflection unwrapped — confirmed by reading
 `native_module.go`'s `reflectValueToVM`, not just assumed). Verified:
 `stats.mtime instanceof Date` is `true`, `.getTime()` returns the same
 value as `.mtimeMs`.
+
+**First group-B fake actually deleted, 2026-08-31: `minimatch`.**
+`internal/host/glob.go`'s `minimatchShim` and its `declareMinimatch()`
+registration removed; `node_modules` resolution now always loads the real
+package. Verified the same way the false-positive scare above should have
+been verified the first time: not just "no diff across the scoreboard's
+three invocations" (though it is clean there too), but an actual functional
+call — `minimatch("foo/bar.js", "foo/**")` / `minimatch("foo/bar.js",
+"baz/**")` correctly return `true`/`false` — and a full re-run of
+`--version`/`--help`/`-p "hello"` against the real, unmodified `pi` CLI
+matching baseline exactly. `glob`'s fake (a separate, sibling shim in the
+same file, still genuinely broken — `fake-off:glob` hits a real, unfixed
+parse error) is untouched.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory

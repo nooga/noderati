@@ -42,7 +42,7 @@ const perRunTimeout = 20 * time.Second
 // fakeNames mirrors installModules()'s ledger-group-B knobs.
 var fakeNames = []string{
 	"pi-tui", "pi-ai", "pi-agent-core", "hosted-git-info",
-	"typebox", "diff", "jiti", "glob", "minimatch", "proper-lockfile",
+	"typebox", "diff", "jiti", "glob", "proper-lockfile",
 }
 
 // patchNames mirrors patchModuleSource()'s per-rewrite knobs. Was twelve;

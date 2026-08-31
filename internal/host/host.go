@@ -99,9 +99,10 @@ func installModules(p *driver.Paserati) {
 	if !isDisabled(disabledFakes, "glob") {
 		declareGlob()
 	}
-	if !isDisabled(disabledFakes, "minimatch") {
-		declareMinimatch()
-	}
+	// minimatch's fake was deleted 2026-08-31 (paserati#144 fixed, real
+	// package verified working via actual functional exercise — see
+	// docs/real-node-plan.md's Phase 3 section) — node_modules resolution
+	// now always loads the real minimatch package.
 	if !isDisabled(disabledFakes, "proper-lockfile") {
 		declareProperLockfile()
 	}
