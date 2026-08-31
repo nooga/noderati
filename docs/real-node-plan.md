@@ -724,6 +724,82 @@ one of these is a real engine or noderati-side gap, still being found faster
 than fixed, which is the whole point of doing this exploration before
 committing to deletions.
 
+**`#141`/`#142` fixed and verified, 2026-08-31** — [paserati#143](https://github.com/nooga/paserati/issues/143)
+(`357881e2`..`3b1fa14e` range via `5734ffda` #141, `3b1fa14e` #142), CI
+green on all three platforms. Re-verified against the original repros:
+
+- `#141` — fixed. The hoisted-function/sibling-class repro now prints
+  `function` correctly.
+- `#142` — fixed at the actual source (not the `vm.go:11288` site the
+  issue guessed at — that was investigated and explicitly ruled out; the
+  real cause was `executeUserFunctionSafe`/`executeUserFunctionWithNewTarget`
+  leaving `vm.unwinding=true` on an *absorbed* exception handoff, poisoning
+  the next unrelated `vm.run()` anywhere). The reentrant-`require()` repro
+  now surfaces the real `Error` (`instanceof Error`, correct `name`) instead
+  of `null`.
+
+**Follow-on noderati-side fix, same day:** fixing `#142` upstream exposed a
+real bug in noderati's *own* `internal/host/cjs.go` — `execFile`'s
+`vmInst.Call` failure got string-formatted once (`formatCallError`) into an
+`errors.RuntimeError`, then `require()` string-formatted *that* again into
+a plain `fmt.Errorf`, so even with the real exception now surviving
+paserati's side, a nested `require()`'s thrown message came out as a
+double-wrapped, unreadable `Runtime Error (...): VM exception: {...full
+Inspect() dump...}` instead of the plain original message. Added
+`moduleThrow` (`cjs.go`): implements both `errors.PaseratiError` (so
+`execFile` can still return it through its normal channel, keeping the
+top-level `RunCJS` entry point's error display working) and
+`vm.ExceptionError` (so `require()`'s own Go-error return hands the *raw*
+exception value straight back to paserati's native-function-error handling
+instead of forcing it to construct a new wrapper `Error` from an
+already-stringified message). Verified: `require("./b.js")` where `b.js`
+throws `new Error("boom from b.js")` now reports exactly `boom from b.js`
+at any nesting depth (tested to 3 levels), caught or uncaught. `go test
+./...` clean.
+
+**Practical effect, re-verified with both fixes in noderati:**
+
+- `proper-lockfile` — no longer masked. The real underlying cause finally
+  surfaces cleanly: `graceful-fs`'s `polyfills.js` does `require('constants')`,
+  a real Node builtin noderati doesn't implement yet (ledger group A/A-minus
+  gap, not a paserati issue — still not built).
+- `hosted-git-info` — no longer masked either, revealing a **different** real
+  gap than expected: `require('lru-cache')` fails with a parse error whose
+  reported position is meaningless (the file is a single 19KB minified line
+  plus a `//# sourceMappingURL=` comment — the still-unfiled Phase 1 item 5
+  diagnostics gap). Not yet bisected (needs reformatting or careful content
+  bisection, not line/col narrowing) or filed.
+- **New finding, not previously known: `fake-off:minimatch` was a false
+  "clean" signal.** The scoreboard's three invocations
+  (`--version`/`--help`/`-p`) never actually call `minimatch()`, so removing
+  the fake showed no diff — but the *real* `minimatch` package throws
+  immediately when actually exercised
+  (`ReferenceError: Minimatch is not defined`), and would have shipped
+  broken if deleted on the scoreboard's word alone. Bisected to a **third**
+  instance of the #128/#141 family: a closure defined *before* a
+  function-scoped class in source order (not hoisted — an ordinary
+  `const f = () => ...`), only *called* after the class is declared (no
+  real TDZ violation, completely ordinary JS — this is exactly
+  `minimatch`'s own `dist/commonjs/index.js` shape: `const minimatch = (p,
+  pattern, options) => { ...; return new Minimatch(...).match(p); }`
+  defined near the top of the file, `class Minimatch` declared later).
+  Neither #128's nor #141's fix covers this — both pre-register a class's
+  spill slot at a specific compile-time trigger point (the class's own
+  body, or a block's hoisted functions) that a plain, non-hoisted earlier
+  statement doesn't hit. Filed as
+  [paserati#144](https://github.com/nooga/paserati/issues/144). **Lesson
+  for the scoreboard's own methodology:** "no diff across the three
+  invocations" only proves *those three invocations* don't exercise the
+  removed fake's real replacement — not that the replacement actually
+  works. Don't delete a group-B fake on that signal alone; exercise the
+  real package's actual functionality directly first, the way this catch
+  required.
+
+Five issues filed across this investigation (`#128`, `#129`, `#130`,
+`#141`, `#142`) plus one more (`#144`) found verifying the fixes; four of
+six now fixed. Still no group-B fake deleted — `minimatch` came the closest
+and turned out to be actively unsafe to delete right now.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

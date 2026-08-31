@@ -151,17 +151,45 @@ func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.Pasera
 		vm.String(filepath.Dir(abs)),
 	})
 	if err != nil {
-		return vm.Undefined, []errors.PaseratiError{&errors.RuntimeError{Msg: formatCallError(err)}}
+		return vm.Undefined, []errors.PaseratiError{newModuleThrow(err)}
 	}
 	return l.moduleExports(moduleVal), nil
 }
 
-func formatCallError(err error) string {
-	if ee, ok := err.(vm.ExceptionError); ok {
-		return "VM exception: " + ee.GetExceptionValue().Inspect()
-	}
-	return err.Error()
+// moduleThrow wraps a real, thrown JS exception that crossed a required
+// module's own vm.Call boundary. It's an errors.PaseratiError (so execFile
+// can return it through its normal []errors.PaseratiError channel, and the
+// top-level RunCJS entry point's error display still works), but it also
+// implements vm.ExceptionError, carrying the raw exception Value — so
+// require()'s own Go-error return can hand a *nested* require() failure's
+// real exception straight back to paserati's native-function-error
+// handling (vm.go's `if ee, ok := err.(ExceptionError); ok { ... }`
+// branch), instead of forcing it to construct a brand-new wrapper Error
+// from an already-formatted, stringified message. Before paserati#130/#142
+// were fixed, every nested require() failure lost its real exception
+// anyway (replaced by a generic message, or literally `null`); now that a
+// real exception does survive a reentrant vm.Call(), this is what stops
+// noderati's own require() from re-flattening it into an unreadable,
+// multiply-wrapped "Runtime Error (...): VM exception: {...}" string.
+type moduleThrow struct {
+	*errors.RuntimeError
+	exception vm.Value
 }
+
+func newModuleThrow(err error) *moduleThrow {
+	msg := err.Error()
+	exception := vm.Undefined
+	if ee, ok := err.(vm.ExceptionError); ok {
+		exception = ee.GetExceptionValue()
+		msg = exception.Inspect()
+	}
+	return &moduleThrow{
+		RuntimeError: &errors.RuntimeError{Msg: msg},
+		exception:    exception,
+	}
+}
+
+func (e *moduleThrow) GetExceptionValue() vm.Value { return e.exception }
 
 func (l *cjsLoader) moduleExports(moduleVal vm.Value) vm.Value {
 	obj := moduleVal.AsPlainObject()
@@ -206,6 +234,14 @@ func (l *cjsLoader) require(specifier, fromFile string) (vm.Value, error) {
 	}
 	val, errs := l.execFile(resolved, StripShebang(string(data)))
 	if len(errs) > 0 {
+		// A real thrown exception (moduleThrow) is returned as-is so its
+		// raw value survives the native-call boundary intact — see
+		// moduleThrow's doc comment. Anything else (a parse/compile
+		// failure, which has no JS exception value to preserve) still
+		// gets flattened to a plain Go error message, as before.
+		if mt, ok := errs[0].(*moduleThrow); ok {
+			return vm.Undefined, mt
+		}
 		return vm.Undefined, fmt.Errorf("%s", errs[0].Error())
 	}
 	return val, nil
