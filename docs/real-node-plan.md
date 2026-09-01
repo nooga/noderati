@@ -1430,6 +1430,30 @@ this traces to a *new*, more general, more severe bug than anything
   actual target CLI, only a corner of `hosted-git-info`'s API surface
   nothing currently exercises.
 
+**2026-09-01, sixth round: `#170` fixed and verified.** Local paserati
+checkout pulled the fix. Full re-verification (build/vet/test, all
+three `pi` invocations, full scoreboard) clean, no regressions. Verified
+two ways: directly through noderati, the real `hosted-git-info`'s
+`browse()` called with zero arguments now returns the correct templated
+URL instead of throwing (`https://github.com/foo/bar`, matching real
+Node); and confirmed the checker-level companion diagnostic
+(`checker/call.go`'s `PS2001`) still fires as expected on a literal call
+site with type-checking on — exactly the "separate, not what this issue
+is about" scoping from the original report, not a regression. Since
+noderati always runs real npm CJS/ESM with `SkipTypeCheck(true)` (real,
+unannotated `.js` never gets this diagnostic in practice), that
+remaining checker-side piece doesn't affect anything here. No code
+changes needed on noderati's side for this round — the fix was entirely
+upstream and nothing was working around it locally to begin with.
+
+**This closes out every issue filed against `hosted-git-info`'s
+investigation** — `#159`, `#160` (destructuring), `#163` (re-export of
+an import), `#168` (`Object.assign` enumerability), `#170` (variadic
+arity) — all fixed, verified, and `hosted-git-info`'s fake is gone for
+good. Six rounds of back-and-forth from "silently returns `{}`" to a
+fully-working real package, each round finding the next real bug once
+the previous one stopped being the blocker.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
