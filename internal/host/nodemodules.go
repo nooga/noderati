@@ -72,7 +72,7 @@ func (r *NodeModulesResolver) Resolve(specifier string, fromPath string) (*modul
 		return nil, fmt.Errorf("package %q not found: %w", pkgName, err)
 	}
 
-	entryPath, err := resolvePackageEntry(pkgDir, subpath)
+	entryPath, err := resolvePackageEntry(pkgDir, subpath, exportsConditionImport)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve entry for %q: %w", specifier, err)
 	}
@@ -158,26 +158,47 @@ func findPackageDir(startDir, pkgName string) (string, error) {
 	return "", fmt.Errorf("node_modules/%s not found from %s", pkgName, startDir)
 }
 
-func resolvePackageEntry(pkgDir, subpath string) (string, error) {
-	if subpath != "" {
-		return resolveSubpathEntry(pkgDir, subpath)
+// exportsCondition picks which of the "import"/"require" branches of a
+// conditional exports map applies to the module system doing the
+// resolving. Real Node never considers the branch that doesn't match the
+// caller's module system (a require() call never picks an "import"-only
+// target, and vice versa) — mixing them up silently hands a CJS require()
+// call an ESM file (or the reverse), which our loader then either
+// misparses or, worse, "successfully" loads with an empty exports object.
+type exportsCondition int
+
+const (
+	exportsConditionRequire exportsCondition = iota
+	exportsConditionImport
+)
+
+func (c exportsCondition) candidates() []string {
+	if c == exportsConditionRequire {
+		return []string{"node", "require", "default"}
 	}
-	return resolveMainEntry(pkgDir)
+	return []string{"node", "import", "default"}
 }
 
-func resolveMainEntry(pkgDir string) (string, error) {
+func resolvePackageEntry(pkgDir, subpath string, cond exportsCondition) (string, error) {
+	if subpath != "" {
+		return resolveSubpathEntry(pkgDir, subpath, cond)
+	}
+	return resolveMainEntry(pkgDir, cond)
+}
+
+func resolveMainEntry(pkgDir string, cond exportsCondition) (string, error) {
 	pkg, err := readPackageJSON(pkgDir)
 	if err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
 
 	if pkg != nil {
-		if entry, ok, err := entryFromExports(pkg.Exports, "."); err != nil {
+		if entry, ok, err := entryFromExports(pkg.Exports, ".", cond); err != nil {
 			return "", err
 		} else if ok {
 			return resolveRelativeEntry(pkgDir, entry)
 		}
-		if pkg.Module != "" {
+		if cond == exportsConditionImport && pkg.Module != "" {
 			return resolveRelativeEntry(pkgDir, pkg.Module)
 		}
 		if pkg.Main != "" {
@@ -188,7 +209,7 @@ func resolveMainEntry(pkgDir string) (string, error) {
 	return resolveIndexFallback(pkgDir)
 }
 
-func resolveSubpathEntry(pkgDir, subpath string) (string, error) {
+func resolveSubpathEntry(pkgDir, subpath string, cond exportsCondition) (string, error) {
 	pkg, err := readPackageJSON(pkgDir)
 	if err != nil && !os.IsNotExist(err) {
 		return "", err
@@ -196,7 +217,7 @@ func resolveSubpathEntry(pkgDir, subpath string) (string, error) {
 
 	exportKey := "./" + subpath
 	if pkg != nil {
-		if entry, ok, err := entryFromExports(pkg.Exports, exportKey); err != nil {
+		if entry, ok, err := entryFromExports(pkg.Exports, exportKey, cond); err != nil {
 			return "", err
 		} else if ok {
 			return resolveRelativeEntry(pkgDir, entry)
@@ -222,7 +243,7 @@ func readPackageJSON(pkgDir string) (*packageJSON, error) {
 	return &pkg, nil
 }
 
-func entryFromExports(exports json.RawMessage, key string) (string, bool, error) {
+func entryFromExports(exports json.RawMessage, key string, cond exportsCondition) (string, bool, error) {
 	if len(exports) == 0 {
 		return "", false, nil
 	}
@@ -245,10 +266,10 @@ func entryFromExports(exports json.RawMessage, key string) (string, bool, error)
 		return "", false, nil
 	}
 
-	return resolveExportTarget(value)
+	return resolveExportTarget(value, cond)
 }
 
-func resolveExportTarget(raw json.RawMessage) (string, bool, error) {
+func resolveExportTarget(raw json.RawMessage, cond exportsCondition) (string, bool, error) {
 	var asString string
 	if err := json.Unmarshal(raw, &asString); err == nil {
 		return asString, true, nil
@@ -259,12 +280,12 @@ func resolveExportTarget(raw json.RawMessage) (string, bool, error) {
 		return "", false, fmt.Errorf("unsupported export target format")
 	}
 
-	for _, candidate := range []string{"node", "import", "require", "default"} {
+	for _, candidate := range cond.candidates() {
 		entry, ok := asMap[candidate]
 		if !ok {
 			continue
 		}
-		resolved, found, err := resolveExportTarget(entry)
+		resolved, found, err := resolveExportTarget(entry, cond)
 		if err != nil {
 			return "", false, err
 		}

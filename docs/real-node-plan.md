@@ -1067,6 +1067,149 @@ a completely different package (`jiti/dist/jiti.cjs`). One fix likely
 unblocks (or moves past a blocker in) more than one Phase 3 target at
 once.
 
+**2026-09-01, second round: local paserati checkout pulled a large batch
+of fixes** (`fix-159-and-160` branch — `#159`/`#160` themselves plus
+seven more: TDZ markers on every `let`/`const` declarator, `var`/pattern
+hoisting through loop heads and `for` heads, a rest element nested in an
+object pattern, function-vs-module var scoping). Full re-verification
+(`go build`/`vet`/`test`, all three `pi` invocations, full scoreboard)
+confirmed clean, no regressions. `#159`/`#160` themselves verified fixed
+directly (the `lru-cache` repros from the previous round now parse and
+run correctly). Investigating further with the scoreboard's now-readable
+output found four more bugs, three in paserati and one — a real,
+previously-invisible noderati bug — in our own module resolution:
+
+- **[paserati#162](https://github.com/nooga/paserati/issues/162)**
+  (driver): a native function declared through `ModuleBuilder.Function`
+  with a parameter typed `vm.Value` never receives the real argument —
+  it's silently replaced with a zeroed struct, no error anywhere. Mirror
+  image of an existing, working special-case on the *return* side
+  (`reflectValueToVM` already passes `vm.Value` through untouched;
+  `vmValueToReflectValue` has no matching case on the *argument* side).
+  Found while trying to add classic Node callback-style `fs.stat(path,
+  cb)` functions (as opposed to the `*Sync`/Promise variants noderati
+  already has) — any attempt to accept the callback as a `vm.Value`
+  parameter hit this. Not blocking (worked around by building the raw
+  `vm.NewNativeFunction` closure directly, the same way
+  `child_process.go` already does for `__noderatiSpawn`), but a real gap
+  in the declarative path specifically.
+
+- **[paserati#163](https://github.com/nooga/paserati/issues/163)**
+  (compiler): `import { X } from 'mod'; export { X };` — re-exporting a
+  name that was itself introduced by an `import` declaration, rather
+  than declared locally — fails to compile: `exported name 'X' not found
+  in current scope`, even though `X` genuinely is in scope. Reproduces
+  for both named and default imports, regardless of how the *consumer*
+  imports the re-exporting module; the one equivalent form that works is
+  the direct re-export clause (`export { default as X } from 'mod'`,
+  which introduces no local binding at all). This is the real, general
+  version of what looked at first like a `diff`-specific problem
+  (`diff@8.0.4`'s own ESM entry point, `libesm/index.js`, is a barrel
+  file: `import Diff from './diff/base.js'; ...; export { Diff, ... };`)
+  — any package whose ESM entry re-exports names collected from several
+  internal submodules will hit this, which is an extremely common
+  package-authoring pattern. High-leverage: the scoreboard's
+  `patch-off:sdk-reexports` row (still needed, per Phase 1 close-out)
+  now shows this exact error shape too (`exported name
+  'withFileMutationQueue' not found in current scope`), so this one fix
+  plausibly clears two blockers at once.
+
+- **[paserati#164](https://github.com/nooga/paserati/issues/164)**
+  (parser): `as` and `satisfies` are treated as fully reserved words
+  instead of TypeScript's actual contextual keywords — reserved only in
+  the specific position that introduces a type assertion, ordinary
+  identifiers everywhere else. `const as = 1; console.log(as);` fails to
+  parse (`of`/`from`/`type`/`async`/`get`/`set`/`let`/`namespace`/
+  `declare`/`module`/`readonly` are all handled correctly by contrast).
+  Found bisecting `glob@11`'s minified ESM bundle
+  (`glob/dist/esm/index.min.js`): the minifier assigned the short name
+  `as` to an unrelated regex variable, and referencing it later
+  (`n.replace(as,fe)`) broke — which, because it's deep inside one huge
+  minified line, cascaded into a confusing "Expression expected" dozens
+  of characters away from the real cause. `noderati`'s own
+  `patchCJSSource` previously worked around the `satisfies` half of this
+  with a source-text regex rewrite for a different package — same
+  underlying bug, now also hitting `as` used as an identifier.
+
+- **noderati resolver bug, found and fixed directly (not a paserati
+  issue): conditional `exports` map resolution ignored whether the
+  caller was CJS `require()` or ESM `import`.** `resolveExportTarget`
+  (`internal/host/nodemodules.go`) tried candidate conditions in one
+  fixed order, `["node", "import", "require", "default"]`, for *every*
+  resolution — meaning a plain `require('lru-cache')` (a CJS call) could
+  pick the `"import"`-conditioned target purely because `"import"` came
+  before `"require"` in that fixed list, handing a `require()` call an
+  ESM file. Confirmed exactly this was happening:
+  `require('lru-cache')` from `hosted-git-info` (its real, direct
+  dependency) silently returned `{}` — no error, just nothing —  because
+  the picked file was `lru-cache`'s ESM bundle, containing top-level
+  `import`/`export` statements that our CJS loader doesn't error on but
+  also doesn't populate `module.exports` from. Fixed by threading an
+  `exportsCondition` (require vs. import) from each of the two real call
+  sites — `cjs.go`'s `require()` and the ESM `NodeModulesResolver` — down
+  through `resolvePackageEntry`/`entryFromExports`/`resolveExportTarget`,
+  so each context only ever considers its own matching condition
+  (`["node", "require", "default"]` vs. `["node", "import",
+  "default"]`), never the other's. `require('lru-cache')` now correctly
+  resolves to the `"require"`-conditioned build and, instead of a silent
+  empty object, throws an honest `Cannot find module
+  'node:diagnostics_channel'` — the actual remaining gap (see next item).
+  Verified via `go test ./...` (covers this exact code path) plus the
+  full scoreboard and all three `pi` invocations, both clean.
+
+**Added a real Node builtin: `node:diagnostics_channel`**
+(`internal/host/diagnostics_channel.go`), the gap the fix above exposed
+— `lru-cache`'s node-specific build genuinely imports it for optional
+metrics/tracing. Implemented as a pure JS shim (`channel`/
+`hasSubscribers`/`subscribe`/`unsubscribe`/`tracingChannel`, with
+`Channel`/`TracingChannel` supporting `publish`/`traceSync`/
+`tracePromise`/`traceCallback` matching real Node's semantics) rather
+than a Go native module, specifically to sidestep `#162` above —
+`tracingChannel`'s `traceSync`/`tracePromise`/`traceCallback` all take a
+JS callback as their first argument, and none of this needs real Go-side
+capability.
+
+**That surfaced a second, separate, pre-existing noderati bug while
+verifying the new shim: `require()` of *any* JS-shim-backed built-in
+returns an empty object, unrelated to anything above.** Confirmed via
+`require('child_process')` — untouched by this round's changes, and
+broken before it too — coming back as `{}` (`typeof cp.spawn ===
+"undefined"`), while `import { spawn } from 'child_process'` works fine.
+Root-caused: noderati's `requireNative` (`cjs.go`) calls
+`p.LoadModule(spec, ".")` and reads `ModuleRecord.GetExportValues()`,
+but `LoadModule` alone only resolves/parses/compiles a text-source
+module — it doesn't execute it, and only execution populates
+`ExportValues`. Tried forcing execution via `p.RunModuleWithValue`, which
+does run the module correctly (confirmed via debug output: the run
+completes with no errors and the correct final value), but paserati only
+collects `ExportValues` when its single shared, stateful
+`p.compiler.IsModuleMode()` happens to be true *at that moment* — which
+a `require()` reached mid-execution of the entry script has no way to
+guarantee. Filed as
+[paserati#165](https://github.com/nooga/paserati/issues/165). Worked
+around on noderati's side without waiting for the upstream fix: fall
+back to `RunModuleWithValue`'s own final return value when
+`ExportValues` comes back empty. This works reliably for noderati's own
+shims specifically because every one of them is authored to end in
+`export default {...}` as its last top-level statement — exactly what a
+module's "final value" evaluates to — so it is *not* a general fix for
+an arbitrary third-party CJS-required ESM file (documented in-line in
+`cjs.go` as such). Verified: `require('child_process')` and
+`require('node:diagnostics_channel')` both now return fully populated,
+working objects.
+
+**Net effect on `hosted-git-info`: significant forward progress, not yet
+fully unblocked.** With its own fake off, `hosted-git-info` no longer
+crashes at all (previously `undefined is not a constructor` on `new
+LRUCache(...)` at its own `lib/index.js:8`) — but `HGI.fromUrl(...)`
+still returns `undefined` where it should return a parsed git-host
+object; not yet bisected. Its fake stays for now. Also re-confirmed the
+`minimatch`-style false-positive lesson applies here too: the scoreboard
+now shows `fake-off:hosted-git-info` as clean on all three invocations
+(none of `--version`/`--help`/`-p hello` ever call `fromUrl`), which
+would be exactly the wrong signal to trust — direct testing is what
+actually caught the remaining bug.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

@@ -19,9 +19,10 @@ var nativeRequireNames = map[string]bool{
 	"child_process": true, "readline": true, "tty": true, "process": true, "buffer": true,
 	"events": true, "stream": true, "crypto": true, "undici": true,
 	"fs/promises": true,
-	"module": true, "worker_threads": true,
+	"module":      true, "worker_threads": true,
 	"perf_hooks": true, "string_decoder": true,
 	"stream/promises": true, "constants": true,
+	"diagnostics_channel": true,
 }
 
 type cjsLoader struct {
@@ -273,10 +274,41 @@ func (l *cjsLoader) requireNative(spec string) (vm.Value, error) {
 		return vm.Undefined, fmt.Errorf("Cannot find module '%s'", spec)
 	}
 
+	// LoadModule alone only resolves/parses/compiles — a Go-declared native
+	// module's exports are populated directly at declare time, but a
+	// text-source module (e.g. one of our JS shims, like child_process's
+	// or diagnostics_channel's) needs actually running to populate
+	// ExportValues, and paserati's driver only does that when its shared
+	// compiler instance happens to be in module mode — which a require()
+	// firing mid-execution of the entry module can't guarantee (filed as
+	// a paserati issue: RunModuleWithValue silently no-ops ExportValues
+	// collection on a reentrant call like this one). Fall back to the
+	// run's own final value: every shim we author ends in
+	// `export default {...}`, which is exactly what a module's last
+	// top-level expression evaluates to — so this reliably recovers our
+	// own shims' exports without waiting on the upstream fix. It won't
+	// generalize to an arbitrary third-party module (whatever its last
+	// statement happens to be), only to ones written this way on purpose.
+	var runFallback vm.Value
+	if len(rec.GetExportValues()) == 0 {
+		v, loadErrs, runErrs := l.p.RunModuleWithValue(spec)
+		if len(loadErrs) > 0 {
+			return vm.Undefined, fmt.Errorf("%s", loadErrs[0].Error())
+		}
+		if len(runErrs) > 0 {
+			return vm.Undefined, fmt.Errorf("%s", runErrs[0].Error())
+		}
+		if !v.IsUndefined() && v.Type() != vm.TypeNull {
+			runFallback = v
+		}
+	}
+
 	vals := rec.GetExportValues()
 	var ns vm.Value
 	if def, ok := vals["default"]; ok && !def.IsUndefined() && def.Type() != vm.TypeNull {
 		ns = def
+	} else if !runFallback.IsUndefined() {
+		ns = runFallback
 	} else {
 		obj := vm.NewObject(l.p.GetVM().ObjectPrototype).AsPlainObject()
 		for name, val := range vals {
@@ -304,7 +336,7 @@ func (l *cjsLoader) resolveFile(specifier, fromFile string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return resolvePackageEntry(pkgDir, subpath)
+	return resolvePackageEntry(pkgDir, subpath, exportsConditionRequire)
 }
 
 func existingJSFile(target string) (string, error) {
