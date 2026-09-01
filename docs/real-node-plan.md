@@ -961,6 +961,48 @@ whose real line 2 is a 37-character sourcemap comment) and several other
 "`Syntax Error at N:M`" positions seen throughout Phase 3 that never quite
 lined up with the file's real content.
 
+**`#147`/`#148` fixed upstream and verified, 2026-09-01** —
+[paserati#155](https://github.com/nooga/paserati/pull/155) (`037aea16`
+#147, `3d23031d` #148), CI green on all three platforms, plus more not
+asked for (`#115`, `#154`, and general `Number()`/`Date()`/`Object()`
+object-conversion-protocol fixes). Re-verified against the original
+repros — both fully fixed:
+
+- `#147` — `fs/promises`' rejections now carry the real `Error` object
+  (`.code`, `.message`, everything), not a bare string.
+- `#148` — error locations are now genuinely accurate: the `bad.mjs`/
+  `entry.mjs` repro now shows the real failing file, the real line 4
+  content, the real caret position, and a correct `at
+  /path/bad.mjs:4:11` footer. This immediately paid off — see below.
+
+**`#148`'s fix directly enabled finding a new, real, and unusually clean
+bug.** With accurate positions, `hosted-git-info` → `lru-cache`'s
+previously-nonsensical `2:2510` resolved to the *actual* real position
+(confirmed independently via plain `paserati` against the raw file,
+bypassing noderati's CJS wrapper entirely: `1:2846`), landing squarely on
+`if(this.#S=D??N.defaultPerf,e!==0&&!T(e))throw new TypeError(...)`.
+Bisected to a minimal, 2-line, dependency-free repro —
+`let x = 1; if (x, x > 0) console.log("yes");` — and filed as
+[paserati#157](https://github.com/nooga/paserati/issues/157): **a comma
+expression inside an `if(...)` condition fails to parse, full stop** — no
+assignment, private fields, or `??` required. `while`, `do...while`, and
+`switch` all handle the identical shape correctly; only `if` doesn't.
+Root-caused to a single line: `parseIfStatement`
+(`pkg/parser/parser.go:2114`) parses its condition at `COMMA` precedence
+(stop before consuming a comma — correct for a `var`/`let` declarator or a
+default parameter value, wrong for a parenthesized condition), while
+`parseWhileStatement`/`parseDoWhileStatement`/`parseSwitchStatement` all
+correctly use `LOWEST`. Very likely a one-token fix. This is a general,
+not `lru-cache`-specific, parser gap — `if (a = b, c)` (assign as a side
+effect, test as the real condition) is an established, if uncommon, real
+JS idiom.
+
+**`proper-lockfile`'s async API, checked again, is still separately
+broken** — unrelated to `#147`/`#148` or anything above: `await
+lockfile.lock(path)` still throws `TypeError: undefined is not a
+function`, on the success path (not a rejection at all). Not yet
+bisected. Its fake stays.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
