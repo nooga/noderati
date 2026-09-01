@@ -22,8 +22,12 @@ func declareFSPromises(p *driver.Paserati) {
 		m.AsyncFunction("writeFile", func(path string, data string, _ ...interface{}) (interface{}, error) {
 			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, []byte(data), 0644))
 		})
-		m.AsyncFunction("mkdir", func(path string, _ ...interface{}) (interface{}, error) {
-			return nil, wrapFsErr(vmInst, "mkdir", path, os.MkdirAll(path, 0755))
+		m.AsyncFunction("mkdir", func(path string, opts map[string]interface{}) (interface{}, error) {
+			mkdirFn := os.Mkdir
+			if mkdirRecursiveRequested(opts) {
+				mkdirFn = os.MkdirAll
+			}
+			return nil, wrapFsErr(vmInst, "mkdir", path, mkdirFn(path, 0755))
 		})
 		m.AsyncFunction("readdir", func(path string, opts map[string]interface{}) ([]vm.Value, error) {
 			fsTouch("readdir", path)

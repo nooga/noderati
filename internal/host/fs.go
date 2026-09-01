@@ -161,8 +161,12 @@ func declareFS(p *driver.Paserati) {
 				ns.Const(c.Name, c.Value)
 			}
 		})
-		m.Function("mkdirSync", func(path string, _ ...interface{}) (interface{}, error) {
-			return nil, wrapFsErr(vmInst, "mkdir", path, os.MkdirAll(path, 0755))
+		m.Function("mkdirSync", func(path string, opts map[string]interface{}) (interface{}, error) {
+			mkdirFn := os.Mkdir
+			if mkdirRecursiveRequested(opts) {
+				mkdirFn = os.MkdirAll
+			}
+			return nil, wrapFsErr(vmInst, "mkdir", path, mkdirFn(path, 0755))
 		})
 		m.Function("readdirSync", func(path string, opts map[string]interface{}) ([]vm.Value, error) {
 			fsTouch("readdir", path)

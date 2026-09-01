@@ -46,6 +46,23 @@ func withFileTypesRequested(opts map[string]interface{}) bool {
 	return ok && v
 }
 
+// mkdirRecursiveRequested reports whether an fs.mkdir(Sync)/fs/promises.mkdir
+// options argument (a JS object; noderati's own reflection converts it to a
+// Go map, a numeric "mode" shorthand converts to nil) asked for recursive
+// parent-directory creation. Real Node's own default is non-recursive —
+// fs.mkdirSync(path) with no options, or explicit {recursive: false},
+// throws ENOENT for a missing parent rather than creating it; only
+// {recursive: true} makes it behave like `mkdir -p`. Same "read one
+// optional boolean flag off a converted options map" shape as
+// withFileTypesRequested above.
+func mkdirRecursiveRequested(opts map[string]interface{}) bool {
+	if opts == nil {
+		return false
+	}
+	v, ok := opts["recursive"].(bool)
+	return ok && v
+}
+
 // readdirEntries lists path's entries as vm.Values — plain name strings
 // normally, real Dirent objects when withFileTypes was requested.
 func readdirEntries(vmInst *vm.VM, path string, opts map[string]interface{}) ([]vm.Value, error) {

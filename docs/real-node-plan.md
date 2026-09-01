@@ -1787,6 +1787,47 @@ sharing a filesystem with the person writing it. Once it's merged: rebuild,
 re-verify (including the fresh-build-cache lesson learned here), then
 delete `glob`'s fake the same way `proper-lockfile`'s went today.
 
+**Follow-up fix, same day: `fs.mkdirSync`/`fs/promises.mkdir` were always
+recursive, unconditionally — a pre-existing divergence from real Node
+flagged (not fixed) while adding `fs_async.go` above.** Real Node's
+`fs.mkdirSync(path)` — no options, or `{recursive: false}`, its own
+default — throws `ENOENT` for a missing parent directory; only
+`{recursive: true}` makes it behave like `mkdir -p`. Both `mkdirSync`
+(`fs.go`) and the promise-based `mkdir` (`fspromises.go`) called
+`os.MkdirAll` unconditionally, ignoring whatever options object was
+actually passed — silently *more* permissive than real Node, not less,
+so nothing depending on the correct (throwing) behavior could ever have
+worked, and everything depending on the (incorrect) always-recursive
+behavior would silently keep working even without `{recursive: true}`.
+
+Checked for real-world fallout before fixing, per the ticket's own
+instruction: grepped both `pi-coding-agent`'s own `dist/` and every real
+package under its `node_modules/` for `mkdirSync(`/`.mkdir(` call sites.
+Every single one — twenty-odd in `pi-coding-agent`'s own code, all of
+them — already passes `{recursive: true}` explicitly; the one
+`node_modules` non-`Sync` bare-looking call
+(`tools/write.js`'s `ops.mkdir(dir)`) turned out to be a one-arg wrapper
+around `fsMkdir(dir, {recursive:true})`, not a raw bypass. Zero real call
+sites anywhere in the real, installed tree depend on the current
+(incorrect) always-recursive default — safe to fix with no regression
+risk, confirmed by measurement rather than assumed.
+
+Fixed by parsing the already-available `opts map[string]interface{}`
+parameter for a `recursive: true` flag (new `mkdirRecursiveRequested`,
+`dirent.go`, alongside `withFileTypesRequested` — same shape) and
+switching between `os.Mkdir` (non-recursive, real Node's own default) and
+`os.MkdirAll` accordingly, in both `fs.go`'s `mkdirSync` and
+`fspromises.go`'s `mkdir`. Verified directly: `mkdirSync('/tmp/x/y/z')`
+with missing parents and no options now throws `ENOENT: no such file or
+directory, mkdir '/tmp/x/y/z'`, matching real Node's exact message shape;
+the same call with `{recursive: true}` still succeeds and creates every
+intermediate directory; a single-level `mkdirSync` with no options under
+an already-existing parent still succeeds (unaffected — this was always
+the common case). Same three checks repeated for the async
+`fs/promises.mkdir`. Full build/vet/test, all three real `pi`
+invocations, full scoreboard: clean, zero regressions — matching the
+zero-real-callers finding above.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
