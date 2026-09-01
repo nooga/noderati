@@ -1223,13 +1223,32 @@ repro:
   probe from the filed issue now returns `true` instead of `false`.
 - **`#163` (re-export of an import) — fixed and verified.** The exact
   repro now runs and prints the re-exported value correctly.
-- **`#164` (`as`/`satisfies` as identifiers) — `as` fixed, `satisfies`
-  narrowed and still open.** `const as = 1; console.log(as)` now prints
-  `1`. `satisfies` is still broken, but the failure mode narrowed
-  precisely: it's `const` specifically (`let satisfies = 1` and `var
-  satisfies = 5` both work correctly now), and `satisfies` specifically
-  (`const as/of/type/async = 1` all work). Commented on the issue with
-  this narrowed repro rather than filing a new one.
+- **`#164` (`as`/`satisfies` as identifiers) — `as` fixed and verified;
+  the `const satisfies` finding was our own false positive, corrected.**
+  `const as = 1; console.log(as)` now prints `1`, confirmed against a
+  plain paserati build. The `const satisfies` repro commented on the
+  issue in the second round was tested through noderati, not plain
+  paserati directly — the paserati maintainer couldn't reproduce it and
+  asked for the exact command. Rebuilding plain paserati and re-testing
+  found the maintainer was right: `const`/`let`/`var satisfies` all work
+  correctly on plain paserati. The apparent bug was noderati's own
+  `patchCJSSatisfiesKeyword` (`cjs.go`) — a blanket regex rewrite from
+  before this fix existed, which unconditionally renamed any `const
+  satisfies = ...` declaration to `const satisfiesFn = ...` without
+  renaming later references to it, producing exactly the
+  `ReferenceError` that looked like a paserati bug. Posted a correction
+  on the issue, deleted the now-obsolete (and, it turns out,
+  actively-harmful) patch outright — confirmed safe via the full
+  scoreboard and all three `pi` invocations, unchanged. One genuine gap
+  remains, found while re-verifying: `satisfies` as a function/arrow
+  **parameter name** (not a declarator) still fails to parse on plain
+  paserati (`function f(satisfies) {}` and `(satisfies) => satisfies`
+  both fail; `as` in the identical position works fine on both) — left
+  as a comment on the open issue rather than a new one, at the
+  maintainer's discretion to fold in or split out. This is the lesson
+  this project's own "why do you need plain paserati" thread from
+  earlier in this session exists to prevent — testing through the host
+  instead of the engine directly produced a real false positive here.
 - **`#165` (`RunModuleWithValue` losing exports on a reentrant call) —
   fixed and verified via debug instrumentation:** `rec.GetExportValues()`
   went from `0` before the fix's target commit to `3` after, for the

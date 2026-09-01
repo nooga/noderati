@@ -5,7 +5,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/nooga/paserati/pkg/driver"
@@ -349,27 +348,25 @@ func existingJSFile(target string) (string, error) {
 }
 
 // patchCJSSource applies small source transforms for known third-party CJS quirks.
+//
+// Used to also carry patchCJSSatisfiesKeyword, a blanket regex rewrite
+// working around paserati treating `satisfies` as a fully reserved word
+// (it renamed any `const satisfies = ...`/`satisfies(...)` it found to
+// `satisfiesFn`, everywhere, unconditionally). Deleted 2026-09-01:
+// paserati#164 fixed `const`/`let`/`var satisfies` as a plain identifier
+// (verified directly against a plain paserati build, not through this
+// host — the same regex, run unconditionally on every CJS file, was
+// itself producing false-positive-looking breakage in code that legally
+// declares a variable named `satisfies`, since it renamed the
+// declaration but not every reference to it). Confirmed safe to remove
+// outright via the full scoreboard and all three `pi` invocations,
+// unchanged. `satisfies` as a function/arrow *parameter* name is still
+// genuinely broken upstream (paserati#164 comment thread), but nothing
+// in this host's own CJS/ESM sources hits that shape, so there's
+// nothing left here to patch around.
 func patchCJSSource(source, filename string) string {
-	source = patchCJSSatisfiesKeyword(source)
 	source = patchCJSClassSelfInstanceOf(source, filename)
 	source = patchCJSClassStaticAccess(source, filename)
-	return source
-}
-
-// patchCJSSatisfiesKeyword works around Paserati parsing `satisfies` as a TS keyword.
-func patchCJSSatisfiesKeyword(source string) string {
-	if !strings.Contains(source, "satisfies") {
-		return source
-	}
-	reConst := regexp.MustCompile(`\bconst\s+satisfies\s*=`)
-	source = reConst.ReplaceAllString(source, "const satisfiesFn =")
-
-	reCall := regexp.MustCompile(`\bsatisfies\s*\(`)
-	source = reCall.ReplaceAllString(source, "satisfiesFn(")
-
-	source = strings.ReplaceAll(source, "module.exports = satisfies", "module.exports = satisfiesFn")
-	reShorthand := regexp.MustCompile(`(?m)^(\s*)satisfies,\s*$`)
-	source = reShorthand.ReplaceAllString(source, `${1}satisfies: satisfiesFn,`)
 	return source
 }
 
