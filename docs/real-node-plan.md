@@ -58,24 +58,28 @@ from-scratch reimplementation of the actual agent loop), `typebox` /
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
-**C. `esmpatch.go` per-file source rewrites.** Was twelve rewrites keyed by
-filename, each patching around one specific parser/compiler gap or the
-package fakes in (B). Eleven are now deleted (2026-08-30): ten in the
-original Phase 1 close-out once the Phase 2 scoreboard confirmed each dead,
-and `syntax-highlight-stub` the same day once
+**C. `esmpatch.go` per-file source rewrites — done, file deleted
+2026-09-01.** Was twelve rewrites keyed by filename, each patching around
+one specific parser/compiler gap or the package fakes in (B). Ten were
+deleted in the original Phase 1 close-out (2026-08-30) once the Phase 2
+scoreboard confirmed each dead; `syntax-highlight-stub` the same day once
 [paserati#121](https://github.com/nooga/paserati/issues/121) (a
 register-allocator compiler bug) and
 [paserati#122](https://github.com/nooga/paserati/issues/122) (a stale
 frozen-property flag) were both fixed upstream and the real `highlight.js`
 was confirmed to register 190/191 bundled languages — the one exception
 (`latex`, needing regex lookahead Go's RE2 doesn't support) is a documented,
-linked, architectural gap, not a reason to keep faking the whole module.
-**One remains:** `sdk-reexports` — a real, still-needed compile-error
-workaround, misidentified in an earlier pass of this doc as an `export *`
-issue (it isn't). Delete it only when its underlying bug is fixed *and*
-verified via the scoreboard, including against `latex`'s existing gap — see
-Phase 2 below for why individual verification isn't sufficient on its own,
-even once a blocking bug is fixed (it happened twice in a row here).
+linked, architectural gap, not a reason to keep faking the whole module. The
+last one, `sdk-reexports` — a real, still-needed compile-error workaround,
+misidentified in an earlier pass of this doc as an `export *` issue (it
+isn't) — was deleted 2026-09-01 once
+[paserati#163](https://github.com/nooga/paserati/issues/163) (re-exporting
+an imported name) was fixed and verified both directly and via the full
+scoreboard/all-three-`pi`-invocations, matching baseline exactly. `esmpatch.go`
+itself is gone (it held zero patches at that point); see Phase 2 below for
+the full verification history, including why individual verification isn't
+sufficient on its own (it happened twice in a row here, before this final
+patch).
 
 **D. Resolver-side dirty tricks, independent of the above:**
 - `findPiCodingAgentNodeModulesRoots()` (`piai.go`) hardcodes
@@ -1198,17 +1202,109 @@ an arbitrary third-party CJS-required ESM file (documented in-line in
 `require('node:diagnostics_channel')` both now return fully populated,
 working objects.
 
-**Net effect on `hosted-git-info`: significant forward progress, not yet
-fully unblocked.** With its own fake off, `hosted-git-info` no longer
-crashes at all (previously `undefined is not a constructor` on `new
-LRUCache(...)` at its own `lib/index.js:8`) — but `HGI.fromUrl(...)`
-still returns `undefined` where it should return a parsed git-host
-object; not yet bisected. Its fake stays for now. Also re-confirmed the
-`minimatch`-style false-positive lesson applies here too: the scoreboard
-now shows `fake-off:hosted-git-info` as clean on all three invocations
-(none of `--version`/`--help`/`-p hello` ever call `fromUrl`), which
-would be exactly the wrong signal to trust — direct testing is what
-actually caught the remaining bug.
+**Net effect on `hosted-git-info`, first pass: significant forward
+progress, not yet fully unblocked.** With its own fake off,
+`hosted-git-info` no longer crashes at all (previously `undefined is not
+a constructor` on `new LRUCache(...)` at its own `lib/index.js:8`) —
+but `HGI.fromUrl(...)` still returns `undefined` where it should return
+a parsed git-host object; not yet bisected. Its fake stays for now. Also
+re-confirmed the `minimatch`-style false-positive lesson applies here
+too: the scoreboard shows `fake-off:hosted-git-info` as clean on all
+three invocations (none of `--version`/`--help`/`-p hello` ever call
+`fromUrl`), which would be exactly the wrong signal to trust — direct
+testing is what actually caught the remaining bug.
+
+**2026-09-01, third round: local paserati checkout pulled fixes for all
+four bugs filed above.** Full re-verification (build/vet/test, all three
+`pi` invocations, full scoreboard) clean. Directly re-verified each
+repro:
+
+- **`#162` (vm.Value passthrough) — fixed and verified.** The exact
+  probe from the filed issue now returns `true` instead of `false`.
+- **`#163` (re-export of an import) — fixed and verified.** The exact
+  repro now runs and prints the re-exported value correctly.
+- **`#164` (`as`/`satisfies` as identifiers) — `as` fixed, `satisfies`
+  narrowed and still open.** `const as = 1; console.log(as)` now prints
+  `1`. `satisfies` is still broken, but the failure mode narrowed
+  precisely: it's `const` specifically (`let satisfies = 1` and `var
+  satisfies = 5` both work correctly now), and `satisfies` specifically
+  (`const as/of/type/async = 1` all work). Commented on the issue with
+  this narrowed repro rather than filing a new one.
+- **`#165` (`RunModuleWithValue` losing exports on a reentrant call) —
+  fixed and verified via debug instrumentation:** `rec.GetExportValues()`
+  went from `0` before the fix's target commit to `3` after, for the
+  exact same `require('child_process')` call that motivated the issue.
+  Simplified `cjs.go`'s `requireNative` back down accordingly — deleted
+  the same-session `runFallback` workaround (falling back to
+  `RunModuleWithValue`'s own return value) now that the real fix makes
+  it dead code; `require('child_process')` and
+  `require('node:diagnostics_channel')` both re-verified still working
+  through the simplified path.
+
+**With `#163` fixed, the scoreboard's `patch-off:sdk-reexports` row went
+clean — verified directly (not just trusted), and `esmpatch.go` deleted
+entirely.** `sdk-reexports` was the exact same "re-export of an import"
+shape #163 fixes: `pi-coding-agent`'s own `dist/index.js` re-exports
+`withFileMutationQueue` and several tool factories that its `sdk.js` had
+itself imported. With the patch off, all three `pi` invocations now
+match baseline exactly (not just the scoreboard's diff count — verified
+by running `--version`/`--help`/`-p hello` directly with
+`NODERATI_DISABLE_PATCHES=sdk-reexports` and comparing output). Deleted
+`esmpatch.go` outright (it held zero patches at that point) rather than
+leaving an empty pass-through mechanism in place, updated its two call
+sites (`nodemodules.go`, `osresolver.go`) to drop the now-nonexistent
+`patchModuleSource` wrapper, and simplified `cmd/scoreboard`'s
+`patchNames`-driven config generation to match (nothing left to toggle
+patch-wise). **This completes Phase 1's close-out in full: zero
+`esmpatch.go` patches remain, down from twelve.**
+
+**Added a real `URL` class to the `url` module and `require('url')`
+(`internal/host/url.go`)**, closing a gap discovered while bisecting
+`hosted-git-info` further: `require('url').URL` didn't exist at all
+(`undefined is not a constructor`), so `parse-url.js`'s `new
+url.URL(...)` — the very first thing `fromUrl()` does — always failed
+silently. Read-only by design (own data properties, all fields computed
+once at construction, no live recomputation on mutation, no
+`URLSearchParams` — nothing needs it yet): `href`, `origin`, `protocol`,
+`username`, `password`, `host`, `hostname`, `port`, `pathname`,
+`search`, `hash`, plus `toString()`/`toJSON()`. Built via
+`driver.ModuleBuilder.Class` (backed by Go's `net/url.Parse`), which
+worked cleanly for field parity but surfaced one more paserati gap along
+the way:
+
+- **[paserati#167](https://github.com/nooga/paserati/issues/167)**
+  (driver): `ModuleBuilder.Class`'s constructor wrapper only ever reads
+  `results[0]` from the reflected Go constructor call — a `(value,
+  error)`-returning constructor's error is silently discarded, so `new
+  X(...)` for invalid input evaluates to `undefined` instead of
+  throwing. Mirrors `#162`'s "the declarative path has real reflection
+  gaps `ModuleBuilder.Function` doesn't have" pattern. Concretely: `new
+  URL("git@github.com:foo/bar.git")` (an scp-style URL, not a valid
+  absolute URL) should throw but instead silently returns `undefined`.
+  **Not actually blocking for `hosted-git-info`'s specific call site**:
+  `parse-url.js`'s `safeUrl` does `try { return new url.URL(u) } catch
+  {}`, and a non-throwing `undefined` return is externally identical to
+  a caught throw for that exact pattern — verified this holds by testing
+  the scp-style fallback path directly, which does correctly resolve.
+  But it's a real, general gap for any other caller that actually
+  distinguishes "threw" from "returned undefined".
+
+**Net effect on `hosted-git-info`, second pass: `fromUrl()` itself is
+now genuinely fixed.** `HGI.fromUrl("git+https://github.com/foo/bar.git")`
+returns a real, correct object (`type: "github", user: "foo", project:
+"bar"`, etc.) instead of `undefined` — verified for both a normal URL
+and the scp-style (`git@github.com:foo/bar.git`) fallback path, both
+resolving correctly. **Not fully done yet**: template-producing methods
+on the returned object (`.shortcut()`, `.https()`, and likely the rest
+of the `#fill`-based family — `.git()`, `.ssh()`, `.browse()`, etc.) all
+return `null`. Traced one level further: `GitHost`'s `#fill(template,
+opts)` explicitly returns `null` whenever `typeof template !== "function"`
+— meaning `this.shortcuttemplate` etc., which `Object.assign(this,
+GitHost.#gitHosts[type], {...})` should have copied from the
+statically-registered host definition (`GitHost.addHost`, using JS
+private static class fields), aren't functions by the time `#fill` sees
+them. Not yet bisected further — a new, separate lead for next time, not
+one of the four issues verified this round.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory

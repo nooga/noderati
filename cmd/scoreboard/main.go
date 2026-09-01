@@ -6,11 +6,15 @@
 // felt.
 //
 // Configurations: a baseline (every internal/host shim on), then each
-// group-B fake and each esmpatch.go patch disabled individually (via
-// NODERATI_DISABLE_FAKES / NODERATI_DISABLE_PATCHES — see
+// group-B fake disabled individually (via NODERATI_DISABLE_FAKES — see
 // internal/host/scoreboard_config.go), diffed against the baseline. This is
-// what lets the Phase 1 close-out sweep (deleting esmpatch.go patches) be a
-// measured decision per patch instead of thirteen judgment calls.
+// what made the Phase 1 close-out sweep (deleting esmpatch.go's patches, one
+// by one, down to zero — the last one, sdk-reexports, went 2026-09-01 once
+// paserati#163 made it genuinely unneeded) a measured decision per patch
+// instead of a judgment call. esmpatch.go itself is gone now that it has no
+// patches left to hold; NODERATI_DISABLE_PATCHES plumbing stays in
+// runOnce/config below (harmless, always "") in case a future package quirk
+// needs the mechanism back.
 //
 // Each invocation runs as its own subprocess (the real `noderati` binary,
 // built fresh into a temp dir at startup) rather than in-process: pi's own
@@ -45,14 +49,12 @@ var fakeNames = []string{
 	"typebox", "diff", "jiti", "glob", "proper-lockfile",
 }
 
-// patchNames mirrors patchModuleSource()'s per-rewrite knobs. Was twelve;
-// ten were deleted 2026-08-30 (Phase 1 close-out) after the first scoreboard
-// run confirmed each dead. Keep this list in sync with esmpatch.go's apply()
-// calls — a stale entry here just silently no-ops (isDisabled matches
-// nothing), which reads as "clean" without actually testing anything.
-var patchNames = []string{
-	"sdk-reexports",
-}
+// esmpatch.go held per-rewrite knobs here (patchNames) until 2026-09-01,
+// when its last patch (sdk-reexports) went the way of the ten before it —
+// confirmed dead once paserati#163 made it genuinely unneeded, then the
+// whole file was deleted rather than left holding zero patches. Nothing
+// left to toggle patch-wise; config.patches/NODERATI_DISABLE_PATCHES below
+// stay as harmless (always-"") plumbing in case that changes.
 
 type invocation struct {
 	label string
@@ -101,10 +103,6 @@ func main() {
 		configs = append(configs, config{label: "fake-off:" + name, fakes: name})
 	}
 	configs = append(configs, config{label: "all-fakes-off", fakes: "all"})
-	for _, name := range patchNames {
-		configs = append(configs, config{label: "patch-off:" + name, patches: name})
-	}
-	configs = append(configs, config{label: "all-patches-off", patches: "all"})
 
 	var baseline map[string]result
 	rows := make(map[string]map[string]result, len(configs))

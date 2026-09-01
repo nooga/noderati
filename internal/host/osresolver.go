@@ -46,7 +46,7 @@ func (r *OSPathResolver) Resolve(specifier string, fromPath string) (*modules.Re
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s: %w", resolved, err)
 	}
-	src := patchModuleSource(StripShebang(string(data)), resolved)
+	src := StripShebang(string(data))
 	return &modules.ResolvedModule{
 		Specifier:    specifier,
 		ResolvedPath: resolved,

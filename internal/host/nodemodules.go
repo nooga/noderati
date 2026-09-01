@@ -352,7 +352,6 @@ func openMaybeCJS(absPath string) (io.ReadCloser, error) {
 		src = patchCJSSource(src, absPath)
 		return io.NopCloser(strings.NewReader(cjsESMWrapper(absPath, src))), nil
 	}
-	src = patchModuleSource(src, absPath)
 	return io.NopCloser(strings.NewReader(src)), nil
 }
 

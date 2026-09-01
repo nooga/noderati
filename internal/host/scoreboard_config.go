@@ -5,20 +5,22 @@ import (
 	"strings"
 )
 
-// Phase 2 scoreboard toggles (docs/real-node-plan.md). Two independent
-// knobs, because installModules() mixes ledger group A (real builtins —
-// must always stay on) with group B (third-party package fakes), and
-// patchModuleSource applies all esmpatch.go rewrites unconditionally:
+// Phase 2 scoreboard toggles (docs/real-node-plan.md).
+// installModules() mixes ledger group A (real builtins — must always stay
+// on) with group B (third-party package fakes):
 //
 //   - NODERATI_DISABLE_FAKES — comma-separated group-B fake names, or "all",
 //     to stop registering those shims so real node_modules resolution picks
 //     up the actual package instead.
 //   - NODERATI_DISABLE_PATCHES — comma-separated esmpatch.go patch names, or
-//     "all", to skip individual source rewrites.
+//     "all", to skip individual source rewrites. esmpatch.go itself was
+//     deleted 2026-09-01 once its last patch (sdk-reexports) was confirmed
+//     unneeded — this knob is unused plumbing until some future package
+//     quirk needs the mechanism back.
 //
-// Both are read fresh on every call (not cached at package init) so the
-// scoreboard tool (cmd/scoreboard) can flip them per run, in-process,
-// without a rebuild.
+// Read fresh on every call (not cached at package init) so the scoreboard
+// tool (cmd/scoreboard) can flip them per run, in-process, without a
+// rebuild.
 
 func disabledSet(envVar string) map[string]bool {
 	raw := os.Getenv(envVar)
