@@ -1303,8 +1303,50 @@ opts)` explicitly returns `null` whenever `typeof template !== "function"`
 GitHost.#gitHosts[type], {...})` should have copied from the
 statically-registered host definition (`GitHost.addHost`, using JS
 private static class fields), aren't functions by the time `#fill` sees
-them. Not yet bisected further — a new, separate lead for next time, not
-one of the four issues verified this round.
+them.
+
+**2026-09-01, fourth round: bisected the `#fill`/template gap to its
+real root cause — a severe, general paserati bug, not anything specific
+to private static class fields.** Turned out to have nothing to do with
+`GitHost`'s class structure at all. `hosts.js` builds each host object
+via `hosts[name] = Object.assign({}, defaults, host)` (template
+functions copied in fine, confirmed directly), then `GitHost`'s
+constructor does a *second* `Object.assign(this, GitHost.#gitHosts[type],
+{...})` off that already-once-assigned object — and that second copy
+silently drops every property the first one had set, template functions
+included. Minimized in three steps to a one-line repro with nothing
+class-related left at all:
+
+```js
+const merged = Object.assign({}, { a: 1 });
+console.log(merged.a);              // 1 -- direct access works
+console.log(Object.keys(merged));   // [] -- should be ["a"]
+console.log(Object.getOwnPropertyDescriptor(merged, "a").enumerable); // false -- should be true
+```
+
+Root cause pinned exactly in `pkg/builtins/object_init.go`:
+`objectAssignWithVM`'s copy loop calls `targetPlain.SetOwnNonEnumerable`
+for a `PlainObject` target instead of `SetOwn` (the sibling `DictObject`
+branch two lines down already uses the correct `SetOwn`) — every
+property `Object.assign` copies onto a plain object ends up
+`enumerable: false`, invisible to `Object.keys`/`for...in`/
+`JSON.stringify`/spread/a second `Object.assign` reading it as a source,
+while still directly readable (which is exactly what a wrong
+`enumerable` flag and nothing else produces, and how this got isolated
+so precisely). Filed as
+[paserati#168](https://github.com/nooga/paserati/issues/168), with the
+one-line fix identified (`SetOwn` instead of `SetOwnNonEnumerable`,
+matching the already-correct sibling branch).
+
+**This is almost certainly bigger than `hosted-git-info`.** `Object.assign`
+called twice in a row, or read via `Object.keys`/spread/`JSON.stringify`
+after one call, is an extremely common pattern — merged config objects,
+`{...Object.assign({}, defaults, overrides)}`, serializing a
+programmatically-built object. Nothing else in this session's Phase 3
+sweep has been re-tested against it specifically; worth keeping in mind
+as a candidate explanation if some other still-blocked package's failure
+looks like "a property that should be there just isn't," the same shape
+`#fill` had before this was traced down.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
