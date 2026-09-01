@@ -218,6 +218,7 @@ func declareFS(p *driver.Paserati) {
 		m.Function("rmSync", func(path string) (interface{}, error) {
 			return nil, wrapFsErr(vmInst, "rm", path, os.RemoveAll(path))
 		})
+		declareFSAsync(m, vmInst)
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:fs", "fs")

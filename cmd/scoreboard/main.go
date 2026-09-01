@@ -46,7 +46,7 @@ const perRunTimeout = 20 * time.Second
 // fakeNames mirrors installModules()'s ledger-group-B knobs.
 var fakeNames = []string{
 	"pi-tui", "pi-ai", "pi-agent-core",
-	"typebox", "diff", "jiti", "glob", "proper-lockfile",
+	"typebox", "diff", "jiti", "glob",
 }
 
 // esmpatch.go held per-rewrite knobs here (patchNames) until 2026-09-01,

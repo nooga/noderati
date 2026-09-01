@@ -52,9 +52,10 @@ export is a no-op — the entire TUI is fake), `@earendil-works/pi-ai` (a
 from-scratch reimplementation of the real LLM client, including its own model
 catalog and provider fetch calls), `@earendil-works/pi-agent-core` (a
 from-scratch reimplementation of the actual agent loop), `typebox` /
-`typebox/value` / `typebox/compile`, `diff`, `jiti/static`, `glob`,
-`proper-lockfile`. (`minimatch` was here too — deleted 2026-08-31;
-`hosted-git-info` deleted 2026-09-01 — see Phase 3 below for both.)
+`typebox/value` / `typebox/compile`, `diff`, `jiti/static`, `glob`.
+(`minimatch` was here too — deleted 2026-08-31; `hosted-git-info` deleted
+2026-09-01; `proper-lockfile` deleted 2026-09-02 — see Phase 3 below for
+all three.)
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
@@ -1693,6 +1694,98 @@ a from-scratch-verified, self-contained (66KB, no external deps once the
 `node:*` imports are stubbed) reproduction script attached. `glob`'s fake
 stays until this lands — it is now the *only* thing standing between `glob`
 and being fully real.
+
+**Tenth round (2026-09-02) — `proper-lockfile` deleted for real; `#180`
+confirmed fixed on an unmerged upstream branch, not yet actionable.**
+
+While waiting on `#180`, picked up `proper-lockfile` — the last known
+blocker (see the ninth round's `#147` note above) was a genuine, systemic
+noderati gap: **noderati's `fs` module had zero classic Node callback-style
+functions** (`fs.mkdir(path, cb)`, `fs.stat(path, cb)`, etc.) — only `*Sync`
+and `fs/promises`. Real Node's `fs` has three parallel styles; noderati had
+two. `graceful-fs` (proper-lockfile's real, direct dependency, and used
+directly by plenty of other real packages) patches every one of those onto
+its own exported `fs` object — with nothing on noderati's side to find and
+wrap, `require('graceful-fs').mkdir` etc. came back `undefined`, which is
+exactly what made `proper-lockfile`'s real async `lock()` throw `TypeError:
+undefined is not a function` inside its own `options.fs.mkdir(...)` call.
+
+Implemented the four callback-style functions proper-lockfile's real async
+core (`lib/lockfile.js`) actually calls — `mkdir`/`stat`/`rmdir`/`utimes` —
+plus `realpath` (`internal/host/fs_async.go`), deferred via the same
+`vmInst.GetAsyncRuntime().ScheduleNextTick(...)` mechanism `process.
+nextTick` already uses, preserving real Node's guarantee that an fs
+callback never fires synchronously within the same tick as its call.
+`realpath` wasn't in the original plan — the first pass, scoped to
+`{realpath: false}` (the option `settings-manager.js`/`trust-manager.js`
+pass to `lockSync`), missed that `auth-storage.js`'s real async
+`lockfile.lock()` call passes *no* `realpath` option at all, which defaults
+to `true` in real proper-lockfile. Caught by testing against the *exact*
+real options object each of the three real call sites actually passes, not
+a hand-simplified stand-in — the same discipline that caught `minimatch`
+and `glob`'s async-API gap as false positives earlier in Phase 3, doing its
+job again.
+
+This was possible cleanly now specifically because
+[paserati#162](https://github.com/nooga/paserati/issues/162) (fixed a few
+rounds back) means a `vm.Value`-typed parameter on a declarative
+`ModuleBuilder.Function` now actually receives the real callback — no need
+for the raw `vm.NewNativeFunction` workaround `child_process.go`'s
+`__noderatiSpawn` still uses for the same reason predating that fix.
+
+**Verified with real, exact call-site fidelity, not just "does it load":**
+async `lockfile.lock()`/`check()` tested with `auth-storage.js`'s literal
+options object (`retries` as a full retry-config object, `stale: 30000`,
+`onCompromised`) — correct lock/release, correct `ELOCKED` on a second
+concurrent lock attempt, correct `check()` true/false across the lock's
+lifetime. Sync `lockSync()`/`checkSync()` tested with both
+`settings-manager.js`'s plain `{realpath: false}` form and
+`trust-manager.js`'s `lockfilePath` override form — both correct. Full
+build/vet/test, all three real `pi` invocations, and the full scoreboard:
+clean, zero regressions.
+
+**`proper-lockfile`'s fake deleted** — `internal/host/properlockfile.go`
+removed entirely, its registration in `host.go` and its toggle in
+`cmd/scoreboard/main.go`'s `fakeNames` both removed. Re-ran the full
+functional verification above with the fake actually gone (no
+`NODERATI_DISABLE_FAKES` needed) — identical, correct results.
+
+**While this was underway, unexpectedly caught `#180` mid-fix, live, in
+the shared paserati checkout.** `pkg/compiler/compile_class.go` showed up
+modified/uncommitted (branch `fix-180`, not pushed) — briefly broke
+noderati's own build (a genuine transient: the paserati agent's edit
+landed between two `go build` invocations a few seconds apart, a real risk
+of the two projects sharing a live checkout, not anything self-inflicted).
+Once it stabilized, the fix builds clean and is *exactly* the right root
+cause: `injectFieldInitializers`' search for a class's `super(...)` call
+only recognized one that was the *entire* statement expression — but a
+minifier commonly merges `super(...);` with the very next statement into
+one `super(...), next;` via the comma operator (legal JS; a bare
+`ExpressionStatement`'s value is always discarded), which is exactly
+`rt`'s real shape in `#180`'s own filed repro
+(`super(t,mi,"/",{...e,nocase:s}),this.nocase=s`). Their fix flattens any
+top-level comma-chain statement into separate statements before searching,
+so the buried `super()` call is found correctly.
+
+**Tested it directly against `#180`'s own filed repro and the full real
+minified bundle — genuinely fixed, both ways** (after a `go clean -cache`;
+the first attempt looked unfixed purely from a stale build-cache artifact,
+not the fix itself — caught by testing the *exact* isolated repro from the
+filed issue on a from-scratch rebuild before concluding anything). The
+truncated 66040-byte repro now runs clean past the point it used to throw;
+the full, untruncated real bundle's actual `globSync("*.txt", ...)` and
+`globSync("**/*.txt", ...)` calls, run through noderati exactly as real
+`pi-coding-agent` code would reach them, now both return correct results.
+
+**Not deleting `glob`'s fake yet, and not commenting on `#180` yet either
+— this fix is real but unmerged**, sitting uncommitted on a local branch
+in a checkout this project doesn't control the lifecycle of. Every other
+fix this whole effort has acted on was verified only once actually merged
+to paserati's `main` (see every prior round above) — no reason to break
+that discipline now just because the fix happens to be visible early from
+sharing a filesystem with the person writing it. Once it's merged: rebuild,
+re-verify (including the fresh-build-cache lesson learned here), then
+delete `glob`'s fake the same way `proper-lockfile`'s went today.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory

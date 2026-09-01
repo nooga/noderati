@@ -101,8 +101,12 @@ func installModules(p *driver.Paserati) {
 	// package verified working via actual functional exercise — see
 	// docs/real-node-plan.md's Phase 3 section) — node_modules resolution
 	// now always loads the real minimatch package.
-	if !isDisabled(disabledFakes, "proper-lockfile") {
-		declareProperLockfile()
-	}
+	// proper-lockfile's fake was deleted 2026-09-02 — real package's
+	// full async (lock/unlock/check) and sync (lockSync/checkSync/
+	// unlockSync) APIs both verified directly against pi-coding-agent's
+	// exact real call patterns from all three real call sites
+	// (auth-storage.js, settings-manager.js, trust-manager.js) — see
+	// docs/real-node-plan.md's Phase 3 section. node_modules resolution
+	// now always loads the real proper-lockfile package.
 	declareCJSInterop(p)
 }
