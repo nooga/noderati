@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 
 	"github.com/nooga/paserati/pkg/driver"
+	"github.com/nooga/paserati/pkg/vm"
 )
 
 func declareFSPromises(p *driver.Paserati) {
@@ -24,23 +25,27 @@ func declareFSPromises(p *driver.Paserati) {
 		m.AsyncFunction("mkdir", func(path string, _ ...interface{}) (interface{}, error) {
 			return nil, wrapFsErr(vmInst, "mkdir", path, os.MkdirAll(path, 0755))
 		})
-		m.AsyncFunction("readdir", func(path string, _ ...interface{}) ([]string, error) {
+		m.AsyncFunction("readdir", func(path string, opts map[string]interface{}) ([]vm.Value, error) {
 			fsTouch("readdir", path)
-			entries, err := os.ReadDir(path)
+			entries, err := readdirEntries(vmInst, path, opts)
 			if err != nil {
 				return nil, wrapFsErr(vmInst, "scandir", path, err)
 			}
-			names := make([]string, len(entries))
-			for i, e := range entries {
-				names[i] = e.Name()
-			}
-			return names, nil
+			return entries, nil
 		})
 		m.AsyncFunction("stat", func(path string, _ ...interface{}) (*fsStats, error) {
 			fsTouch("stat", path)
 			info, err := os.Stat(path)
 			if err != nil {
 				return nil, wrapFsErr(vmInst, "stat", path, err)
+			}
+			return newFsStats(vmInst, info), nil
+		})
+		m.AsyncFunction("lstat", func(path string, _ ...interface{}) (*fsStats, error) {
+			fsTouch("stat", path)
+			info, err := os.Lstat(path)
+			if err != nil {
+				return nil, wrapFsErr(vmInst, "lstat", path, err)
 			}
 			return newFsStats(vmInst, info), nil
 		})

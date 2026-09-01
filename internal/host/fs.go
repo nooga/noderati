@@ -18,15 +18,25 @@ type fsStats struct {
 	Mtime   vm.Value `json:"mtime"`
 	file    bool
 	dir     bool
+	symlink bool
 }
 
-func (s *fsStats) IsFile() bool      { return s.file }
-func (s *fsStats) IsDirectory() bool { return s.dir }
+func (s *fsStats) IsFile() bool            { return s.file }
+func (s *fsStats) IsDirectory() bool       { return s.dir }
+func (s *fsStats) IsSymbolicLink() bool    { return s.symlink }
+func (s *fsStats) IsBlockDevice() bool     { return false }
+func (s *fsStats) IsCharacterDevice() bool { return false }
+func (s *fsStats) IsFIFO() bool            { return false }
+func (s *fsStats) IsSocket() bool          { return false }
 
 // newFsStats builds an fsStats from a Go os.FileInfo, including a real JS
 // Date for .mtime — real Node's fs.Stats has both .mtimeMs (a number) and
 // .mtime (a Date); real packages call .mtime.getTime() directly
 // (proper-lockfile's mtime-precision.js is what surfaced this gap).
+// info.IsDir() is false for a symlink even when it points at a
+// directory — correct for lstat's own result (which must describe the
+// link itself, not its target), which is the whole reason lstat exists
+// as distinct from stat.
 func newFsStats(vmInst *vm.VM, info os.FileInfo) *fsStats {
 	mtimeMs := float64(info.ModTime().UnixMilli())
 	mtime := vm.Undefined
@@ -35,12 +45,14 @@ func newFsStats(vmInst *vm.VM, info os.FileInfo) *fsStats {
 			mtime = v
 		}
 	}
+	isSymlink := info.Mode()&os.ModeSymlink != 0
 	return &fsStats{
 		Size:    info.Size(),
 		MtimeMs: mtimeMs,
 		Mtime:   mtime,
-		file:    !info.IsDir(),
+		file:    info.Mode().IsRegular(),
 		dir:     info.IsDir(),
+		symlink: isSymlink,
 	}
 }
 
@@ -152,17 +164,13 @@ func declareFS(p *driver.Paserati) {
 		m.Function("mkdirSync", func(path string, _ ...interface{}) (interface{}, error) {
 			return nil, wrapFsErr(vmInst, "mkdir", path, os.MkdirAll(path, 0755))
 		})
-		m.Function("readdirSync", func(path string, _ ...interface{}) ([]string, error) {
+		m.Function("readdirSync", func(path string, opts map[string]interface{}) ([]vm.Value, error) {
 			fsTouch("readdir", path)
-			entries, err := os.ReadDir(path)
+			entries, err := readdirEntries(vmInst, path, opts)
 			if err != nil {
 				return nil, wrapFsErr(vmInst, "scandir", path, err)
 			}
-			names := make([]string, len(entries))
-			for i, e := range entries {
-				names[i] = e.Name()
-			}
-			return names, nil
+			return entries, nil
 		})
 		m.Function("unlinkSync", func(path string) (interface{}, error) {
 			return nil, wrapFsErr(vmInst, "unlink", path, os.Remove(path))
@@ -175,6 +183,14 @@ func declareFS(p *driver.Paserati) {
 			info, err := os.Stat(path)
 			if err != nil {
 				return nil, wrapFsErr(vmInst, "stat", path, err)
+			}
+			return newFsStats(vmInst, info), nil
+		})
+		m.Function("lstatSync", func(path string, _ ...interface{}) (*fsStats, error) {
+			fsTouch("stat", path)
+			info, err := os.Lstat(path)
+			if err != nil {
+				return nil, wrapFsErr(vmInst, "lstat", path, err)
 			}
 			return newFsStats(vmInst, info), nil
 		})

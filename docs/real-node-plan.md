@@ -1530,9 +1530,80 @@ hitting it a second time via a completely unrelated package (nothing in
 common with `highlight.js` except "compiles a lookahead somewhere")
 makes it a wholesale blocker for a whole package's pattern-matching
 core, not a one-language edge case — worth having tracked at the
-engine level, even though there's no quick fix. `glob`'s fake stays.
-Verified no regressions from either fix via the full scoreboard and all
-three `pi` invocations.
+engine level, even though there's no quick fix. Verified no regressions
+from either fix via the full scoreboard and all three `pi` invocations.
+
+**2026-09-01, eighth round: `#172` (RE2 lookahead) fixed upstream —
+verified, and it's a real fix, not a won't-fix closure.** Local paserati
+checkout pulled `new RegExp(...)` falling back to `regexp2` (a
+backtracking engine) specifically for patterns using lookaround
+constructs RE2 can't compile. Verified directly against plain paserati:
+`(?!`, `(?=`, `(?<=`, `(?<!` all now work correctly (tested both
+matching and non-matching cases for each). Rebuilt noderati: the
+`latex`/`highlight.js` noise (`ERROR: Language definition for 'latex'
+could not be registered` on every single invocation, since the very
+first round of this whole effort) is **completely gone** — `highlight.js`
+now registers all 191 bundled languages cleanly, not 190. Full
+build/vet/test, all three `pi` invocations, and the full scoreboard all
+clean.
+
+With the lookahead wall gone, `glob`/`minimatch` got past pattern
+compilation and into actual directory walking — which surfaced two more
+real noderati-side `fs` gaps, both fixed directly:
+
+- **`fs.readdirSync`/`fs.readdir` (and their `fs/promises` equivalent)
+  completely ignored the `{ withFileTypes: true }` option**, always
+  returning plain name strings. Real Node returns `Dirent` objects in
+  that mode (`.name` plus `.isFile()`/`.isDirectory()`/
+  `.isSymbolicLink()`/etc.) specifically so callers that walk a tree
+  don't need a second `stat()` per entry just to tell files from
+  directories — exactly what `path-scurry` (glob's real filesystem-
+  walking dependency) does. Without it, nothing threw anywhere: the
+  caller's own `entToType()`-style dispatch (`e.isFile() ? ... :
+  e.isDirectory() ? ...`) just found none of those methods on a plain
+  string and fell through every branch, silently walking zero children.
+  Added a real `Dirent`-shaped object (`internal/host/dirent.go`,
+  shared by both the sync and async `readdir` implementations) and
+  wired `withFileTypes` detection through both.
+- **`fs.lstatSync`/`fs/promises.lstat` didn't exist at all** — `path-scurry`
+  imports both unconditionally at its own module top level (`import {
+  lstatSync, ... } from 'fs'`). Added both, using Go's `os.Lstat` (does
+  not follow symlinks, matching lstat's whole reason for existing versus
+  `stat`) and extended `fsStats` with `isSymbolicLink()`/
+  `isBlockDevice()`/`isCharacterDevice()`/`isFIFO()`/`isSocket()` to
+  round out the real `fs.Stats` method set (previously only
+  `isFile()`/`isDirectory()` existed). Also corrected `isFile()` itself
+  while touching this: it was `!info.IsDir()` (true for symlinks and
+  device files too), now `info.Mode().IsRegular()` — real Node's
+  `isFile()` means specifically a regular file.
+
+**`glob` is still blocked, but by something new and unrelated: a
+different `Object.assign` gap from `#168`'s — this time about the
+*target*, not the source.** With both `fs` fixes in place, directory
+entries are read from disk correctly and processed into `Path` objects
+without error — confirmed directly (patched a scratch copy of
+`path-scurry`'s source with temporary logging to see the real entries
+flowing through). But the result was still always an empty directory
+listing. Traced to `PathBase.children()`:
+
+```js
+const children = Object.assign([], { provisional: 0 });
+```
+
+`objectAssignWithVM` (`pkg/builtins/object_init.go`) has branches for a
+`TypeObject` and a `TypeDictObject` *target* — nothing at all for
+`TypeArray`. `Object.assign([], {...})` silently does nothing: no
+error, the array just comes back with none of the source properties
+copied on. `children.provisional` stays `undefined` forever, so every
+later `children.provisional++` (path-scurry's own count of
+just-discovered, not-yet-confirmed directory entries) produces `NaN`
+instead of counting up — and `children.slice(0, children.provisional)`
+with a `NaN` bound always returns `[]`. Filed as
+[paserati#174](https://github.com/nooga/paserati/issues/174), verified
+against plain paserati with a two-line repro
+(`Object.assign([], {provisional: 0}).provisional` → `undefined`,
+should be `0`). `glob`'s fake stays — this is squarely upstream, nothing
+to work around on noderati's side.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
