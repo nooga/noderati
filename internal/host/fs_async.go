@@ -96,6 +96,13 @@ func scheduleCallback(vmInst *vm.VM, cb vm.Value, cbArgs []vm.Value) {
 // another real package's real call site demands more of the callback
 // surface -- don't build ahead of evidence.
 func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
+	// os.Mkdir (non-recursive), deliberately -- matches real Node's own
+	// fs.mkdir default (no {recursive:true} means parent dirs must
+	// already exist) and is load-bearing here: proper-lockfile's whole
+	// mutual-exclusion protocol depends on this call failing with EEXIST
+	// when the lock dir already exists. fs.mkdirSync (fs.go) uses
+	// os.MkdirAll instead -- a pre-existing divergence from real Node's
+	// own default, predating this file, not mirrored here on purpose.
 	m.Function("mkdir", func(path string, cb vm.Value) (vm.Value, error) {
 		err := os.Mkdir(path, 0755)
 		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "mkdir", path, err))})
