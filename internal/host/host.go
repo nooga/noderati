@@ -94,13 +94,16 @@ func installModules(p *driver.Paserati) {
 	if !isDisabled(disabledFakes, "jiti") {
 		declareJiti()
 	}
-	if !isDisabled(disabledFakes, "glob") {
-		declareGlob()
-	}
 	// minimatch's fake was deleted 2026-08-31 (paserati#144 fixed, real
 	// package verified working via actual functional exercise — see
 	// docs/real-node-plan.md's Phase 3 section) — node_modules resolution
 	// now always loads the real minimatch package.
+	// glob's fake was deleted 2026-09-02 — paserati#180 (the "must call
+	// super constructor" bug on glob's real minified ESM bundle) merged
+	// upstream; real package verified via its exact real call pattern
+	// (bare `import { globSync } from "glob"`, pi-coding-agent's own
+	// options shape) — see docs/real-node-plan.md's Phase 3 section.
+	// node_modules resolution now always loads the real glob package.
 	// proper-lockfile's fake was deleted 2026-09-02 — real package's
 	// full async (lock/unlock/check) and sync (lockSync/checkSync/
 	// unlockSync) APIs both verified directly against pi-coding-agent's

@@ -1828,6 +1828,33 @@ the common case). Same three checks repeated for the async
 invocations, full scoreboard: clean, zero regressions — matching the
 zero-real-callers finding above.
 
+**`glob`'s fake deleted, 2026-09-02 — [paserati#180](https://github.com/nooga/paserati/issues/180)
+merged and confirmed.** `origin/main` pulled (`c7865334`, "fix(compiler):
+a derived class handles a comma-joined super() call"), both `paserati`
+and `noderati` rebuilt from a fully clean cache (the false-negative
+lesson from spotting this fix mid-development still applies). Re-verified
+both ways again: the issue's own filed repro now runs clean past the
+"must call super" error entirely (fully clean on plain paserati once
+`URL` — an unrelated plain-CLI-only gap, not part of this bug — is
+available; noderati has it natively). Then went one step further than
+before deleting: found `glob`'s *only* real call site in `pi-coding-agent`
+(`package-manager.js`: `import { globSync } from "glob"`,
+`globSync(entry, { cwd: root, absolute: true, dot: false, nodir: false
+})`) and tested that *exact* pattern — bare specifier, real resolution,
+real options — against a small fixture tree with a dotfile mixed in.
+Correct on every count: recursive match, absolute paths, dotfile
+correctly excluded.
+
+`internal/host/glob.go` (the fake) deleted entirely; its registration in
+`host.go` and its toggle in `cmd/scoreboard/main.go`'s `fakeNames` both
+removed. Re-ran the full verification above with the fake actually gone
+(no `NODERATI_DISABLE_FAKES` needed) — identical, correct results. Full
+build/vet/test, all three real `pi` invocations, full scoreboard: clean.
+The scoreboard's "candidates to delete" list is now empty — every
+remaining fake (`pi-tui`, `pi-ai`, `pi-agent-core`, `typebox`, `diff`,
+`jiti`) genuinely fails when disabled, no more scoreboard-clean-but-
+functionally-broken candidates left to find.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
