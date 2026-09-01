@@ -1003,6 +1003,70 @@ lockfile.lock(path)` still throws `TypeError: undefined is not a
 function`, on the success path (not a rejection at all). Not yet
 bisected. Its fake stays.
 
+**`#157` fixed upstream and verified, 2026-09-01** —
+[paserati#158](https://github.com/nooga/paserati/pull/158) (`8b423b14`
+#157, plus `e0fd6bd8` #156 not asked for: "an uncaught exception from a
+native call no longer panics the VM"), CI green. `if (x, x > 0)` now runs
+correctly.
+
+**Also fixed on noderati's own side, 2026-09-01: the CJS wrapper's own
+line-number corruption.** `execFile`'s function-wrapper
+(`"(function (exports, require, module, __filename, __dirname) {\n" +
+source + "\n})"`) had a leading `\n` before `source` — every real file's
+own line 1 became wrapped line 2, every line 2 became line 3, and so on,
+for every `require()`d CJS file. Paserati was reporting positions
+faithfully the whole time — for the text we handed it, which wasn't the
+real file. Dropped the leading newline (`cjs.go`): source's own line 1
+now stays wrapped line 1, with zero line-number impact on every
+line after the first (the vast majority of real, non-minified files).
+Verified with a 4-line CJS fixture with an error on line 4 — reports
+`4:11` exactly, matching the real file. (A file whose real content is
+entirely on one line — e.g. a minified bundle, exactly the shape that
+made `lru-cache` hard to read before — still carries a small, fixed
+column offset from the ~61-character wrapper-prefix text sharing that one
+line; full column correction for that specific case is a smaller
+follow-up, not done here.) `patchCJSSource`'s own regex-based text
+rewrites (`satisfies`, class-self-`instanceof` fixups) are a separate,
+much narrower source of position drift — only the small set of files they
+target, not fixed here.
+
+**Immediate, dramatic payoff from `#148` + the wrapper fix together: the
+scoreboard's own output became genuinely readable.** Nearly every
+`fake-off:X` row across a fresh run now shows a real file path, real line
+content, and a real caret — `diff`'s failure now reads
+`import * as Diff from "diff";` at its own real position in
+`dist/modes/interactive/components/diff...`; `sdk-reexports`' failure
+shows the actual `export { AgentSessionRuntime, ...` line it's choking
+on; `typebox`'s shows a real caret in
+`typebox/build/type/engine/mapped/instantiate.mjs`. This changes the
+shape of the rest of Phase 3 — positions can mostly just be read directly
+off the scoreboard's tail now, instead of needing a `paserati -bytecode`
+side investigation to recover them the way `lru-cache` needed twice this
+session.
+
+**That immediate payoff directly found two more real, general bugs in
+`lru-cache`**, filed as [paserati#159](https://github.com/nooga/paserati/issues/159)
+and [paserati#160](https://github.com/nooga/paserati/issues/160) — both
+about a multi-declarator `let`/`const` statement mixing a destructuring
+declarator with plain-identifier ones:
+
+- **`#159`** (parser): `let r = 1, {a} = {a: 1};` — a destructuring
+  pattern as a **non-first** declarator — fails to parse outright
+  (`expected identifier or destructuring pattern after ','`).
+- **`#160`** (compiler/codegen): the reverse order, `let {a} = {a: 1}, b
+  = 20;`, parses but silently produces the wrong value (`a` comes out
+  `undefined`) or throws `ReferenceError` if the trailing declarator has
+  no initializer. Root-caused via `-bytecode`: the destructuring source's
+  register gets clobbered by the second declarator's own initializer
+  value before the destructuring extraction runs.
+
+**`#159` is confirmed general, not `lru-cache`-specific** — the fresh
+scoreboard run's now-accurate `fake-off:jiti` row hits the exact same
+error text (`expected identifier or destructuring pattern after ','`) in
+a completely different package (`jiti/dist/jiti.cjs`). One fix likely
+unblocks (or moves past a blocker in) more than one Phase 3 target at
+once.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

@@ -137,7 +137,19 @@ func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.Pasera
 	fromFile := abs
 	requireFn := l.bindRequire(fromFile)
 
-	wrapped := "(function (exports, require, module, __filename, __dirname) {\n" + source + "\n})"
+	// No newline between the wrapper's opening brace and source: inserting
+	// one would push every line of the real file's error positions down by
+	// one, which is exactly the kind of noderati-side position corruption
+	// docs/real-node-plan.md's Phase 1 item 5 (and paserati#148) is about —
+	// paserati reports positions faithfully for whatever text it's given;
+	// wrapping shouldn't be the thing that makes those positions wrong.
+	// Safe: `{` can't combine with source's first token into something
+	// else, and nothing about CJS wrapping needs source to start at a
+	// fresh line. (A file whose real content is entirely on one line —
+	// e.g. a minified bundle — still gets a fixed, small column offset
+	// from the prefix text itself; only the line number is fully fixed by
+	// this, not every column on line 1.)
+	wrapped := "(function (exports, require, module, __filename, __dirname) {" + source + "\n})"
 	fn, errs := l.p.RunScript(wrapped, abs)
 	if len(errs) > 0 {
 		return vm.Undefined, errs
