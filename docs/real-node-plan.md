@@ -53,8 +53,8 @@ from-scratch reimplementation of the real LLM client, including its own model
 catalog and provider fetch calls), `@earendil-works/pi-agent-core` (a
 from-scratch reimplementation of the actual agent loop), `typebox` /
 `typebox/value` / `typebox/compile`, `diff`, `jiti/static`, `glob`,
-`proper-lockfile`, `hosted-git-info`. (`minimatch` was here too — deleted
-2026-08-31, see Phase 3 below, first of this group actually gone.)
+`proper-lockfile`. (`minimatch` was here too — deleted 2026-08-31;
+`hosted-git-info` deleted 2026-09-01 — see Phase 3 below for both.)
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
@@ -1366,6 +1366,69 @@ sweep has been re-tested against it specifically; worth keeping in mind
 as a candidate explanation if some other still-blocked package's failure
 looks like "a property that should be there just isn't," the same shape
 `#fill` had before this was traced down.
+
+**2026-09-01, fifth round: `#167`/`#168` fixed and verified, plus a
+`satisfies`-as-parameter bonus fix; `hosted-git-info`'s fake deleted for
+real.** Local paserati checkout pulled fixes for both. Full
+re-verification (build/vet/test, all three `pi` invocations, full
+scoreboard) clean throughout. Directly re-verified each against a
+freshly-built plain paserati binary (learning the lesson from this same
+round's `#164` correction — see above):
+
+- **`#167` (constructor error swallowed) — fixed and verified.** The
+  exact repro from the filed issue now throws (`threw: true`) instead of
+  silently returning `undefined`.
+- **`#168` (`Object.assign` non-enumerable) — fixed and verified.** The
+  exact repro now shows `Object.keys`/`JSON.stringify`/a second
+  `Object.assign` all correctly seeing the copied property, and
+  `getOwnPropertyDescriptor(...).enumerable` is `true`.
+- **Bonus, not one of the filed issues:** `satisfies` as a function/arrow
+  parameter name (the one gap noted in the `#164` correction) is also
+  fixed — `function f(satisfies) { return satisfies; }` and `(satisfies)
+  => satisfies` both work now.
+
+**With `#168` fixed, `hosted-git-info`'s template methods work for
+real**, not just `fromUrl()`'s plain-property reads. Verified directly:
+`.shortcut()` → `"github:foo/bar"`, `.https()` → the real git+https
+URL, `.ssh()` → the real scp-style URL, `.toString()`, `.path()`,
+`.tarball()`, `.bugs()`, `.docs()` — all correct, matching real Node's
+`hosted-git-info`. **Deleted the `hosted-git-info` fake** (`hostedgit.go`,
+its `host.go` registration, its `cmd/scoreboard` entry) after confirming
+directly — not just via the scoreboard, which would have shown a false
+"clean" here too, since none of the three `pi` invocations exercise
+`hosted-git-info` at all — that `pi-coding-agent`'s actual usage
+(`dist/utils/git.js`: `hostedGitInfo.fromUrl(candidate)` plus reading
+`.domain`/`.user`/`.project`/`.committish` off the result, multiple
+hosts, scp-style and `https://` forms, the "no match" case) all produce
+correct results. Replaced the old fake-testing `TestHostedGitInfoShim`
+unit test with `TestHostedGitInfoReal`, matching the existing
+real-package-with-skip-if-absent pattern other Phase 3 tests already
+use (`findPiAgentCorePackage`, which conveniently already resolves to
+the right `pi-coding-agent` root for `hosted-git-info` too, since it's a
+direct dependency in the same `node_modules`).
+
+**One caveat, not blocking pi-coding-agent's actual usage but worth
+tracking: `.browse()` called with zero arguments still throws**, and
+this traces to a *new*, more general, more severe bug than anything
+`hosted-git-info`-specific:
+
+- **[paserati#170](https://github.com/nooga/paserati/issues/170)**
+  (vm): a variadic function (one with a rest parameter) throws a hard
+  runtime error when called with fewer arguments than its non-rest
+  parameter count — `function bar(path, ...args) {} bar();` throws
+  `Expected at least 1 arguments but got 0` instead of running with
+  `path: undefined`, matching real JS's total lack of arity enforcement
+  at the language level. This is a genuine `vm/call.go` runtime check
+  (not a suppressable type-checker diagnostic — there's a separate,
+  related compile-time-only version of the same bug in
+  `checker/call.go`, not what this issue is about), so it can't be
+  worked around by skipping type-checking. `(firstArg, ...rest)` is a
+  common real-world signature, so this is likely to recur elsewhere.
+  **Not currently blocking**: confirmed `pi-coding-agent`'s own code
+  never calls `hosted-git-info`'s `.browse()` (or any other template
+  method) at all — grepped `dist/` directly — so this doesn't affect the
+  actual target CLI, only a corner of `hosted-git-info`'s API surface
+  nothing currently exercises.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory

@@ -64,18 +64,39 @@ func TestPiAiStreamSimpleFetchError(t *testing.T) {
 	}
 }
 
-func TestHostedGitInfoShim(t *testing.T) {
+// TestHostedGitInfoReal exercises the real, unmodified hosted-git-info
+// package (its fake was deleted 2026-09-01 once paserati#159/#160/#163/
+// #168 — destructuring, re-exporting an import, and Object.assign
+// enumerability — were all fixed and this was confirmed working end to
+// end, matching pi-coding-agent's own real usage in dist/utils/git.js:
+// fromUrl() plus reading plain properties off the result, never any of
+// the #fill-based template methods).
+func TestHostedGitInfoReal(t *testing.T) {
+	pkgRoot := findPiAgentCorePackage(t)
+	if pkgRoot == "" {
+		t.Skip("pi-coding-agent not installed")
+	}
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(pkgRoot); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
 		import hostedGitInfo from "hosted-git-info";
-		hostedGitInfo.fromUrl("https://github.com/a/b") ? "ok" : "no"
+		const info = hostedGitInfo.fromUrl("git@github.com:foo/bar.git");
+		[info.domain, info.user, info.project].join(",")
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	if val.ToString() != "ok" {
-		t.Errorf("hosted-git-info = %q, want ok", val.ToString())
+	if val.ToString() != "github.com,foo,bar" {
+		t.Errorf("hosted-git-info fromUrl = %q, want github.com,foo,bar", val.ToString())
 	}
 }
 

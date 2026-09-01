@@ -81,9 +81,6 @@ func installModules(p *driver.Paserati) {
 	if !isDisabled(disabledFakes, "pi-agent-core") {
 		declarePiAgentCore()
 	}
-	if !isDisabled(disabledFakes, "hosted-git-info") {
-		declareHostedGitInfo()
-	}
 	declarePerfHooks()
 	declareStringDecoder()
 	if !isDisabled(disabledFakes, "typebox") {
