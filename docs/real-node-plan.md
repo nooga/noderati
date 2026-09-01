@@ -516,6 +516,11 @@ logged (not crashed) by `highlight.js`'s own per-language try/catch around
   matching). This isn't a bug to fix, it's an architectural boundary of the
   regex engine noderati/paserati is built on; supporting it would mean a
   different regex engine or a lookahead-emulation layer, out of scope here.
+  Tracked upstream as [paserati#172](https://github.com/nooga/paserati/issues/172)
+  (filed 2026-09-01, once `glob`'s `minimatch` dependency turned out to hit
+  the identical gap unconditionally — see Phase 3 below — making this a
+  wholesale blocker for a whole package, not just one `highlight.js`
+  language plugin).
 - **`mercury`**: `TypeError: Cannot assign to read only property 'length' of
   object` — a genuinely new paserati bug, isolated to a 5-line
   dependency-free repro and filed as
@@ -1519,8 +1524,15 @@ any pattern (confirmed: still fails identically with `dot: true`, so
 it's not specific to the default dotfile-exclusion behavior). Nothing
 to fix here on noderati's side — this is the same class of gap already
 accepted and documented for `latex`, just newly hit via a different
-package. `glob`'s fake stays. Verified no regressions from either fix
-via the full scoreboard and all three `pi` invocations.
+package. Filed upstream as
+[paserati#172](https://github.com/nooga/paserati/issues/172), since
+hitting it a second time via a completely unrelated package (nothing in
+common with `highlight.js` except "compiles a lookahead somewhere")
+makes it a wholesale blocker for a whole package's pattern-matching
+core, not a one-language edge case — worth having tracked at the
+engine level, even though there's no quick fix. `glob`'s fake stays.
+Verified no regressions from either fix via the full scoreboard and all
+three `pi` invocations.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
