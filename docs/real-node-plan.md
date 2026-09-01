@@ -1605,6 +1605,94 @@ against plain paserati with a two-line repro
 should be `0`). `glob`'s fake stays — this is squarely upstream, nothing
 to work around on noderati's side.
 
+**Ninth round (2026-09-01/02) — `#172` and `#174` verified fixed upstream;
+`glob`'s real functionality is now 100% correct; one new blocker found and
+filed.** paserati merged three fixes to `main`: the `#172` regexp2 fallback,
+the `#174` `Object.assign` array-target fix, plus two related array-indexing
+fixes (`667d201e` sparse-index bracket reads, `2f6fe2b0`
+`Object.defineProperty` honoring attributes on array indices). Rebuilt
+noderati against the updated checkout and re-verified everything directly
+against plain paserati before touching noderati, per this project's standing
+rule:
+
+- `#172` (RE2→regexp2 lookahead): all four lookaround forms (`(?!`, `(?=`,
+  `(?<=`, `(?<!`) verified correct again; the `latex`/`highlight.js` noise
+  stays gone.
+- `#174` (`Object.assign` array target): verified with three cases including
+  numeric-index + `length` assignment (`Object.assign([], {0:"a",1:"b",
+  length:2})` → `["a","b"]`) — correct.
+- Full `go build`/`go vet`/`go test`, all three real `pi` invocations, and
+  the full Phase 2 scoreboard: clean, zero regressions.
+- **`glob`'s real, non-minified ESM entry (`dist/esm/index.js`) now produces
+  100% correct functional output end-to-end** — both flat (`*.txt`) and
+  recursive (`**/*.txt`) patterns, verified against the actual installed
+  `glob@13.0.6` package. That file turned out to be a thin re-export shim
+  over glob's separate real source files (`glob.js`, `has-magic.js`,
+  `minimatch`'s own exports), not a bundle — so this confirms every fix
+  landed this cycle (RE2 lookahead, `path.posix`/`path.win32`,
+  `withFileTypes`/`Dirent`, `lstatSync`, `Object.assign` array target) really
+  does add up to correct real-world `glob` behavior.
+
+**But `glob`'s fake still cannot be deleted**, because that's not the file
+real code actually loads. `glob`'s own `package.json` `exports["."].import.
+default` points at `dist/esm/index.min.js` — a genuinely bundled-and-
+minified file (glob's own submodules plus `minimatch`/`minipass`/
+`path-scurry` all inlined into one ~83KB file) — and *that* file throws a
+`ReferenceError: Must call super constructor in derived class before
+accessing 'this' or returning from derived constructor` on every
+`globSync`/`glob` call, at the real, unmodified `PathScurryBase` →
+`PathScurryPosix` → `PathScurryDarwin` construction (minified to `It` → `rt`
+→ `St`).
+
+Chased this down at length before concluding it's a new, distinct paserati
+bug rather than anything fixable on noderati's side:
+
+- Confirmed via `try { globSync(...) } catch (e) { ... }` that it's a
+  genuine `ReferenceError` from paserati's own "must call super" VM check —
+  not a misattributed error — though every frame in the reported stack
+  shows the same bogus placeholder position (`3:1`), which is itself
+  suspicious.
+- Hand-written repros using the *exact* real shapes (a 3-level
+  `extends` chain built from class expressions, class fields declared
+  before the constructor, `let`-destructuring preceding `super(...)`,
+  indirect construction through a ternary-selected variable) all run
+  correctly in isolation, against plain paserati — none reproduce the bug.
+- Bisected the real file directly instead: truncating the real minified
+  bundle at byte offset 66040 (right after the `St` class definition ends,
+  discarding `Glob`/`globSync` entirely) and calling `new St("/tmp", {})`
+  directly **still reproduces the identical error** — so it needs nothing
+  from `Glob`/`globSync`/the ternary selection call site, just the
+  `It`/`rt`/`St` chain plus everything the bundle defines before it
+  (~65.6KB: an LRU cache, minipass, minimatch, path helpers, all bundled
+  ahead of the PathScurry classes). Attempted further automated bisection
+  (binary search over syntactically-valid split points) but didn't land on
+  anything smaller in the time available — every candidate cut either broke
+  on an unrelated dropped identifier or landed mid-token. This may depend on
+  total scope size (many prior class/function declarations in one compile
+  unit) rather than on any single specific construct, which would explain
+  why every hand-scoped-down repro above passes.
+- Re-verified the whole thing against **genuinely plain paserati** (not just
+  through noderati's embedding) using `-no-typecheck` plus small local stubs
+  for the handful of `node:*`/`fs` imports the truncated prefix still
+  contains (none of which the `new St(...)` call path actually exercises) —
+  reproduces identically, clean-room, confirming this is a paserati VM bug
+  and not something noderati-specific.
+- Along the way, noticed the checker rejects the *full* untruncated file
+  outright (without `-no-typecheck`) on an apparently unrelated false
+  positive — `Array.prototype.some`'s callback inferred as `(any,any)=>void`
+  instead of `(any,any)=>boolean` for a function whose only `return`
+  statement returns a `RegExp.prototype.test()` result. Could not reproduce
+  that one in isolation either; noted in the issue as a secondary
+  observation, not filed separately, and doesn't block noderati's real usage
+  path since noderati doesn't type-check host-loaded npm modules in the
+  first place.
+
+Filed as [paserati#180](https://github.com/nooga/paserati/issues/180), with
+a from-scratch-verified, self-contained (66KB, no external deps once the
+`node:*` imports are stubbed) reproduction script attached. `glob`'s fake
+stays until this lands — it is now the *only* thing standing between `glob`
+and being fully real.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
