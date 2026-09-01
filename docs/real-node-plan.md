@@ -1684,8 +1684,9 @@ bug rather than anything fixable on noderati's side:
   statement returns a `RegExp.prototype.test()` result. Could not reproduce
   that one in isolation either; noted in the issue as a secondary
   observation, not filed separately, and doesn't block noderati's real usage
-  path since noderati doesn't type-check host-loaded npm modules in the
-  first place.
+  path — confirmed (not assumed) that noderati calls `p.SetSkipTypeCheck(true)`
+  unconditionally at all three of its entry points in `cmd/noderati/main.go`,
+  so it never invokes paserati's checker at all, for anything.
 
 Filed as [paserati#180](https://github.com/nooga/paserati/issues/180), with
 a from-scratch-verified, self-contained (66KB, no external deps once the
