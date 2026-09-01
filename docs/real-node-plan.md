@@ -1454,6 +1454,74 @@ good. Six rounds of back-and-forth from "silently returns `{}`" to a
 fully-working real package, each round finding the next real bug once
 the previous one stopped being the blocker.
 
+**2026-09-01, seventh round: picked up `glob` next.** Its scoreboard
+"clean" row was the expected false positive (none of the three `pi`
+invocations call anything `glob`-dependent) — direct functional testing
+(`globSync`/`glob` via a real, unmodified `glob@11`) found two more real
+noderati-side bugs, both general and both fixed directly:
+
+- **`looksLikeESMSource` misclassified a real ESM file as CommonJS,
+  silently corrupting every export.** `import { globSync } from "glob"`
+  resolved and "succeeded" with `globSync` coming back `undefined` — no
+  error anywhere, matching the exact shape of a real CommonJS-vs-ESM
+  mismatch, except `glob`'s own `package.json` unambiguously says `type:
+  module` and its ESM build is genuinely ESM. Root-caused to
+  `nodemodules.go`'s `looksLikeESMSource`: it only checked whether some
+  *line* started with the literal string `"import "` or `"export "`
+  (note the trailing space) — which fails two ways at once for a
+  minified bundle: minifiers drop the space after the keyword
+  (`export{...}`, not `export {...}`), and the whole 82KB file is one
+  line, so "starts a line" only ever looks at line 1 (which starts with
+  neither keyword — the real `import`/`export` statements are scattered
+  mid-file, a common bundler artifact from concatenating what were
+  originally separate chunks). Misclassified as CJS, `.js` extension
+  tipped `shouldWrapCJS` into wrapping it in a CJS function body — which
+  hides its `export{...}` inside a function scope where it's a silent
+  no-op, not a syntax error, so nothing ever surfaced the problem.
+  Fixed by replacing the line-prefix scan with a whole-source,
+  word-boundary regex match for `import`/`export` as the reserved-word
+  keyword (safe: real JS can't use either as an ordinary identifier, so
+  a same-word-boundary match anywhere in the source has no real
+  false-positive risk). This is a general fix, not `glob`-specific — any
+  minified ESM bundle with a `.js` extension and no space after
+  `import`/`export` would have hit the identical silent corruption.
+
+- **`path.posix`/`path.win32` were almost entirely unimplemented** —
+  only `sep`/`basename`/`dirname` existed on either namespace, missing
+  `resolve`/`join`/`normalize`/`isAbsolute`/`relative`/`extname`/
+  `delimiter`/`toNamespacedPath` entirely. With the export bug fixed,
+  `glob`'s real dependency `path-scurry` got far enough to actually call
+  `path.posix.resolve(cwd)` from its `PathScurryBase` constructor (chosen
+  deliberately — `PathScurryPosix`/`PathScurryDarwin` pick the posix
+  implementation on purpose, not because the host happens to be POSIX) —
+  `posix.resolve` not existing at all threw `pathImpl.resolve is not a
+  function`, which is what the earlier, much more confusing "Must call
+  super constructor..." error (chased at length against the *minified*
+  bundle before switching to the readable non-minified source, which is
+  what actually surfaced this) turned out to really be — some other
+  reporting artifact of the same underlying failure, not a real
+  super-call-ordering bug at all. Implemented both namespaces properly
+  and platform-independently (`internal/host/path.go`) — `posix.*` via
+  Go's platform-independent `"path"` package (always forward-slash,
+  correct regardless of host OS, unlike reusing `path/filepath` which
+  would silently produce backslash output on a Windows host); `win32.*`
+  hand-rolled (Go's stdlib has no backslash-path equivalent) — join,
+  normalize, resolve, and relative all implemented and checked against
+  known-correct outputs directly, not just "doesn't crash."
+
+**`glob` itself still can't be unfaked.** With both bugs above fixed,
+`globSync`/`glob` get all the way into `minimatch`'s actual
+pattern-to-regex compilation — and hit the same documented, accepted,
+architectural gap as `highlight.js`'s `latex` support: Go's RE2 regex
+engine doesn't support lookahead (`(?!`), and minimatch's glob-to-regex
+translation uses a negative lookahead unconditionally, for essentially
+any pattern (confirmed: still fails identically with `dot: true`, so
+it's not specific to the default dotfile-exclusion behavior). Nothing
+to fix here on noderati's side — this is the same class of gap already
+accepted and documented for `latex`, just newly hit via a different
+package. `glob`'s fake stays. Verified no regressions from either fix
+via the full scoreboard and all three `pi` invocations.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

@@ -369,14 +369,26 @@ func shouldWrapCJS(absPath, source string) bool {
 	return looksLikeCJSSource(source) || ext == ".js"
 }
 
+// esmKeywordRe looks for `import`/`export` used as the reserved-word
+// statement keyword, anywhere in the source — not just at the start of
+// a line. The line-prefix version this replaced (`strings.HasPrefix(trim,
+// "import ")`) missed two real shapes at once: a minified bundle is one
+// giant line, so "starts a line" never matches anything past line 1; and
+// minifiers routinely drop the space after the keyword entirely
+// (`import{fileURLToPath as X}from...`, `export{...}`), so even a
+// same-line check requiring a literal trailing space would still miss
+// it. A real, unmodified ESM bundle (glob's minified dist/esm/index.min.js
+// is what surfaced this) was silently misdetected as CommonJS this way —
+// CJS-wrapped despite having no CommonJS in it at all, which hides its
+// `export{...}` inside a function body the wrapper wraps around it,
+// leaving every export silently empty with no error anywhere. `import`
+// and `export` are JS reserved words — they can only appear as this
+// keyword, as `import()`/`import.meta`, or inside a string/comment, so a
+// same-word-boundary match anywhere in the source is safe.
+var esmKeywordRe = regexp.MustCompile(`(?:^|[^\w$])(?:import|export)(?:[^\w$]|$)`)
+
 func looksLikeESMSource(source string) bool {
-	for _, line := range strings.Split(source, "\n") {
-		trim := strings.TrimSpace(line)
-		if strings.HasPrefix(trim, "import ") || strings.HasPrefix(trim, "export ") {
-			return true
-		}
-	}
-	return false
+	return esmKeywordRe.MatchString(source)
 }
 
 func looksLikeCJSSource(source string) bool {
