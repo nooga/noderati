@@ -2600,6 +2600,63 @@ paserati bugs on their actual real-world call paths, not just
 "doesn't crash the same way" as the fake. No noderati code changes
 this round; full build/vet/test unaffected.
 
+**Twenty-fifth round (2026-09-02) — `#198`/`#199` fixed on
+[paserati PR #200](https://github.com/nooga/paserati/pull/200)
+(unmerged), verified for information only.** Checked out the PR's
+branch (`fix/promise-own-props-and-async-arrow-this`,
+`a074b017`), `go clean -cache` rebuild first. Both issues' own
+repros now give the correct result — `#198`'s `APIPromise` subclass
+builds and its `responsePromise` reads back correctly; `#199`'s
+two-receiver repro (`t13.mjs`, the one that replaced the original
+wrong "detached calls" framing) gives `obj` for both call shapes,
+matching real Node exactly. Re-ran every control case from both
+issues too (not just the failing repros): `Array`/`Error`/`Map`/`Set`
+subclassing still works (confirms the `Promise` fix didn't regress
+the other five `op_setprop.go` cases it sits beside), plain arrow
+functions and attached async methods still correct (confirms the
+`this`-sourcing fix is scoped to the async-arrow case and didn't
+touch the working paths). `advisor()` flagged that neither control set
+covered the *actual* shape that motivated `#199` — a class-field async
+arrow, capturing a constructor-time instance `this`, called through a
+detached-callback subscribe wrapper (`t5`/`t6`/`classfield_arrow_test4`,
+the closest stand-in for `agent-session.js`'s real
+`_handleAgentEvent`) — since `t13`'s repro closes over an *object
+method's* `this` instead, a different capture site
+(`compileFunctionLiteralAsFieldInitializer` is a separate compiler
+entry point from the plain-closure path `t13` exercises). Re-ran all
+three: all pass, including the one with an internal `await` before the
+`this.` reference — `#199` is now verified against the shape that
+found it, not just the shape that minimized it. Full paserati
+build/vet/test: clean.
+
+Went past the isolated repros to the real call paths per the standing
+rule: `pi-ai` alone and `pi-agent-core`+`pi-ai` together both now get
+past `#198`/`#199` entirely on `-p hello` — the `Promise` and
+`_emitExtensionEvent` errors are both gone — and converge on the
+*same* next blocker: `URLSearchParams is not defined` (confirmed
+`typeof URLSearchParams === "undefined"` directly, not inferred from
+the error text). `advisor()` pushed on scope here too: noderati does
+have a `url` module (`declareURL(p)`), and real Node exports
+`URLSearchParams` both globally and from `node:url` — checked which of
+those noderati is actually missing rather than assuming "the global
+alias." Both: `import * as url from "node:url"; typeof
+url.URLSearchParams` is *also* `undefined` (while `typeof URL` — the
+class, not the search-params helper — is `"function"` and works
+fine). So this isn't a one-line `DefineGlobal` next to `atob`/`btoa`
+like the doc's first read suggested — `URLSearchParams` needs an
+actual implementation (query-string parsing/serialization, iteration,
+`.get`/`.set`/`.append`/`.toString()`), registered on both the global
+and the `url` module's exports. Noted as the natural next thread for
+either package, not implemented this round. `--version`/`--help` for
+both configurations still match baseline. Switched the shared paserati
+checkout back to `main` before finishing (it had moved to a different
+WIP branch, `fix/for-init-member-expr-and-union-contextual-typing`,
+since last round — unrelated, not touched; checked it back out
+briefly, read-only, for this round's own verification, then back to
+`main` again). Neither fake is deleted yet — `#198`/`#199` aren't
+merged, and `URLSearchParams` is a new, separate, unaddressed blocker
+regardless. No noderati code changes this round.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
