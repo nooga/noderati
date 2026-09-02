@@ -83,9 +83,18 @@ func installModules(p *driver.Paserati) {
 	}
 	declarePerfHooks()
 	declareStringDecoder()
-	if !isDisabled(disabledFakes, "typebox") {
+	// typebox's own top-level entry (Type.Object etc.) was deleted
+	// 2026-09-02 (paserati#183 fixed, real package verified working via
+	// actual functional exercise — see docs/real-node-plan.md's Phase 3
+	// section) — node_modules resolution now always loads the real
+	// typebox package for the bare "typebox" specifier. typebox/value
+	// and typebox/compile are separate real npm entry points, still
+	// blocked by paserati#188, so they keep their own independent
+	// toggles rather than being all-or-nothing with the parent package.
+	if !isDisabled(disabledFakes, "typebox/compile") {
 		declareTypeboxCompile()
-		declareTypebox()
+	}
+	if !isDisabled(disabledFakes, "typebox/value") {
 		declareTypeboxValue()
 	}
 	if !isDisabled(disabledFakes, "diff") {

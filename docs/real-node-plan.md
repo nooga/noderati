@@ -2011,6 +2011,69 @@ did. `diff`'s fake stays, now blocked by `#185` instead of the
 now-fixed `#182`. Full build/vet/test, full scoreboard: unchanged, clean
 (no noderati code touched this round).
 
+**Fourteenth round (2026-09-02) — `#183` merged and confirmed; `typebox`'s
+own top-level entry deleted; `typebox/value`/`typebox/compile` re-blocked
+by a new, precisely-scoped compiler bug
+([paserati#188](https://github.com/nooga/paserati/issues/188)); `#185`
+verified fixed on an unmerged branch (informational, not acted on).**
+
+Pulled `main` (`b8c17c8c`, "fix(modules): key module caches by resolved
+path, not specifier text"), clean-cache rebuilt both. Re-verified `#183`'s
+own two repros directly — both fixed (including the reversed-import-order
+check and the silent-wrong-value variant, which now correctly resolves to
+`105` instead of a wrongly-shared `10`). Then re-exercised `typebox`'s
+real, evidenced usage — not just `write.js`'s single call site from the
+prior round, but `bash.js`'s and `grep.js`'s real schemas too (multiple
+`Type.Optional` fields, correctly excluded from `required`) — all correct.
+**`internal/host/typebox.go` (the top-level `Type.Object` etc. fake)
+deleted.**
+
+`typebox/value` and `typebox/compile` are separate real npm entry points
+(their own `package.json` `exports` subpaths) that were previously
+all-or-nothing with the parent package's single `"typebox"` toggle — split
+into their own independent `disabledFakes` names (`"typebox/value"`,
+`"typebox/compile"`) in `host.go` and `cmd/scoreboard/main.go`, so a fake
+can be deleted exactly where it's proven real without forcing the same
+verdict onto a sibling entry point that isn't. Necessary this round
+specifically: real, evidenced usage (`model-registry.js`/`theme.js`'s
+`Compile(schema).Check(...)`) of `typebox/compile` still throws —
+`Cannot read properties of undefined (reading 'Symbol(Symbol.iterator)')`,
+inside typebox's own `Arguments.Match` overload-dispatch helper (used by
+`typebox/value`'s `Check`/`Errors` and, transitively, `typebox/compile`'s
+`Compile(...).Check`/`.Errors` — both share it).
+
+Bisected `Match`'s `match[args.length]?.(...args) ?? (() => { throw ... })()`
+down to a clean, dependency-free, general repro against plain paserati:
+an **optional call whose callee is a member expression** (`obj.f?.(...)`,
+`obj["f"]?.(...)`, `obj[computed]?.(...)` — any form) **combined with a
+spread argument** doesn't work correctly. A plain-identifier callee with
+spread works fine; a member-expression callee with literal (non-spread)
+arguments works fine; only the combination of all three (member callee +
+optional call + spread arg) breaks — manifesting two different ways
+depending on context: a standalone hard *compile error*
+(`error compiling argument in optional call expression`) as a bare
+statement, or a silent `undefined` (neither the real function's result
+nor the `??` fallback) when wrapped in `??`, exactly `Match`'s own shape.
+Filed as `#188`. `typebox/value`'s and `typebox/compile`'s fakes both
+stay pending it — confirmed via direct exercise, not assumed from the
+scoreboard's own signal (`fake-off:typebox/value` shows scoreboard-clean,
+same known trap as ever, since none of the three smoke invocations touch
+real schema validation).
+
+Separately, checked in on `#185` (still open on `main`, but fixed on a
+pushed, unmerged `fix-185` branch — same situation `#180` was in) purely
+informationally: re-ran `diffLines` against the same 3-vs-4-line fixture
+from the prior round, using a clean-cache build off that branch — now
+produces the correct five per-line parts with newlines intact, matching
+real Node exactly. Not acted on — `main` doesn't have it yet, so `diff`'s
+fake stays untouched, per this project's standing rule.
+
+Full build/vet/test, all three real `pi` invocations, full scoreboard:
+clean. `pi-ai`'s `fake-off` failure text changed since last checked
+(`Cannot read property 'id' of undefined` → `ReferenceError: atob is not
+defined`) — not investigated this round, noted for whenever `pi-ai`/
+`pi-agent-core` get picked up.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
