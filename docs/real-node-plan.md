@@ -51,14 +51,14 @@ registered ahead of the real files on disk: `@earendil-works/pi-tui` (every
 export is a no-op — the entire TUI is fake), `@earendil-works/pi-ai` (a
 from-scratch reimplementation of the real LLM client, including its own model
 catalog and provider fetch calls), `@earendil-works/pi-agent-core` (a
-from-scratch reimplementation of the actual agent loop), `typebox/value` /
-`typebox/compile`, `jiti/static`.
+from-scratch reimplementation of the actual agent loop), `typebox/compile`,
+`jiti/static`.
 (`minimatch` was here too — deleted 2026-08-31; `hosted-git-info` deleted
-2026-09-01; `proper-lockfile`, `glob`, `typebox`'s own top-level entry, and
-`diff` all deleted 2026-09-02 — `typebox/value`/`typebox/compile` are
-separate real npm entry points that split off their own independent
-toggle the same day and are still blocked; see Phase 3 below for all of
-these.)
+2026-09-01; `proper-lockfile`, `glob`, `typebox`'s own top-level entry,
+`diff`, and `typebox/value` all deleted 2026-09-02 —
+`typebox/value`/`typebox/compile` split off their own independent toggle
+that same day, as separate real npm entry points, before `typebox/value`
+itself cleared too; see Phase 3 below for all of these.)
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
@@ -2153,6 +2153,20 @@ preprocessing pass, independent of either engine's own `\p{...}`
 support). `typebox/compile`'s fake stays, now blocked by `#190` instead of
 `#188`. No noderati code changes this round (nothing here is on `main`
 yet); full build/vet/test unchanged, clean.
+
+**Seventeenth round (2026-09-02) — `#188` merged and confirmed;
+`typebox/value`'s fake deleted.** Pulled `main` (`18200ba4`, "fix(compiler):
+optional call on a member-expression callee handles spread args"),
+clean-cache rebuilt both. Re-verified `#188`'s own two repro forms
+directly, plus `typebox/value`'s real `Check`/`Errors` functional
+exercise — both correctly report `true`/`false` for valid/invalid values
+now. `internal/host/typeboxvalue.go` deleted; its `host.go` registration
+and `cmd/scoreboard/main.go` toggle both removed. Re-ran the same
+functional exercise with the fake actually gone — identical, correct
+results. Full build/vet/test, all three real `pi` invocations, full
+scoreboard: clean. `typebox/compile` stays faked, still blocked by
+`#190`. Remaining fully-uninvestigated group-B fakes: `pi-tui`, `pi-ai`,
+`pi-agent-core`, `jiti`.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
