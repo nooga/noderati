@@ -53,8 +53,12 @@ libraries pi-coding-agent depends on, hardcoded as JS strings in Go and
 registered ahead of the real files on disk: `@earendil-works/pi-tui` (every
 export is a no-op — the entire TUI is fake), `@earendil-works/pi-ai` (a
 from-scratch reimplementation of the real LLM client, including its own model
-catalog and provider fetch calls), `@earendil-works/pi-agent-core` (a
-from-scratch reimplementation of the actual agent loop), `jiti/static`.
+catalog and provider fetch calls — its bare-entry fake only exports
+`modelsAreEqual`, everything else lives in the separate `/compat` fake;
+real `pi-agent-core` imports `EventStream`/`parseStreamingJson` from the
+*bare* specifier, coupling the two fakes — neither de-fakes cleanly
+without the other, confirmed 2026-09-02), `@earendil-works/pi-agent-core`
+(a from-scratch reimplementation of the actual agent loop), `jiti/static`.
 (`minimatch` was here too — deleted 2026-08-31; `hosted-git-info` deleted
 2026-09-01; `proper-lockfile`, `glob`, `typebox`'s own top-level entry,
 `diff`, and `typebox/value` all deleted 2026-09-02 —
@@ -2485,6 +2489,116 @@ untouched (no stash/checkout/clean), per standing hygiene around a
 resource this session doesn't own. `pi-tui`'s fake stays in place — no
 fix exists yet. No noderati code changes this round; full build/vet/
 test unaffected.
+
+**Twenty-fourth round (2026-09-02) — `pi-agent-core` and `pi-ai`
+investigated together (the user asked for both); three real findings,
+two new paserati bugs filed as
+[paserati#198](https://github.com/nooga/paserati/issues/198) and
+[paserati#199](https://github.com/nooga/paserati/issues/199).** Bonus
+observation on the way in: `#194` (last round's for-init parser bug)
+landed on `origin/main` (`2123e0eb`) during this round — noted here for
+the record; not re-verified/acted on this round since today's ask was
+these two packages, not closing out `jiti`.
+
+**Finding 1 — `pi-agent-core`'s "Class extends value undefined" isn't
+a paserati bug at all.** Disabling only `pi-agent-core`'s fake failed
+immediately with `TypeError: Class extends value undefined is not a
+constructor or null`. Traced (not assumed) to the exact real line:
+`pi-agent-core`'s real `dist/proxy.js` does
+`import { EventStream, parseStreamingJson } from "@earendil-works/pi-ai";`
+— the *bare* `pi-ai` specifier, not `/compat`. Reading `internal/host/
+piai.go` directly: the bare `@earendil-works/pi-ai` fake
+(`piAiShim`) only ever exported `modelsAreEqual` — `EventStream` and
+everything else pi-agent-core needs live only in the separate
+`piAiCompatShim` (`@earendil-works/pi-ai/compat`). So `EventStream`
+genuinely was `undefined` on that import — a real gap in the fake's
+completeness, not a bug in paserati or in pi-agent-core's real code.
+Confirmed the fix isn't "patch the bare fake to add these exports"
+(exactly the smaller-fake anti-pattern `docs/real-node-plan.md` itself
+warns against) by disabling `pi-ai`'s fake alongside `pi-agent-core`'s:
+`--version`/`--help` both then match baseline exactly. `-p` doesn't,
+but for the next two reasons — not this one.
+
+**Finding 2 — `pi-ai`'s real `-p` blocker: subclassing `Promise` and
+setting an own property after `super()` throws.
+[paserati#198](https://github.com/nooga/paserati/issues/198).** With
+just `pi-ai`'s fake disabled, `--version`/`--help` match baseline;
+`-p hello` (the one invocation that makes a real request) fails with
+`TypeError: Cannot create property 'responsePromise' on object
+'&{20 0 0x...}'` — a raw Go struct printed via `%v`, not a JS value,
+immediately suspicious. Traced to `@anthropic-ai/sdk`'s real,
+unmodified `core/api-promise.js`: `class APIPromise extends Promise`,
+setting `this.responsePromise = ...` in the constructor after
+`super()`. Minimally reproduced standalone; confirmed `Array`/`Error`/
+`Map`/`Set` all handle the identical subclass-then-own-property
+pattern correctly — only `Promise` is broken. Root-caused by reading
+`pkg/vm/op_setprop.go`'s own-property type-switch directly:
+`TypeRegExp`/`TypeMap`/`TypeSet`/`TypeArrayBuffer`/
+`TypeSharedArrayBuffer` all have a dedicated case backed by a
+`Properties` table; there's no `case TypePromise:` at all, so it falls
+into the `default` branch's "not a plain object → throw in strict
+mode" path (and ES modules are always strict). `PromiseObject` already
+has a `prototype` field explicitly documented for subclassing support,
+just no `Properties` table to match — filed with that exact gap and
+the fix pattern already established by the other five cases.
+
+**Finding 3 — `pi-agent-core`'s deeper blocker, once its own fake is
+also off: `async` arrow functions derive `this` from the call site
+instead of lexical capture.
+[paserati#199](https://github.com/nooga/paserati/issues/199).** With
+*both* `pi-agent-core` and `pi-ai` disabled, `--version`/`--help`
+still match baseline, but `-p` fails differently than `pi-ai` alone —
+`Cannot read property '_emitExtensionEvent' of undefined` — meaning it
+doesn't even reach `#198` yet. Traced to `pi-coding-agent`'s real
+`core/agent-session.js`: `_handleAgentEvent = async (event) => {
+await this._emitExtensionEvent(event); }`, an ordinary auto-bind
+class-field-arrow-function passed as a detached callback to
+`agent.subscribe(this._handleAgentEvent)` — the single most common
+idiom for this exact situation, expected to just work. It doesn't.
+
+First characterization was wrong and `advisor()` caught it before
+filing settled: the initial read was "detached calls lose captured
+`this`, attached calls work," inferred from `s.handle("x")` (attached)
+succeeding while `const f = s.handle; f("x")` (detached) failed.
+`advisor()` pointed out that explanation contradicts arrow-function
+semantics on its face — arrows ignore the call-time receiver entirely,
+so "attached" shouldn't matter at all if capture were actually
+working — and asked for a test that varies the receiver while holding
+the arrow itself fixed. That test (`const h = obj.make()` returning an
+async arrow that closes over `obj`; call `h()` bare, and
+`{ h }.h()` through an unrelated `holder`) showed both calls give
+**different** wrong answers, each exactly matching what a *regular*
+(non-arrow) function's dynamic `this` would give for that call shape:
+`undefined` for the bare call, the actual receiver (`holder`, which
+has no matching property) for the member call. So the arrow isn't
+failing to capture and falling back to some fixed wrong value — the
+VM is computing its `this` as if `isArrowFunction` were false, full
+stop, for the async case only. The earlier "detached" framing held
+up only by coincidence (a class field's receiver equals its own
+lexical capture when called through the same instance it's declared
+on) — the corrected two-receiver repro rules that out. Confirmed
+plain (non-`async`) arrows are unaffected in every shape tried, and
+ordinary `async` methods (non-arrow) correctly use their dynamic
+receiver — consistent with the "only isArrowFunction is being ignored
+for async" diagnosis. Verified side by side against real Node.
+Edited `#199` before anyone acted on the wrong framing. Not
+root-caused to an exact line — flagged the likely area (async
+function frame setup probably not checking `isArrowFunction` at all
+before sourcing `this` from the call's receiver) rather than guessing
+further into unfamiliar VM territory.
+
+Confirmed on a fresh `go clean -cache` build off `main` (`e3059abf`)
+for both issues. The shared paserati checkout moved to a new WIP
+branch (`fix/for-init-member-expr-and-union-contextual-typing`) at
+some point during this round, presumably other work landing — noticed
+at the end, left completely untouched (this session did no checkouts
+this round; the earlier builds used here were all taken while the
+checkout was still on `main`, so the verification itself is
+unaffected). Neither `pi-agent-core` nor `pi-ai`'s fake is safe to
+delete yet — both are genuinely blocked by real, filed, unmerged
+paserati bugs on their actual real-world call paths, not just
+"doesn't crash the same way" as the fake. No noderati code changes
+this round; full build/vet/test unaffected.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
