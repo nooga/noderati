@@ -34,12 +34,15 @@ proud of and building on.
 
 **A-minus. Real builtin name, fake body — needs a real implementation, not
 deletion:** `string_decoder` (`stringdecoder.go` — `write()` just does
-`String(c)`, no actual UTF-8 multibyte/incremental decoding), `glob`
-(real Node/npm surface, but `globSync` always returns `[]` — silently
-*wrong*, worse than missing). `minimatch`'s equivalent fake was resolved the
-group-B way instead, 2026-08-31 — deleted outright, real `node_modules`
-resolution now loads the genuine package (see Phase 3 below); it never
-needed a real from-scratch implementation here, just deleting the shim.
+`String(c)`, no actual UTF-8 multibyte/incremental decoding). `glob` was
+listed here too (real npm surface, but `globSync` always returned `[]` —
+silently *wrong*, worse than missing) until it turned out, like
+`minimatch`, to need no from-scratch implementation at all: resolved the
+group-B way instead, 2026-09-02 — deleted outright once
+[paserati#180](https://github.com/nooga/paserati/issues/180) fixed the
+real package's own blocker, real `node_modules` resolution now loads
+the genuine package (see Phase 3 below). `minimatch`'s equivalent fake
+went the same way, 2026-08-31.
 `stream.go` also hand-rolls its own `EventEmitter` instead of reusing
 `events.go`'s — pick
 one.
@@ -2331,6 +2334,24 @@ scoreboard: clean. Remaining fully-uninvestigated group-B fakes:
 separate, unstudied `-p` failure
 (`Cannot create property 'responsePromise' on object '&{20 0 0x...}'`)
 noted but not yet chased.
+
+`advisor()` flagged a real gap in that verification: `--version`/
+`--help`/`-p hello` never actually reach a `.Check()` call on real
+data (the eager `Compile()` calls at import time only prove the
+module *loads*, not that a schema with real constructs *validates*
+correctly), and the `ModelsConfigSchema` exercise used to verify
+`#192` didn't cover `theme.js`'s other eager schema, which uses
+`Type.Integer({minimum, maximum})` inside a `Type.Union` — a construct
+`ModelsConfigSchema` doesn't have. Built that exact shape (string-or-
+bounded-integer union, matching `theme.js`'s `ColorValueSchema`) and
+ran a valid value, an out-of-range value, and `.Errors()` on the
+failure through it — all three matched real Node exactly, including
+the precise error-message strings (`must be string`, `must be <=
+255`, `must match a schema in anyOf`). Both of `typebox/compile`'s
+real eager call sites are now genuinely exercised, not just imported.
+Also fixed the A-minus ledger's stale `glob` entry (still described as
+"needs a real implementation" — it was actually deleted the group-B
+way on `#180`, same as `minimatch`) while in the file for this.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
