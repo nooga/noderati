@@ -2112,6 +2112,48 @@ noted for whenever `typebox/value`/`typebox/compile` are revisited. Only
 `pi-tui`, `pi-ai`, `pi-agent-core`, and `jiti` remain as fully
 uninvestigated group-B fakes.
 
+**Sixteenth round (2026-09-02) — `#188` confirmed fixed on an unmerged
+branch (informational only); `typebox/compile` re-blocked by a distinct,
+newly-filed regex-engine gap ([paserati#190](https://github.com/nooga/paserati/issues/190)).**
+`#188` sits committed and pushed on `origin/fix-188` (`62cdefba`), `main`
+unchanged, issue still open — same situation `#180`/`#185` were in before
+they landed. Checked it out, clean-cache rebuilt, and verified: both of
+the issue's own repros (a member-expression-callee optional call with a
+spread argument, standalone and `??`-wrapped) now behave correctly, and
+**`typebox/value`'s real `Check`/`Errors` now work end to end** — valid
+and invalid values both correctly reported, confirmed directly. Not acted
+on — `main` doesn't have it yet, so `typebox/value`'s fake stays untouched
+regardless of this being fully verified working.
+
+Continuing the same functional exercise onto `typebox/compile` (which
+shares `Arguments.Match`, `#188`'s target, with `typebox/value`) found a
+**new, unrelated** blocker: `Compile(schema)`'s real validator-codegen path
+throws building a regex it constructs internally,
+`/^[\p{ID_Start}_$][\p{ID_Continue}_$]*$/u` (used to decide whether a
+generated property accessor needs bracket notation) — `SyntaxError:
+unknown unicode category, script, or property 'ID_Start'`. Confirmed
+stable against a fresh `main` checkout (unrelated to the `fix-188` branch
+or its content). Bisected precisely: `\p{ID_Start}`/`\p{ID_Continue}` are
+ECMAScript-specific Unicode *derived binary properties* (from Unicode's
+own `PropList.txt`, added to JS in ES2018 specifically to define what a
+valid identifier character is) — distinct from the ordinary
+category/script names both of paserati's regex engines otherwise support.
+Checked both engines directly, not assumed: RE2 fails outright
+(`invalid character class range`); **`regexp2` — the fallback engine
+`#172` added specifically for lookaround — also doesn't recognize these
+two names** (a different error message, `unknown unicode category,
+script, or property`, confirming `regexp2` genuinely was tried and itself
+failed, not just that the narrower `new RegExp(...)` fallback gate missed
+this pattern). So this is a deeper gap than `#172`'s — broadening the
+fallback trigger alone wouldn't fix it, since neither engine has the data
+this needs. Filed as `#190` with that distinction spelled out, plus a
+concrete direction (both properties are static, well-published Unicode
+data — expandable into an explicit character-class range in a
+preprocessing pass, independent of either engine's own `\p{...}`
+support). `typebox/compile`'s fake stays, now blocked by `#190` instead of
+`#188`. No noderati code changes this round (nothing here is on `main`
+yet); full build/vet/test unchanged, clean.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
