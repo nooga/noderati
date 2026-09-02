@@ -1910,6 +1910,62 @@ is general and likely to recur. `diff`'s fake stays pending `#182`.
 `typebox`, `pi-ai`, `pi-agent-core`, `pi-tui`, and `jiti` remain
 uninvestigated this round.
 
+**Twelfth round (2026-09-02) — investigated `typebox`, found and filed a
+severe, general module-resolution correctness bug
+([paserati#183](https://github.com/nooga/paserati/issues/183)).**
+`typebox@1.1.38`'s real `Type` export loads fine on its own (all ~120
+real exports present, richer than the fake's dozen), but the real,
+evidenced usage pattern (`Type.Object({ path: Type.String({...}), ... })`,
+from `dist/core/tools/write.js` and seventeen other real call sites)
+throws `TypeError: undefined is not a function` deep inside typebox's own
+`RequiredArray`/`IsOptional` machinery.
+
+Bisected by testing each layer of the real package's own module graph in
+isolation — `_optional.mjs`, `properties.mjs`, `object.mjs`, and even the
+full `typebox.mjs` namespace all worked *individually*; the failure only
+appeared once loaded through the real top-level entry, `build/index.mjs`.
+That file combines several `export *` barrels
+(`type/action/index.mjs`, `type/extends/index.mjs`, `type/types/index.mjs`,
+plus a namespaced `export * as Type from './typebox.mjs'`) — bisecting
+*those* found `type/action/index.mjs` and `type/extends/index.mjs` each
+independently trigger it, `type/engine/index.mjs`/`type/script/index.mjs`
+don't. The common thread: `type/action/_optional.mjs` and
+`type/extends/object.mjs` are real, different files with real, different
+content, that happen to share a basename with `type/types/_optional.mjs`/
+`type/types/object.mjs` — the exact files `Type.Object`'s own working
+implementation depends on.
+
+Reduced to two clean, dependency-free, general (no `typebox` involved at
+all) repros, both verified against plain paserati directly:
+
+1. `dirA/_helper.mjs` and `dirB/_helper.mjs` — different files, different
+   directories, each exporting a *different-named* function; `dirA/user.mjs`
+   and `dirB/user.mjs` each do `import { X } from './_helper.mjs'` (a
+   plain relative import, resolved from *their own* directory). Importing
+   both users from one script: the first one resolved works; the second
+   throws `undefined is not a function` — its own `./_helper.mjs` import
+   silently got handed back the *other* directory's already-cached module
+   instead of loading its own file. **Reversing the import order in the
+   entry script flips which one fails** — confirms it's a "whoever
+   resolves this literal specifier text first wins the cache slot"
+   mechanism, not anything content-specific.
+2. Same shape, but both `_helper.mjs` files export a *same-named* function
+   with different logic (`x*2` vs `x+100`). No crash at all this time —
+   the second file's caller just silently gets the *first* file's wrong
+   implementation and returns the wrong number, with zero indication
+   anything went wrong.
+
+Filed as a general compiler/driver bug, not `typebox`-specific — likely
+root cause is the module cache keying relative-import resolution by the
+literal specifier text (`'./_helper.mjs'`) instead of the fully resolved,
+canonical path (which necessarily differs between two different
+directories). Flagged as high severity given repro 2: any real,
+multi-directory project with a conventionally-reused filename
+(`index.js`, `utils.js`, `base.js`, ...) can silently swap in the wrong
+module's implementation with no error at all — considerably worse than a
+crash. `typebox`'s fake stays pending `#183`. `pi-ai`, `pi-agent-core`,
+`pi-tui`, and `jiti` remain uninvestigated.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
