@@ -3151,6 +3151,141 @@ so this probably helps other real packages too, not just jiti);
 `node:v8` (small, honest, real implementation, not a stub scoped to
 one call site).
 
+**Thirtieth round (2026-09-02) — user reported `#205` closed and
+checked out locally; verified it, found it genuinely fixes streaming
+but surfaced two more real gaps, one of them a regression severe
+enough to change this project's own scoreboard baseline text.**
+Confirmed `#205`'s actual fix landed as `dbf6d62d` on `origin/main`
+(separate from the `2c346301` primitive two rounds ago — that only
+added the `ReadableStream` type; this commit is what wires `fetch()`'s
+`Response.body` to it). Clean-cache rebuilt; paserati's own full test
+suite: clean.
+
+**`#205` itself is genuinely fixed** — verified against the same real
+SSE stub server as two rounds ago: `typeof response.body === "object"`
+now (was `"undefined"`), `.getReader()` exists, and reading through it
+returns the complete, correct bytes (confirmed by dumping the actual
+byte array and decoding it by hand, not just checking a length) — the
+earlier "only 19 bytes, no `[DONE]` terminator" first read looked like
+a `ReadableStream` bug, but the raw bytes it returned were the full,
+correct SSE payload; the appearance of truncation was entirely
+`TextDecoder.decode()` silently failing to decode a real `Uint8Array`,
+not the stream dropping or truncating data. (This round's stub sent
+all four SSE frames back-to-back with no gap, so it doesn't itself
+distinguish genuinely-incremental delivery from an already-buffered
+body handed back in one piece — `dbf6d62d`'s own `fetch_stream_test.go`
+already covers that timing question upstream, with a real gap between
+chunks, so it wasn't re-verified here.) Re-aimed the investigation at
+`TextDecoder` instead of filing against `#205`.
+
+**Found and filed `#212`** — `TextDecoder.decode()` never handles a
+real `Uint8Array`/`ArrayBuffer` at all; `pkg/builtins/text_codec_init.go`
+only checks `vm.TypeArray` (a plain JS array), so any real typed-array
+input falls through to a generic `.ToString()` fallback, producing
+literal `"[object Uint8Array]"`/`"[object ArrayBuffer]"` text instead
+of decoding anything. Confirmed broadly (bare `Uint8Array`,
+`ArrayBuffer`, and a byte-offset subarray view all fail the same way)
+before filing, and root-caused to the exact missing branch
+(`vm.TypeTypedArray`, `AsTypedArray()`/`GetBufferData()`) rather than
+just describing the symptom. This is likely the actual remaining
+blocker for any real streaming text consumer (the OpenAI/Anthropic/
+Google SDKs' shared `LineDecoder` all `.decode()` each raw chunk) —
+more foundational than `#205` was, since `Uint8Array` is what
+`TextEncoder.encode()` itself returns and what every stream chunk is.
+
+**Found and filed `#213` — a genuine regression, not a pre-existing
+gap.** Rebuilding noderati against the fixed `#205` broke a previously
+green test, `TestPiAiStreamSimpleFetchError` (expects a real
+"connection refused"-shaped error from `pi-ai`'s fake hitting an
+intentionally-unroutable address). The rejected error changed from a
+real Go dial error to `"AbortError: The operation was aborted"` — with
+**no `AbortSignal` anywhere in the call**. Confirmed this was newly
+introduced by `dbf6d62d` (not present before) by running the exact
+same bare, `AbortSignal`-free repro against the still-available
+pre-`#205` binary from two rounds ago: it correctly reported the real
+dial error there. Root-caused precisely by reading `dbf6d62d`'s own
+diff (not inferring from the new code alone — `advisor()` pushed for
+the actual `git show` diff of the old code's `cancel()` handling
+before accepting the narrative): the pre-fix outer goroutine did
+`defer cancel()` in the *same function* as its `ctx.Err() ==
+context.Canceled` check, so that `defer` only ran *after* the check
+had already read `ctx.Err()`'s real value; `dbf6d62d` moved `cancel`
+ownership into the callee (`doFetchRequestWithContext`), whose own
+internal cleanup now fires *before* returning control to the caller,
+on every single error path — so the check that used to distinguish
+"a real abort happened" from "the request just failed" now reads
+`context.Canceled` unconditionally after any network failure at all,
+and the real underlying error is discarded. Filed with that precise
+before/after mechanism, not just the symptom, plus a suggested fix
+direction (track whether the abort-polling goroutine's own
+`abortOnce.Do` actually fired, rather than trusting `ctx.Err()`, which
+`dbf6d62d` made unconditionally true).
+
+This regression is severe enough that it changed this project's own
+scoreboard **baseline** row's literal text — `-p "hello"` against real
+`pi-coding-agent` (fakes on, no local model server) now prints `ERROR:
+AbortError: The operation was aborted` instead of the historic `ERROR:
+Post "http://...": dial tcp ...: connect: connection refused`, purely
+because the fake's own bespoke `completeOnce()` hits the same
+paserati-level bug. Recorded here explicitly so a future round doesn't
+mistake the new baseline text for a fresh noderati-side problem — it
+isn't; it's `#213`, tracked upstream. Notably, `fake-off:pi-ai`'s row
+(the *real* package) still matches real Node exactly despite this:
+the real OpenAI SDK wraps every `fetch()` failure into its own generic
+`"Connection error."` message regardless of the underlying error
+type, so the regression doesn't change `pi-ai`'s real *observable*
+behavior in this specific scenario — though it would still matter for
+any real code that branches on `error.name === "AbortError"` vs a
+plain network failure, which is exactly the class of bug `#213`
+documents.
+
+**Found and filed `#214`** while investigating `#213`: `fetch()`
+rejects with a bare *string*, never a real `Error`/`TypeError`/
+`DOMException` instance (`typeof e === "string"`, `e instanceof Error`
+is `false`, `.name`/`.message` are `undefined`) — confirmed
+pre-existing (present on the build immediately before `dbf6d62d` too,
+not part of the regression), root-caused to `fetch()`'s manual
+`RejectPromise(promiseObj, vm.NewString(...))` calls bypassing
+whatever real-`Error`-construction path native-function errors
+normally go through.
+
+**`TestPiAiStreamSimpleFetchError` is deliberately left failing, not
+skipped.** First instinct was `t.Skip` with a comment, reasoning
+"the suite must report clean" — `advisor()` correctly called this out
+as backwards: this project's own rule is that a known gap stays
+*visible* until fixed upstream (the scoreboard's DIFF rows are never
+hidden either), not masked from the next person's test run. Reverted
+to a plain failing test with a comment explaining the exact mechanism
+and linking `#213` — it goes green on its own once the fix lands, and
+nobody has to remember to re-enable it.
+
+**Twice this round, a leftover stub HTTP server from earlier
+verification work silently contaminated a scoreboard/CLI run** before
+being caught (once via an unexpected `unexpected completions response`
+baseline text, once by simply remembering to check `lsof -i:1234`
+before trusting a "-p" result) — both times killed and the run
+redone before drawing any conclusion from it.
+
+No noderati code changed this round except the one test file
+(`piai_test.go`, un-skip + comment). Full build/vet/test (one failure,
+tracked, expected: `TestPiAiStreamSimpleFetchError`/`#213`; one
+confirmed-flaky child-process test unrelated to anything touched this
+round), full scoreboard, three real `pi` invocations: all consistent
+with the picture above, zero unexplained regressions. Shared paserati
+checkout left on `main`, clean, up to date with `origin/main`.
+
+**Net effect**: `#205` genuinely fixes streaming (verified, not just
+trusted from the closed-issue label), but exercising it precisely
+surfaced two more real gaps — one a straightforward missing feature
+(`#212`, `TextDecoder`), one a real regression (`#213`) serious enough
+to reach into this project's own baseline — plus one more pre-existing
+gap found in passing (`#214`). None of `pi-ai`'s fake's blockers are
+fully cleared yet: even once `#212`/`#213` land, real SSE text
+decoding through the real SDK stack is still unverified end-to-end.
+`#210` (`Intl.Segmenter`) is "in the works" per the user, not yet
+checked out anywhere accessible this round — nothing to verify there
+yet.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

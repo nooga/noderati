@@ -47,6 +47,26 @@ func TestPiAiCompatShim(t *testing.T) {
 }
 
 func TestPiAiStreamSimpleFetchError(t *testing.T) {
+	// A genuine, understood paserati regression (dbf6d62d, #205's streaming
+	// fetch() fix) currently makes this fail: doFetchRequestWithContext's
+	// own internal cleanup calls cancel() on any error return (including a
+	// plain connection-refused dial failure, nothing to do with aborting),
+	// which then makes fetch()'s ctx.Err()==context.Canceled check —
+	// intended to detect a real AbortSignal-triggered abort — fire on
+	// every network failure, discarding the real error in favor of a
+	// fabricated "AbortError: The operation was aborted". Confirmed via a
+	// bare, AbortSignal-free fetch() to an unreachable address, diffed
+	// against the immediately-prior commit's build (which correctly
+	// reported the real dial error) before filing
+	// https://github.com/nooga/paserati/issues/213.
+	//
+	// Left failing on purpose rather than skipped or weakened to accept
+	// the wrong behavior: this project's own discipline is that a known
+	// regression stays visible (the scoreboard's DIFF rows never get
+	// silently masked either) until the upstream fix actually lands, so
+	// whoever runs the suite next sees it and doesn't have to remember to
+	// re-enable anything — it goes green on its own once #213 is fixed.
+
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
