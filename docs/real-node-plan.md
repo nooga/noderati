@@ -1966,6 +1966,51 @@ module's implementation with no error at all — considerably worse than a
 crash. `typebox`'s fake stays pending `#183`. `pi-ai`, `pi-agent-core`,
 `pi-tui`, and `jiti` remain uninvestigated.
 
+**Thirteenth round (2026-09-02) — `#182` merged and confirmed; `diff`
+re-blocked by a new, real, silent-correctness bug, filed as
+[paserati#185](https://github.com/nooga/paserati/issues/185).** Pulled
+`main` (`957383ca`, "fix(vm): spreading the arguments object no longer
+throws 'not iterable'"), clean-cache rebuilt both `paserati` and
+`noderati` (per the lesson from `#180`'s round). Re-verified `#182`'s own
+three repro forms directly against plain paserati — all three now
+correct (`super(...arguments)`, a plain call spread, and an array-literal
+spread of `arguments` all work).
+
+Then, rather than stopping at "does `diff`'s real barrel load without
+throwing," exercised `diff`'s actual functional output against `edit-diff.js`'s
+and the interactive `diff.js`'s exact real calls
+(`Diff.diffLines`, `Diff.createTwoFilesPatch` with real
+`headerOptions`/`context`, `Diff.diffWords`) — the same discipline that's
+caught every previous false positive this whole effort. `diffLines` no
+longer throws, but its output is **grossly wrong**: a 3-line-vs-4-line
+diff that should produce five per-line parts instead collapses into two
+giant multi-line blobs with every newline stripped out. Compared directly
+against real Node running the identical installed package (same
+`node_modules`, same `diff@8.0.4`) to confirm this is genuinely wrong, not
+a hasty assumption — real Node's output has the correct five parts, each
+line's own trailing `\n` intact.
+
+Traced to `diff/line.js`'s own tokenizer:
+`value.split(/(\n|\r\n)/)` — a capturing-group regex used specifically so
+`split()` also returns each matched newline, interleaved with the line
+content, per real JS spec. Minimal, dependency-free repro against plain
+paserati: `"a\nb\nc\n".split(/(\n|\r\n)/)` returns `["a","b","c",""]`
+(the captures silently vanish) where real Node returns
+`["a","\n","b","\n","c","\n",""]`. A non-capturing group
+(`(?:,|;)`) is unaffected; a single capturing group loses exactly its
+captured text; **two or more capturing groups produces something more
+broadly wrong**, not just "missing captures"
+(`"a1b2c3".split(/([a-z])(\d)/)` → `["","","",""]` vs the correct
+9-element real-Node array).
+
+Filed as `#185`, general (a well-known, idiomatic real-world `split()`
+pattern, not `diff`-specific) and flagged as a silent-correctness bug
+(wrong output, no thrown error) rather than a crash — exactly the shape
+this project's "measure, don't assume" discipline exists to catch, and
+did. `diff`'s fake stays, now blocked by `#185` instead of the
+now-fixed `#182`. Full build/vet/test, full scoreboard: unchanged, clean
+(no noderati code touched this round).
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
