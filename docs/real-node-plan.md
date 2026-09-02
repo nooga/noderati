@@ -2216,6 +2216,60 @@ picked up again, though its Go-struct-shaped error text suggests a
 paserati VM issue rather than another node-coverage gap. Full
 build/vet/test, all three real `pi` invocations, full scoreboard: clean.
 
+**Nineteenth round (2026-09-02) — `atob`/`btoa` boundary-verified;
+`typebox/compile` blocked by a second, deeper bug (`#192`), found while
+sanity-checking `#190`'s status.** `advisor()` flagged two loose ends
+from the eighteenth round: `btoa`'s Latin1-range check iterates Go
+runes rather than JS/UTF-16 code units, and the scoreboard's
+`typebox/compile` error text had visibly changed since it was last
+described in this doc. Checked both directly rather than assuming
+either was fine or broken:
+
+- `btoa` boundary case (`0xFF` vs `0x100`, and the full `0x80`-`0xFF`
+  byte range) matches real Node exactly, run side by side — the
+  rune-vs-code-unit distinction only diverges from real Node on lone
+  UTF-16 surrogates, which both implementations reject anyway (real
+  Node because the code unit is `> 0xFF`; noderati because the
+  malformed rune decodes to `U+FFFD`, also `> 0xFF`). No fix needed.
+- `typebox/compile`'s new error (`ReferenceError: index is not
+  defined`, replacing the `#190` `ID_Start` text this doc previously
+  described) turned out to be real, not doc drift: this session's
+  paserati checkout had been sitting on the unmerged `#190` fix branch
+  since the sixteenth round rather than `main` (a repeat of the
+  standing "switch back to `main` after verifying on a WIP branch"
+  hygiene rule not yet having run this round) — the branch's paserati
+  gets *past* `#190`'s `ID_Start` regex failure and hits a new bug one
+  layer deeper. Confirmed `#190` itself is still open and unmerged on
+  `origin/main` (so the doc's existing "blocked by `#190`" statement
+  stays accurate for `main`), and separately confirmed the new error is
+  a real, reachable bug that will surface the moment `#190` lands, not
+  an artifact of testing against the wrong branch.
+
+Minimally reproduced with real `typebox@1.1.38`: `Compile()` on any
+schema containing `Type.Record(...)` throws `ReferenceError: index is
+not defined` when `typebox` and `typebox/compile` are both reached via
+dynamic `import()` (either order) — the exact shape of
+`pi-coding-agent`'s own real startup path (`core/model-registry.js`'s
+`ModelsConfigSchema`, itself a `Type.Record(...)`, reached through a
+chain of dynamic imports). The identical schema compiles and validates
+correctly with ordinary static `import`, and a schema without
+`Type.Record` compiles fine either way — narrowed enough to rule out
+"dynamic import is broken in general" and "any `Record` schema fails,"
+before filing. A synthetic three-file repro shaped like typebox's own
+directory layout (a shared registry module reached via two different
+relative-import depths, both loaded through dynamic `import()`) did
+*not* reproduce a module-duplication problem, ruling out simple
+relative-path resolution as the cause and pointing instead at
+something specific to `typebox`'s `Record` codegen combined with
+dynamic-import's compile path. Filed as
+[paserati#192](https://github.com/nooga/paserati/issues/192) with the
+repro, what's ruled out, and a pointer into `OpDynamicImport`/
+`executeModule`/`moduleContextKey` in `pkg/vm/vm.go`. `typebox/compile`
+stays faked — now blocked by `#192` (reachable only once `#190`
+lands), not `#190` alone. Switched the shared paserati checkout back to
+`main` before finishing, per the standing hygiene rule. No noderati
+code changes this round; full build/vet/test unaffected.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
