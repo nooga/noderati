@@ -23,8 +23,10 @@ var specialSchemes = map[string]bool{
 // data properties, per ModuleBuilder.Class/bindStructFields — there is
 // no live getter/setter support, so mutating an instance's properties
 // afterward doesn't recompute href the way real Node's URL does). No
-// URLSearchParams either — nothing in noderati needs it yet, and it's a
-// meaningfully bigger surface to get right; add it when something does.
+// `.searchParams` property either — nothing needs a *live* link between
+// a URL instance and a URLSearchParams yet (see urlsearchparams.go for
+// the standalone `new URLSearchParams(...)` class itself, added
+// 2026-09-02).
 type jsURL struct {
 	Href     string `json:"href"`
 	Origin   string `json:"origin"`
@@ -96,6 +98,7 @@ func newJSURL(href string) (*jsURL, error) {
 func declareURL(p *driver.Paserati) {
 	p.DeclareModule("url", func(m *driver.ModuleBuilder) {
 		m.Class("URL", &jsURL{}, newJSURL)
+		m.Class("URLSearchParams", &urlSearchParams{}, newURLSearchParams)
 		m.Function("fileURLToPath", func(fileURL string) (string, error) {
 			u, err := url.Parse(fileURL)
 			if err != nil {

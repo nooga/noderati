@@ -2657,6 +2657,103 @@ briefly, read-only, for this round's own verification, then back to
 merged, and `URLSearchParams` is a new, separate, unaddressed blocker
 regardless. No noderati code changes this round.
 
+**Twenty-sixth round (2026-09-02) — `#198`/`#199` merged, confirmed;
+`URLSearchParams` implemented; a new paserati bug found and filed
+([paserati#201](https://github.com/nooga/paserati/issues/201)) before
+either fake could actually be deleted.** `#198`/`#199` landed on
+`origin/main` (`cde341ca`, confirmed directly). Clean-cache rebuild,
+re-ran every repro and control from the last two rounds against the
+merged commit — including the real class-field-arrow shape `advisor()`
+had pushed for, not just the minimized one — all pass; full paserati
+build/vet/test clean.
+
+Implemented `URLSearchParams` (`internal/host/urlsearchparams.go`) —
+the blocker both rounds ago identified precisely (missing from both
+the global scope and `node:url`'s own exports, not a one-line alias).
+Backed by an ordered `[][2]string` rather than Go's `net/url.Values`
+(a map) specifically because insertion order — including which of
+several same-named pairs comes first — is spec-observable via
+`.toString()`/iteration, something a map would silently scramble;
+reused `net/url.QueryUnescape` for decoding (parsing an incoming query
+string). Scoped to what real code
+actually needs (construction from a string/plain-object/array-of-
+pairs, `append`/`delete`/`get`/`getAll`/`has`/`set`/`sort`/`toString`)
+and explicitly not to what nothing here exercises yet (`.size`
+getter, `Symbol.iterator`/`entries`/`keys`/`values`/`forEach`, copying
+from another instance) — `ModuleBuilder.Class`'s reflection has no
+getter or well-known-symbol support to hang the first group off of
+today, and the doc-comment says so plainly, same discipline as
+`url.go`'s own pre-existing "add it when something does" note for
+`jsURL`. Verified every implemented method side by side against real
+Node — exact match, including duplicate-name handling and `set()`'s
+"replace first occurrence in place, drop the rest" semantics (not
+"delete then re-append," which would move the pair to the end).
+`advisor()` caught that `.toString()`'s original encoder (`net/url.
+QueryEscape` for *encoding*, not just the decoding above) disagrees
+with the WHATWG serializer on two characters: Go treats `~` as
+unreserved (leaves it raw) and `*` as reserved (percent-encodes it);
+the spec is the exact opposite (`~` encoded, `*` raw) — confirmed by
+running an OAuth-shaped payload (colons, tildes, stars, parens, bangs,
+quotes — the actual character classes in `pi-ai`'s real
+`grant_type: "urn:ietf:params:oauth:grant-type:device_code"` value)
+through both real Node and noderati side by side and diffing. Left
+uncaught, this would have shipped `URLSearchParams` as "works" while
+silently corrupting the wire bytes of exactly the OAuth request bodies
+that motivated building it in the first place. Fixed with a small
+hand-rolled `formURLEncode` implementing the spec's actual unreserved
+set (`A-Z a-z 0-9 * - . _`, space→`+`, everything else percent-encoded
+uppercase-hex UTF-8) instead of `QueryEscape`; added
+`TestURLSearchParamsFormEncoding` pinning the exact OAuth-shaped
+output, verified byte-for-byte against real Node. `net/url` is now
+only used for decoding (`QueryUnescape`) on the parse side.
+
+Registered via `m.Class` in `declareURL`, giving it automatic access
+to noderati's existing (previously unexplained) mechanism that
+promotes every native module's exports onto the bare global scope too
+— traced that mechanism down while investigating (`Paserati.
+registerNativeModuleExports`, which every `PreloadAllNativeModules`-
+loaded module's exports go through, keyed by plain name into the VM's
+global heap) rather than assuming an explicit `DefineGlobal` existed
+somewhere unfound. Six new tests in `url_test.go` alongside the
+existing `URL` ones.
+
+Then hit a **third** real blocker exercising the actual call site —
+`@anthropic-ai/sdk`'s `client.js` does `body instanceof URLSearchParams`
+unconditionally on every request — and it **throws** instead of
+evaluating `false`: `TypeError: Function has non-object prototype in
+instanceof check`. Confirmed this isn't specific to the new class at
+all: the pre-existing `URL` class throws identically on `instanceof`,
+meaning this bug has been silently present since `URL` was first added
+and nothing had exercised `instanceof` against it until now.
+Root-caused precisely: `ModuleBuilder.Class`'s constructor
+(`pkg/driver/native_module.go`'s `createClassConstructor`) builds
+itself via `vm.NewNativeConstructor`, which allocates no `Properties`
+table at all — unlike its sibling `vm.NewConstructorWithProps`, which
+does — so there's nowhere for a `.prototype` property to even live;
+`vm.go`'s `instanceof` handling has a working case for
+`TypeNativeFunctionWithProps` but falls through to nothing for a bare
+`TypeNativeFunction`, and what real Node treats as "not found on the
+prototype chain, so `false`" paserati treats as "no valid prototype
+object, so throw." Filed with the fix direction (swap to
+`NewConstructorWithProps`, set an actual `.prototype` object) since
+the `TypeNativeFunctionWithProps` branch already handles the rest.
+
+**Net effect: neither fake is deleted yet.** `pi-ai` alone now clears
+`#198`/`#199`/`URLSearchParams`-missing and hits `#201` instead — the
+scoreboard's `fake-off:pi-ai` row is a different failure signature
+each of the last three rounds, each one strictly further into the
+real request path than the last, which is the actual measure of
+progress here even though no row has gone clean yet.
+`fake-off:pi-agent-core` is unchanged (still needs `pi-ai`'s fake off
+too — Finding 1 from two rounds ago). Noticed in passing while running
+the full scoreboard: `fake-off:jiti`'s error also changed since `#194`
+landed (now `expected identifier, string literal, or computed property
+name after 'async' in async method`, a different position in the same
+bundled acorn) — another "fix uncovers the next layer" case, not
+investigated this round; flagged for whoever picks up `jiti` next.
+Full build/vet/test, all three real `pi` invocations, full scoreboard:
+clean (baseline unaffected by the new module).
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
