@@ -2419,6 +2419,73 @@ the standing measure-don't-assume rule). `jiti`'s fake stays in place
 for now — no fix exists yet. No noderati code changes this round; full
 build/vet/test unaffected.
 
+**Twenty-third round (2026-09-02) — `pi-tui` investigated (while `#194`
+is worked on); two real, independent bugs found and filed as
+[paserati#195](https://github.com/nooga/paserati/issues/195) and
+[paserati#196](https://github.com/nooga/paserati/issues/196).** By far
+the largest group-B fake — every export a no-op, spanning `@earendil-
+works/pi-tui`'s entire TUI component library — referenced from **90**
+real `dist/` files. Confirmed it's pulled in eagerly regardless of
+mode: `core/extensions/loader.js` statically imports the whole package
+(`import * as _bundledPiTui from "@earendil-works/pi-tui"`), which is
+itself eagerly loaded — the same shape as `jiti`'s blocker last round —
+so `--version`/`--help`/`-p hello` all fail on it even though the TUI
+only matters for interactive mode.
+
+Disabling the fake fails immediately on real `dist/utils.js`'s very
+first non-trivial line:
+```js
+const zeroWidthRegex = /^(?:\p{Default_Ignorable_Code_Point}|\p{Control}|\p{Mark}|\p{Surrogate})+$/v;
+```
+Two separate, independently-confirmed bugs on this one line:
+
+1. **`#195`** — the `v` flag (ES2024 Unicode Sets mode) isn't
+   recognized at all: `pkg/lexer/lexer.go`'s flag whitelist
+   (`g, i, m, s, u, y`) is missing it, and the whole regex *literal*
+   fails to parse as a result (`TS1109: Expression expected.`), not
+   just the flag. Checking neighboring flags by hand turned up `d`
+   (ES2022 `hasIndices`) missing too, with the identical failure mode
+   — filed together since they're the same root gap (`grep`ing
+   `pkg/vm/regex.go` confirms neither flag is handled anywhere
+   downstream either, a complete absence rather than a lexer oversight
+   with dead plumbing behind it).
+2. **`#196`** — independent of `#195`, reachable today via the
+   already-working `u` flag: `\p{Default_Ignorable_Code_Point}` isn't
+   recognized by either regex engine — the same class of gap `#190`
+   fixed, but `#190`'s fix (confirmed by reading its diff directly
+   rather than assuming it generalized) is a hardcoded map of exactly
+   `ID_Start`/`ID_Continue` and their UCD aliases, not a general
+   derived-property mechanism. `\p{Control}`, `\p{Mark}`, and
+   `\p{Surrogate}` in the same regex all already work fine.
+
+`advisor()` caught a wrong claim in the `#196` draft: a literal
+`RegExp` with this property appeared to construct without error and
+only throw on `.test()`, which read like ordinary lazy compilation.
+Checking construction vs. use on both the literal and `new RegExp(...)`
+forms directly showed it isn't laziness — the two forms disagree, with
+different underlying errors (the literal's `.test()` hits regexp2's
+own "unknown unicode category" error; the constructor form throws
+immediately with RE2's "invalid character class range," meaning
+regexp2 was never even tried there) — the same constructor-vs-literal
+fallback asymmetry `#190` already documented, not a new laziness
+finding. Corrected before leaving it filed.
+
+Both issues block on the exact same line, so fixing only one doesn't
+move the scoreboard — `pi-tui`'s import chain needs both merged before
+re-checking. Given the fake's sheer size (90 files, an entire component
+library, unlike `typebox`/`jiti`'s handful of call sites), expect more
+layers behind these two once they land, and its eventual deletion will
+need a real functional exercise of TUI components specifically — the
+three baseline invocations exercise none of it, only the import.
+
+The shared paserati checkout had uncommitted, in-progress `#194`
+changes (`pkg/parser/parser.go` + a new test script) during this whole
+round — confirmed unrelated to this investigation and left completely
+untouched (no stash/checkout/clean), per standing hygiene around a
+resource this session doesn't own. `pi-tui`'s fake stays in place — no
+fix exists yet. No noderati code changes this round; full build/vet/
+test unaffected.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
