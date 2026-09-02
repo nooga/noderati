@@ -2270,6 +2270,41 @@ lands), not `#190` alone. Switched the shared paserati checkout back to
 `main` before finishing, per the standing hygiene rule. No noderati
 code changes this round; full build/vet/test unaffected.
 
+**Twentieth round (2026-09-02) — `#190` merged; `#192` fixed on an
+unmerged branch, verified for information only.** `#190` landed on
+`origin/main` (closed on GitHub, confirmed with
+`git merge-base --is-ancestor` rather than trusting the issue tracker
+alone). `#192` has a fix on the local checkout's
+`fix/module-hoisted-ref-later-decl` branch (not yet merged — confirmed
+the same way), whose actual root cause turned out to be different from
+this doc's own speculation: `fix(compiler): hoisted function refs to a
+module's later top-level binding resolve to the right heap slot`, not
+a dynamic-import module-duplication bug as guessed when `#192` was
+filed.
+
+Verified on this branch (`go clean -cache` rebuild first, per the
+standing rule): `#192`'s own minimal repro (`Compile()` on a
+`Type.Record(...)` schema, `typebox`/`typebox/compile` both reached
+via dynamic `import()`) now returns the correct result instead of
+throwing. Went further than the minimal repro, per this project's own
+"exercise the exact real call pattern" rule: built the real
+`ModelsConfigSchema` shape from `core/model-registry.js` (nested
+`Type.Record`/`Type.Object`/`Type.Optional`) and ran both a valid and
+an invalid config through `.Check()`/`.Errors()` — correct `true`/
+`false` and a correct error message, matching real Node running the
+identical script side by side exactly (down to `.Errors()`'s message
+text). Full `pi` scoreboard run: `fake-off:typebox/compile` now
+reproduces baseline on **all three** invocations (`--version`,
+`--help`, `-p hello` — the last matching baseline's own expected
+"no local model server" failure, not a crash), the first time this row
+has been fully clean. Full paserati build/vet/test (`go test ./...`,
+every package) and noderati's own build/vet/test: clean.
+
+**`typebox/compile`'s fake stays in place** — per the standing rule,
+verifying a fix on an unmerged branch is for information only; nothing
+gets deleted until `#192` actually lands on `origin/main`. Switched the
+shared checkout back to `main` before finishing.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
