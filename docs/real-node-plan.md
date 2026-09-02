@@ -52,12 +52,13 @@ export is a no-op — the entire TUI is fake), `@earendil-works/pi-ai` (a
 from-scratch reimplementation of the real LLM client, including its own model
 catalog and provider fetch calls), `@earendil-works/pi-agent-core` (a
 from-scratch reimplementation of the actual agent loop), `typebox/value` /
-`typebox/compile`, `diff`, `jiti/static`.
+`typebox/compile`, `jiti/static`.
 (`minimatch` was here too — deleted 2026-08-31; `hosted-git-info` deleted
-2026-09-01; `proper-lockfile`, `glob`, and `typebox`'s own top-level entry
-all deleted 2026-09-02 — `typebox/value`/`typebox/compile` are separate
-real npm entry points that split off their own independent toggle the
-same day and are still blocked; see Phase 3 below for all of these.)
+2026-09-01; `proper-lockfile`, `glob`, `typebox`'s own top-level entry, and
+`diff` all deleted 2026-09-02 — `typebox/value`/`typebox/compile` are
+separate real npm entry points that split off their own independent
+toggle the same day and are still blocked; see Phase 3 below for all of
+these.)
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
@@ -2075,6 +2076,41 @@ clean. `pi-ai`'s `fake-off` failure text changed since last checked
 (`Cannot read property 'id' of undefined` → `ReferenceError: atob is not
 defined`) — not investigated this round, noted for whenever `pi-ai`/
 `pi-agent-core` get picked up.
+
+**Fifteenth round (2026-09-02) — `#185` merged and confirmed; `diff`'s
+fake deleted.** Pulled `main` (`b84eef1a`, "fix(builtins):
+String.prototype.split(regex) interleaves captured groups"), clean-cache
+rebuilt both. Re-verified `#185`'s own three repro forms directly against
+plain paserati — all now match real Node exactly (a single capturing
+group, a delimiter-alternation group, and the two-capturing-groups case
+that previously produced something more broadly wrong than just missing
+captures).
+
+Then re-ran the exact real functional exercise from the prior round —
+`Diff.diffLines`/`Diff.createTwoFilesPatch`/`Diff.diffWords` against
+`edit-diff.js`'s and the interactive `diff.js`'s real call shapes — output
+now matches real Node exactly on every field (five correct per-line
+parts, newlines intact, a properly formatted unified patch).
+`internal/host/diff.go` deleted; its `host.go` registration and
+`cmd/scoreboard/main.go` toggle both removed. Re-ran the same functional
+exercise with the fake actually gone (no `NODERATI_DISABLE_FAKES` needed)
+— identical, correct results.
+
+`go test ./...` hit one flaky failure (`TestSpawnEcho`, an unrelated
+`child_process` test with no connection to anything touched this round)
+— confirmed flaky by re-running it alone three times (all pass) and the
+full suite again (clean); not a real regression. Full build/vet/test, all
+three real `pi` invocations, full scoreboard: clean.
+
+`typebox/compile`'s `fake-off` error text changed since last checked too
+(`Cannot read properties of undefined (reading 'Symbol(Symbol.iterator)')`
+→ `... unknown unicode category, script, or property 'ID_Start' in`
+`` `^[\p{ID_Start}_$][\p{ID_Continue}_$‌‍]*$` ``) — `#188` is
+in progress upstream and this looks like forward movement past it into a
+new, likely RE2-Unicode-property-class gap; not investigated this round,
+noted for whenever `typebox/value`/`typebox/compile` are revisited. Only
+`pi-tui`, `pi-ai`, `pi-agent-core`, and `jiti` remain as fully
+uninvestigated group-B fakes.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory

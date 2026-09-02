@@ -97,9 +97,13 @@ func installModules(p *driver.Paserati) {
 	if !isDisabled(disabledFakes, "typebox/value") {
 		declareTypeboxValue()
 	}
-	if !isDisabled(disabledFakes, "diff") {
-		declareDiff()
-	}
+	// diff's fake was deleted 2026-09-02 — paserati#182 (spread of
+	// arguments) and paserati#185 (String.split capture groups) both
+	// merged upstream; real package verified via its exact real call
+	// sites (Diff.diffLines, Diff.createTwoFilesPatch, Diff.diffWords —
+	// edit-diff.js and the interactive diff.js) matching real Node's
+	// output exactly — see docs/real-node-plan.md's Phase 3 section.
+	// node_modules resolution now always loads the real diff package.
 	if !isDisabled(disabledFakes, "jiti") {
 		declareJiti()
 	}
