@@ -2353,6 +2353,72 @@ Also fixed the A-minus ledger's stale `glob` entry (still described as
 "needs a real implementation" — it was actually deleted the group-B
 way on `#180`, same as `minimatch`) while in the file for this.
 
+**Twenty-second round (2026-09-02) — `jiti` investigated; a genuine,
+severe parser bug found and filed as
+[paserati#194](https://github.com/nooga/paserati/issues/194).** Real
+usage: `core/extensions/loader.js` statically imports `createJiti`
+from `jiti/static` at module scope (eagerly loaded regardless of
+whether any extension actually runs — confirmed by reading the import,
+not assumed), which itself statically imports jiti's real, vendored
+`dist/jiti.cjs` (jiti bundles acorn for its own TS/JS transform).
+Disabling the fake and importing that chain fails immediately —
+`parsing failed: Syntax Error at 1:47226: ';' expected.` — not a
+missing-feature gap but a parser bug on real, non-exotic code.
+
+Pinpointed the exact failing construct using paserati's own lexer
+directly (`scratch/jitidebug/tok`, a throwaway Go program dumping the
+token stream around the reported column — far more reliable than
+guessing at character offsets in 190KB of minified single-line JS, and
+what actually cracked this after an initial mis-read of the position):
+`for(e.body||(e.body=[]);this.type!==O.eof;){...}` — a for-loop
+initializer that's a plain expression starting with a member access,
+followed by `||`. Minimally reproduced standalone and confirmed
+against a fresh `go clean -cache` plain-paserati build off `main`
+(`9c8ca157`) — a real, current bug, not build-cache staleness.
+
+Swept every operator below the suspect precedence boundary
+(`||`, `&&`, `??`, `==`, `===`, `!=`, `!==`, `|`, `^`, `&`, plus every
+compound-assignment operator) following a for-init starting with a
+member expression, `this.x`/`this[x]`, or a paren/bracket/brace-led
+expression — all fail the same way. Traced the exact root cause by
+reading the parser itself (`pkg/parser/parser.go`,
+`parseForStatementOrForOf` ~9206-9258 and
+`parseRegularForStatementWithVar` ~9404-9470): those branches
+deliberately parse the head with `parseExpression(LESSGREATER)` to
+avoid swallowing a for-in's `in` (registered at exactly that
+precedence) — correct for `in`, but it also stops before every other
+operator below `LESSGREATER`, and the fallback function that's
+supposed to continue parsing once for-in/for-of is ruled out only
+knows how to handle a trailing `:`/`=` for `*LetStatement`/
+`*ConstStatement`/`*VarStatement` heads, never the `*ExpressionStatement`
+these branches actually produce.
+
+`advisor()` caught that the initial "not affected: `for (e.x = 1; ...)`"
+claim was checked by parsing only, not by running it — running it
+turned up something worse than the operators that hard-error: plain
+`=` parses with **no error at all** and silently discards the
+assignment (`for (e.x = 42; false;) {}` leaves `e.x` unchanged) — the
+worst class of bug this project chases, now found in the parser
+itself rather than a fake. Filed with both variants, the operator
+sweep as evidence, and (after `advisor()` also caught that the
+first-drafted "resume the Pratt loop" fix suggestion isn't an
+operation that exists in a Pratt parser) a corrected fix direction
+citing the two real options and confirming there's no existing no-`in`
+mechanism to reuse (`grep -rn "noIn\|allowIn\|NoIn" pkg/parser/*.go`
+— nothing).
+
+**Practical effect for `jiti`'s fake:** `#194` is a parse-time failure
+on `jiti/static`'s own real module, reached eagerly at import time (not
+gated behind actually loading an extension) — so once it lands,
+`jiti`'s import chain should clear on all three scoreboard invocations
+even though none of them exercise `createJiti()`'s actual lazy
+`.import()` call (extension loading itself stays functionally
+untested by the baseline scoreboard; a future round should still
+exercise that real call pattern directly before deleting the fake, per
+the standing measure-don't-assume rule). `jiti`'s fake stays in place
+for now — no fix exists yet. No noderati code changes this round; full
+build/vet/test unaffected.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
