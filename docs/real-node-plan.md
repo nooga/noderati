@@ -2754,6 +2754,101 @@ investigated this round; flagged for whoever picks up `jiti` next.
 Full build/vet/test, all three real `pi` invocations, full scoreboard:
 clean (baseline unaffected by the new module).
 
+**Twenty-seventh round (2026-09-02) — chased down `jiti`'s new
+async-method parser error, flagged at the end of the last round; found
+and filed two distinct paserati bugs
+([paserati#203](https://github.com/nooga/paserati/issues/203),
+[paserati#204](https://github.com/nooga/paserati/issues/204)); no
+noderati code changes.** User also confirmed `#201` is being actively
+worked on upstream.
+
+Traced the scoreboard's `fake-off:jiti` error (`expected identifier,
+string literal, or computed property name after 'async' in async
+method` at `jiti.cjs:1:189764`) to real source this time by locating
+the byte offset directly in the bundle rather than guessing — found
+`async import(e,t){...}`, a plain object literal method literally
+named `import` (jiti's own `import()`/`require()`/`esmResolve()`
+surface object), with `async` in front of it.
+
+Minimized against a clean-cache plain-`main` build (`cde341ca`) —
+built from the shared paserati checkout, which had `#201`'s in-
+progress fix sitting as an *uncommitted* diff to `pkg/driver/
+native_module.go` on the `fix/module-builder-class-instanceof` branch
+at the time; checked out `main` for the plain-baseline build (the
+uncommitted diff followed across the branch switch untouched, as git
+does for any non-conflicting local modification — confirmed via `git
+diff` before and after), then switched back to their WIP branch
+immediately after. Mid-investigation, that uncommitted diff turned
+into a real commit (`7a55fb39 fix(driver): ModuleBuilder.Class
+constructors support instanceof`) on the same branch, matching
+`origin` — nothing of theirs was at risk at any point, confirmed via
+`git diff origin/... --stat` before finishing and switching the shared
+checkout back to `main` as usual.
+
+**`async import(e) {}` reproduces standalone**: `const o = { async
+import(e, t) { return e; } }` fails identically to jiti's real error.
+Swept every ECMAScript keyword as an `async <name>(e) {}` object-
+literal method name to scope it: `import`, `class`, `delete`,
+`typeof`, `default`, `new`, `this`, `super`, `static`, `of`, and
+`async` itself all fail; only `yield`/`await`/`get`/`set` (plus
+ordinary identifiers) work — because those four happen to be the only
+ones the async-method branch's hand-maintained allowlist includes.
+The generator-method branch (`*foo()`) has an exact copy of the same
+narrow list and the same bug — `advisor()` pushed back on this being
+asserted from reading the code alone (the async-generator form
+consumes `*` first and could plausibly fall through into either
+branch's list), so confirmed directly with two isolated cases:
+`*import(e) { yield e; }` (plain generator, no `async`) fails with the
+generator branch's own error text, while `async *class(e) { yield e;
+}` (async generator) fails with the *async* branch's error text —
+proving `async *foo()` falls into the async branch's list after
+consuming `*`, so both hardcoded lists genuinely need the fix, not
+just one read as "the same" from source. Confirmed **not** affected: plain
+(non-async) object-literal methods (`import(e) {}` parses fine for
+every keyword tested) and class methods of any kind including `async`/
+generator (`class C { async import(e) {} }` works) — both already go
+through more general property-name-parsing paths. Root-caused to
+`pkg/parser/parser.go`'s two method-name branches (~7159, ~7294) each
+hand-listing a handful of token types instead of calling the file's
+own existing general-purpose helpers built for exactly this
+(`parsePropertyName()` ~8516, or `isIdentifierNameToken()` ~24) the
+way getters/setters and plain shorthand methods already do. Filed
+[paserati#203](https://github.com/nooga/paserati/issues/203) with the
+fix direction (swap both hardcoded lists for the existing helper).
+
+**Bonus finding while scoping #203's control cases**: testing every
+`FutureReservedWord` (`static`, `implements`, `interface`, `package`,
+`private`, `protected`, `public`) as a plain (non-async) object-
+literal method name surfaced a second, differently-rooted bug — all
+seven fail to *compile* (not parse) with `SyntaxError: Unexpected
+strict mode reserved word '<name>'`, though real Node accepts all
+seven fine. `advisor()` caught that the issue's original "not
+affected: class methods" claim had only actually tested one of the
+seven words (`implements`) plus one inconclusive `static` case with no
+output to check — swept the full class-body matrix properly (all
+seven, each called and its return value printed, against both
+paserati and real Node): all seven pass in both, confirming the
+scoping claim but only after actually running it, not asserting it
+from a single example. Root-caused to `pkg/compiler/compile_literal.go`:
+`compileObjectLiteral` synthesizes a method's `FunctionLiteral.Name`
+from its property key purely so the function's own `.name` reflects
+correctly at runtime (~line 828); `compileFunctionLiteralWithOptions`'s
+strict-mode name validation (~line 1181) then treats that synthetic
+display name exactly like a real named-function-expression binding
+identifier, without consulting the `isMethod` flag it already has
+available — applying a check that's spec-mandated only for actual
+`BindingIdentifier` positions to a `PropertyName`, which is
+categorically exempt. Filed
+[paserati#204](https://github.com/nooga/paserati/issues/204),
+cross-referencing #203, with the fix direction (guard the check with
+`!isMethod`).
+
+Not yet confirmed whether either bug is on jiti's *only* remaining
+blocker path — `fake-off:jiti` may hit further real gaps once `#203`
+lands, same pattern as every other fake this session. No noderati
+code changed this round; nothing to rebuild or re-verify against the
+scoreboard.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
