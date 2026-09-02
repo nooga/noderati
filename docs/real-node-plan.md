@@ -51,11 +51,13 @@ registered ahead of the real files on disk: `@earendil-works/pi-tui` (every
 export is a no-op — the entire TUI is fake), `@earendil-works/pi-ai` (a
 from-scratch reimplementation of the real LLM client, including its own model
 catalog and provider fetch calls), `@earendil-works/pi-agent-core` (a
-from-scratch reimplementation of the actual agent loop), `typebox` /
-`typebox/value` / `typebox/compile`, `diff`, `jiti/static`, `glob`.
+from-scratch reimplementation of the actual agent loop), `typebox/value` /
+`typebox/compile`, `diff`, `jiti/static`.
 (`minimatch` was here too — deleted 2026-08-31; `hosted-git-info` deleted
-2026-09-01; `proper-lockfile` deleted 2026-09-02 — see Phase 3 below for
-all three.)
+2026-09-01; `proper-lockfile`, `glob`, and `typebox`'s own top-level entry
+all deleted 2026-09-02 — `typebox/value`/`typebox/compile` are separate
+real npm entry points that split off their own independent toggle the
+same day and are still blocked; see Phase 3 below for all of these.)
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
