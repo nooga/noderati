@@ -2,7 +2,6 @@ package host
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,15 +41,22 @@ func (r *OSPathResolver) Resolve(specifier string, fromPath string) (*modules.Re
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve %s: %w", specifier, err)
 	}
-	data, err := os.ReadFile(resolved)
+	// Route through the same CJS-detection/wrapping openMaybeCJS applies for
+	// NodeModulesResolver (nodemodules.go) — a relative `import` of a
+	// `.cjs`/CommonJS-shaped `.js` file is completely ordinary Node interop
+	// (e.g. jiti's own lib/jiti-static.mjs does `import _createJiti from
+	// "../dist/jiti.cjs"`), and without this an OS-path-resolved CJS file
+	// loads as plain ESM with no `require`/`module`/`exports` injected at
+	// all, throwing "require is not defined" the moment it uses any of
+	// them.
+	source, err := openMaybeCJS(resolved)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s: %w", resolved, err)
 	}
-	src := StripShebang(string(data))
 	return &modules.ResolvedModule{
 		Specifier:    specifier,
 		ResolvedPath: resolved,
-		Source:       io.NopCloser(strings.NewReader(src)),
+		Source:       source,
 		Resolver:     r.Name(),
 	}, nil
 }

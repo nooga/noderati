@@ -68,6 +68,7 @@ func installModules(p *driver.Paserati) {
 	declareModule()
 	declareWorkerThreads(p)
 	declareDiagnosticsChannel()
+	declareV8(p)
 
 	// Ledger group B (docs/real-node-plan.md): third-party npm package
 	// fakes, individually toggleable for the Phase 2 scoreboard.

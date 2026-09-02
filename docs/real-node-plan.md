@@ -2955,6 +2955,202 @@ this round. No noderati
 code changed — pure upstream investigation and verification, same as
 last round.
 
+**Twenty-ninth round (2026-09-02) — status survey ("let's see where we
+stand") after a large batch of upstream paserati merges; two genuine
+noderati bugs found and fixed live; two new paserati gaps found and
+filed (`#210`), one comment-updated (`#205`); `#195`/`#196` status
+check folded in.** Checked the shared paserati checkout: `origin/main`
+had moved to `9c9532b8`, carrying `#201` (`2b68032c`), `#203`/`#204`
+(`cc64d772`), `#205`'s `ReadableStream` primitive (`2c346301`),
+`#195`/`#196` (`1a61ca80`/`07eca5ff`), and one more fix not tied to
+any issue filed this session (`9c9532b8` itself, "synchronize Promise
+state/reactions against goroutine-driven settlement"). Switched the
+shared checkout to `main` (was on an unrelated, already-merged WIP
+branch, `fix/promise-goroutine-race`, whose tip content had landed on
+`main` under a different commit hash — ordinary squash/rebase, nothing
+of concern). Clean-cache rebuilt; paserati's own full test suite:
+clean.
+
+Verified every merged fix directly against this build (all
+`-no-typecheck`, since several of these repros hit narrow, pre-existing
+TS *type*-checker gaps unrelated to the runtime fix itself — e.g.
+`.match()`'s return type still doesn't include `.indices` for a
+`d`-flagged regex, a real but separate, narrower gap not chased this
+round):
+- `#195` (regex `d`/`v` flags): `/abc/v`, `/abc/d` both construct;
+  `.exec()` on a `d`-flagged pattern with a named group populates
+  `.indices` and `.indices.groups` correctly.
+- `#196` (`\p{Default_Ignorable_Code_Point}`): `.test()` no longer
+  throws, matches correctly.
+- `#198`/`#199`: re-confirmed once more on this now-further-advanced
+  `main`.
+- `#201` (`instanceof`): re-confirmed via noderati's own `URL`/
+  `URLSearchParams`, including the subclass-`instanceof`-both matrix
+  from the PR-branch verification two rounds ago — unchanged now that
+  it's actually on `main`.
+- `#203`/`#204` (object-literal method names): `async import(e,t){}`,
+  `*class(e){}` (generator), `static(e){}`, `implements(e){}` — all
+  construct and call correctly now.
+- `#205` (`ReadableStream`): confirmed `typeof ReadableStream ===
+  "function"` — but then confirmed, against the same real SSE stub
+  server from two rounds ago, that `fetch()`'s `Response.body` is
+  *still* `undefined` and the real `pi-ai` streaming client still
+  throws identically (`git show 2c346301 --stat` confirms the commit
+  touches only the new `readable_stream_init.go` file plus tests —
+  `fetch_init.go` untouched). Left a comment on
+  [#205](https://github.com/nooga/paserati/issues/205) distinguishing
+  "the primitive landed" from "the bug this issue reports is still
+  open" — the issue itself was correctly left open by whoever merged
+  the primitive, not auto-closed, and this comment records precisely
+  why so nobody has to re-derive it.
+
+**Note for whoever next checks issue status**: `#203` and `#204` are
+functionally fully fixed (verified above) but both still show `OPEN`
+on GitHub — evidently a bookkeeping gap in how `cc64d772`'s commit
+message referenced them (no `Closes #NNN`), not a sign anything is
+unfixed. Confirmed this by testing, not by trusting either state.
+
+**`#195`/`#196` were the exact two issues the user separately asked
+about verifying this round** (last checked as "both open, unaddressed"
+one round ago) — both are the merged/confirmed-fixed pair above; no
+separate re-narration needed since this round's general sweep already
+covered them precisely.
+
+Rebuilt noderati against the fully-updated `main` and reran the full
+scoreboard — caught and killed a leftover stub HTTP server (from the
+prior round's `#205` verification, still running on `:1234`) that had
+silently contaminated the first run's `baseline` row before reading
+too much into it; reran clean. Net result across all five fakes:
+zero clean rows still (nothing safe to delete yet), but real,
+substantial forward movement on two of them:
+
+- **`fake-off:pi-tui`**: no longer blocked by `#195`'s parse failure —
+  now reaches and executes real code, immediately hitting a brand-new
+  blocker: `Intl` doesn't exist as a global at all. Traced to
+  `dist/utils.js`'s module-scope `new Intl.Segmenter(undefined, {
+  granularity: "grapheme" | "word" })` (real, default-locale grapheme/
+  word segmentation for terminal text measurement, paired with
+  `get-east-asian-width`). Filed
+  [paserati#210](https://github.com/nooga/paserati/issues/210), scoped
+  precisely to what's actually used (not full ECMA-402 — just
+  `Intl.Segmenter`'s two granularities at the default locale, which
+  Unicode's own UAX#29 algorithms don't need locale data for).
+- **`fake-off:jiti`**: no longer blocked by `#203`'s parse failure —
+  and this is where the round's real noderati-side work happened (see
+  below). After two live fixes, now blocked by `node:vm` (specifically
+  `vm.runInThisContext`, jiti's actual TS-execution mechanism) — a
+  substantial, real `vm`-module gap, not attempted this round (unlike
+  `node:v8` below, this isn't a quick honest stub — real script
+  execution semantics are the whole point of the module). Flagged as
+  next round's natural continuation.
+- `fake-off:pi-ai` / `fake-off:pi-agent-core`: unchanged (still `#205`
+  and the `pi-ai`-fake-off prerequisite, respectively).
+
+**Two genuine noderati bugs found and fixed live this round** (not
+filed anywhere — noderati's own gaps are tracked in this doc, not
+GitHub issues, since this session does noderati's own fixing directly):
+
+1. **`OSPathResolver` never CJS-wrapped a relative `.cjs` import — the
+   round's real find.** Traced jiti's `require is not defined` (after
+   `#203`/`#204` cleared the parse failure) precisely: the real
+   consumer is `dist/core/extensions/loader.js`'s `import { createJiti
+   } from "jiti/static"`, resolving via jiti's own `package.json`
+   `exports["./static"].import` to `lib/jiti-static.mjs`, which itself
+   does `import _createJiti from "../dist/jiti.cjs"` — a completely
+   ordinary relative static-ESM-import of a `.cjs` file, real Node's
+   own dual-package CJS/ESM interop. First hypothesized (wrongly, and
+   said so before filing anything) that this was a resolver-honesty
+   bug — `require.resolve("jiti/dist/jiti.cjs")` genuinely throws
+   `ERR_PACKAGE_PATH_NOT_EXPORTED` under real Node, since that subpath
+   isn't in jiti's `exports` map — but then found `lib/jiti-static.mjs`
+   reaches `dist/jiti.cjs` via a *relative* require/import from
+   *inside* the package, which `exports` restrictions don't apply to
+   at all (they only gate external bare-specifier resolution). Root
+   cause was instead in `nodemodules.go`'s existing, correct
+   `.cjs`-detection-and-wrapping machinery
+   (`openMaybeCJS`/`shouldWrapCJS`/`cjsESMWrapper`, already used by
+   `NodeModulesResolver` for bare-specifier imports) simply never being
+   called by `osresolver.go`'s `OSPathResolver.Resolve` — the resolver
+   that handles every `./`/`../`/absolute-path specifier — which read
+   the file as plain source with `os.ReadFile` and no wrapping at all.
+   Minimized to a 7-line, jiti-independent repro (`foo.cjs` +
+   `main.mjs`, `import greet from "./foo.cjs"` where `foo.cjs` does
+   `require("path")`) diffed directly against real Node before writing
+   the fix, so the fix targets the actual interop rule, not jiti's
+   particular shape. Fixed [osresolver.go](../internal/host/osresolver.go)
+   by routing `OSPathResolver.Resolve` through the same `openMaybeCJS`
+   `NodeModulesResolver` already uses. Verified against the minimal
+   repro (now matches real Node exactly) and against the real
+   dependency chain — the post-fix stack trace for the *next* error
+   (below) cleanly shows every real frame (`jiti.cjs` ← `jiti-
+   static.mjs` ← `loader.js` ← `resource-loader.js` ← `agent-session-
+   services.js` ← `agent-session-runtime.js` ← `main.js`), proof the
+   fix works through the genuine graph, not just the isolated repro.
+   New test: `TestImportRelativeCJSFile`
+   ([osresolver_test.go](../internal/host/osresolver_test.go)).
+
+2. **`node:v8` didn't exist at all**, the very next blocker jiti's real
+   dependency chain hit once (1) was fixed. jiti's real `dist/jiti.cjs`
+   does `require("node:v8")` at module scope purely to call
+   `v8.startupSnapshot.isBuildingSnapshot()` inside a `try {} catch
+   {}` — so even an empty module would have silently unblocked this
+   one call site, but implemented a small, *honest* slice instead (not
+   a jiti-shaped patch): `getHeapStatistics()` returns real numbers
+   from Go's own `runtime.MemStats`, `setFlagsFromString()` is a
+   documented genuine no-op (there's no V8 to configure), and
+   `startupSnapshot` is a real namespace with `isBuildingSnapshot()`
+   correctly, always returning `false` (paserati never runs from a V8
+   snapshot) plus no-op callback registrars for the same reason.
+   `advisor()` caught that the first cut of `getHeapStatistics()` set
+   `heap_size_limit` to `HeapSys` — which moves in lockstep with
+   `total_heap_size`, so any real caller's "am I near the cap?" check
+   (the actual thing that field exists for) would silently never fire.
+   Fixed to read Go's own soft memory limit
+   (`debug.SetMemoryLimit(-1)`, falling back to "no limit configured"
+   the same way Go itself reports that) as the real ceiling, deriving
+   `total_available_size` from it. New file
+   [v8.go](../internal/host/v8.go), registered in `installModules`
+   (host.go); new tests `TestV8Require`/`TestV8RequireViaCJS`
+   ([v8_test.go](../internal/host/v8_test.go)) — the latter exists
+   because `import "node:v8"` and `require("node:v8")` turned out to
+   go through genuinely different lookup paths (see finding below),
+   and only testing one would have missed that they'd diverge.
+
+   Along the way, found that `require("node:v8")` specifically (as
+   opposed to `import`) still failed after `v8.go` was declared and
+   registered — `declareV8(p)` alone wasn't enough. Root cause:
+   `cjs.go`'s `nativeRequireNames` is a **second, separately
+   hand-maintained** map of "which module names `require()` should
+   route to a native module" — the exact same drift shape `#203`/`#204`
+   were about (a hardcoded list next to code that already knows the
+   full set, guaranteed to miss the next addition). `driver.Paserati`
+   doesn't currently expose a way to enumerate declared module names to
+   derive this automatically (checked, per `advisor()`'s prompt, before
+   accepting the drift) — added `v8` to the list and added a doc
+   comment on `nativeRequireNames` itself flagging the drift risk
+   explicitly for the next person adding a `declareX(p)` module, rather
+   than silently leaving it to repeat.
+
+Full build/vet/test, all three real `pi` invocations, full scoreboard
+(rerun after killing the contaminating stub): clean. Shared paserati
+checkout left on `main`, up to date with `origin/main`, clean working
+tree.
+
+**Net effect**: real, substantial forward movement on two of the five
+fakes (`pi-tui`: now blocked on `Intl.Segmenter` instead of a parse
+failure; `jiti`: now blocked on `vm.runInThisContext` instead of a
+parse failure, after fixing two genuinely load-bearing noderati bugs
+along the way), zero regressions, still zero scoreboard rows clean
+enough to delete a fake. `pi-ai`/`pi-agent-core` unchanged, still on
+`#205`. Newly filed/updated: `#210` (Intl.Segmenter, new), `#205`
+comment (primitive-vs-bug-still-open, informational). Newly fixed in
+noderati directly: `OSPathResolver`'s CJS-interop gap (likely the
+single highest-value fix of this round — real ESM-imports-relative-
+CJS is completely ordinary Node interop, not a jiti-specific pattern,
+so this probably helps other real packages too, not just jiti);
+`node:v8` (small, honest, real implementation, not a stub scoped to
+one call site).
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

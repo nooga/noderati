@@ -12,6 +12,19 @@ import (
 	"github.com/nooga/paserati/pkg/vm"
 )
 
+// nativeRequireNames lists every module name `require()`/`require("node:x")`
+// should route to a Go-declared native module (via requireNative below)
+// instead of treating it as a file path to resolve. This is a second,
+// hand-maintained list of the same names installModules (host.go) already
+// declares via p.DeclareModule/DeclareModuleAlias — driver.Paserati doesn't
+// currently expose a way to ask "what module names are declared", so there
+// is nothing to derive this from automatically. A name declared in
+// installModules but missing here silently falls through to file
+// resolution and fails with "Cannot find module" on require() even though
+// import of the same name works fine (found the hard way: adding v8.go's
+// declareV8(p) call didn't make require("node:v8") work until this map was
+// also updated by hand) — when adding a new declareX(p) module, add its
+// name here too.
 var nativeRequireNames = map[string]bool{
 	"fs": true, "path": true, "os": true, "util": true,
 	"assert": true, "url": true, "querystring": true,
@@ -22,6 +35,7 @@ var nativeRequireNames = map[string]bool{
 	"perf_hooks": true, "string_decoder": true,
 	"stream/promises": true, "constants": true,
 	"diagnostics_channel": true,
+	"v8":                  true,
 }
 
 type cjsLoader struct {
