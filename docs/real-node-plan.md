@@ -1855,6 +1855,61 @@ remaining fake (`pi-tui`, `pi-ai`, `pi-agent-core`, `typebox`, `diff`,
 `jiti`) genuinely fails when disabled, no more scoreboard-clean-but-
 functionally-broken candidates left to find.
 
+**Eleventh round (2026-09-02) — investigated `diff`, filed a new, precisely
+root-caused general VM bug ([paserati#182](https://github.com/nooga/paserati/issues/182)).**
+`diff`'s previously-known blocker
+([paserati#163](https://github.com/nooga/paserati/issues/163), the
+re-export-of-an-import compile bug that motivated filing it in the first
+place — `diff@8.0.4`'s real ESM entry, `libesm/index.js`, is exactly that
+barrel shape) is fixed and verified; the scoreboard's current
+`fake-off:diff` failure (`TypeError: object is not iterable`, at the
+same bogus `line 1, column 1` position the diagnostics gap has produced
+before) is something new since then.
+
+Bisected by importing each of the barrel's thirteen real submodules
+individually: `diff/line.js`, `diff/json.js`, and `patch/create.js` fail
+(the third only because it transitively imports the broken `diff/line.js`
+— confirmed, not assumed, by checking its own source); the other ten load
+cleanly. Both real failures share one exact line:
+`super(...arguments)` in a derived class's pass-through constructor.
+Reduced to a clean, dependency-free repro against plain paserati, then
+went further to characterize the bug precisely rather than just report
+the crash: `for (const x of arguments)`, `Array.from(arguments)`,
+destructuring (`const [a,b] = arguments`), and even
+`typeof arguments[Symbol.iterator]` (`"function"`) **all work correctly**
+on the exact same `arguments` object — only the spread operator
+(`...arguments`, in a call, an array literal, or a `super()` call)
+fails. Spreading other non-Array iterables (a `Set`, a hand-written
+`{[Symbol.iterator](){...}}` object) works fine, so this is specific to
+`arguments`, not spread-of-iterables in general.
+
+Root-caused precisely by reading `pkg/vm/vm.go`'s `extractSpreadArguments`
+(every spread context funnels through this one function): its outer
+`switch iterableVal.Type()` has fast-path cases for `TypeArray`,
+`TypeString`, `TypeGenerator`, `TypeSet`, `TypeMap` — no `TypeArguments`
+case — so an `arguments` object (a distinct VM type, confirmed via
+`value.go`'s `TypeArguments`/`ArgumentsObject`) falls to the generic
+`default:` iterator-protocol path. That path's own prototype-chain walk
+is a hand-rolled `if`/`else if` chain checking `current.Type()` against
+`TypeObject`/`TypeGenerator`/`TypeAsyncGenerator`/`TypeDictObject`, with a
+catch-all `else { break }` for anything else — `TypeArguments` isn't one
+of the handled branches, so it hits that catch-all immediately, `found`
+stays `false`, and the resulting error's `%s is not iterable` substitutes
+`TypeArguments.TypeName()`, which (correctly, matching real JS's
+`typeof arguments === "object"`) returns `"object"` — exactly the
+observed message. The real `Symbol.iterator` property is genuinely
+present and reachable through the ordinary property-get path (which is
+why `for...of`/`Array.from`/destructuring/`typeof` all already work) —
+`extractSpreadArguments` is the one place in the VM with its own private,
+incomplete list of "types that count as object-like" instead of using
+that same general lookup.
+
+Not filed as a `diff`-specific issue — `super(...arguments)` is a common,
+idiomatic pass-through-constructor pattern in real-world JS/TS, so this
+is general and likely to recur. `diff`'s fake stays pending `#182`.
+`typebox`, `pi-ai`, `pi-agent-core`, `pi-tui`, and `jiti` remain
+uninvestigated this round.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
