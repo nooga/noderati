@@ -51,14 +51,14 @@ registered ahead of the real files on disk: `@earendil-works/pi-tui` (every
 export is a no-op — the entire TUI is fake), `@earendil-works/pi-ai` (a
 from-scratch reimplementation of the real LLM client, including its own model
 catalog and provider fetch calls), `@earendil-works/pi-agent-core` (a
-from-scratch reimplementation of the actual agent loop), `typebox/compile`,
-`jiti/static`.
+from-scratch reimplementation of the actual agent loop), `jiti/static`.
 (`minimatch` was here too — deleted 2026-08-31; `hosted-git-info` deleted
 2026-09-01; `proper-lockfile`, `glob`, `typebox`'s own top-level entry,
 `diff`, and `typebox/value` all deleted 2026-09-02 —
 `typebox/value`/`typebox/compile` split off their own independent toggle
 that same day, as separate real npm entry points, before `typebox/value`
-itself cleared too; see Phase 3 below for all of these.)
+itself cleared, then `typebox/compile` too once its own two-layer block
+(`#190` then `#192`) merged upstream; see Phase 3 below for all of these.)
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
@@ -2304,6 +2304,33 @@ every package) and noderati's own build/vet/test: clean.
 verifying a fix on an unmerged branch is for information only; nothing
 gets deleted until `#192` actually lands on `origin/main`. Switched the
 shared checkout back to `main` before finishing.
+
+**Twenty-first round (2026-09-02) — `#192` merged; `typebox/compile`'s
+fake deleted.** `#192` landed on `origin/main` (`9c8ca157`, confirmed
+directly, not from the issue tracker alone). Clean-cache rebuild, then
+re-ran everything from the twentieth round's verification against the
+actual merged commit rather than trusting the prior branch-based
+result to carry over unchanged: `#192`'s own minimal repro, the real
+`ModelsConfigSchema` functional exercise (nested `Type.Record`/
+`Type.Object`/`Type.Optional`, valid and invalid input through
+`.Check()`/`.Errors()`), `--version`/`--help` — all matched real
+Node/baseline exactly, same as on the unmerged branch. Full scoreboard:
+`fake-off:typebox/compile` clean on all three invocations.
+
+`internal/host/typeboxcompile.go` deleted; its `host.go` registration
+(the `typebox/compile` toggle branch) and `cmd/scoreboard/main.go`'s
+`fakeNames` entry both removed; top-level ledger updated to move
+`typebox/compile` from the active to the deleted list. `node_modules`
+resolution now always loads the real `typebox/compile` entry point —
+**`typebox`'s three real entry points (bare, `/value`, `/compile`) are
+now all real**, closing out this package's own two-round, two-bug arc
+(`#183` → `#188` → `#190` → `#192`). Full paserati build/vet/test, full
+noderati build/vet/test, all three real `pi` invocations, full
+scoreboard: clean. Remaining fully-uninvestigated group-B fakes:
+`pi-tui`, `pi-agent-core`, `jiti`; `pi-ai` stays faked with its own
+separate, unstudied `-p` failure
+(`Cannot create property 'responsePromise' on object '&{20 0 0x...}'`)
+noted but not yet chased.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory

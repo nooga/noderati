@@ -87,19 +87,21 @@ func installModules(p *driver.Paserati) {
 	// 2026-09-02 (paserati#183 fixed, real package verified working via
 	// actual functional exercise — see docs/real-node-plan.md's Phase 3
 	// section) — node_modules resolution now always loads the real
-	// typebox package for the bare "typebox" specifier. typebox/value
-	// and typebox/compile are separate real npm entry points; they kept
-	// their own independent toggles rather than being all-or-nothing
-	// with the parent package specifically because of this — typebox/
-	// value's fake was deleted 2026-09-02 (paserati#188 fixed, real
-	// Check/Errors verified working via actual functional exercise —
-	// see docs/real-node-plan.md's Phase 3 section) while typebox/
-	// compile's real Compile(...).Check/.Errors still throws on a
-	// separate, distinct Unicode-property-escape gap
-	// (paserati#190, still open).
-	if !isDisabled(disabledFakes, "typebox/compile") {
-		declareTypeboxCompile()
-	}
+	// typebox package for the bare "typebox" specifier. typebox/value's
+	// fake was deleted 2026-09-02 (paserati#188 fixed, real Check/Errors
+	// verified working via actual functional exercise — see
+	// docs/real-node-plan.md's Phase 3 section). typebox/compile's fake
+	// was deleted 2026-09-02 too, once its own two-layer block cleared:
+	// paserati#190 (Unicode ID_Start/ID_Continue property escapes,
+	// needed by Type.Record's key-pattern codegen) then paserati#192 (a
+	// hoisted-function-reference heap-slot bug it uncovered next, hit
+	// via typebox + typebox/compile both reached through dynamic
+	// import() in pi-coding-agent's real startup path) — both merged
+	// upstream; real Compile(...).Check/.Errors verified against the
+	// actual ModelsConfigSchema shape (nested Type.Record/Type.Object/
+	// Type.Optional) matching real Node exactly — see
+	// docs/real-node-plan.md's Phase 3 section. node_modules resolution
+	// now always loads the real typebox/compile entry point.
 	// diff's fake was deleted 2026-09-02 — paserati#182 (spread of
 	// arguments) and paserati#185 (String.split capture groups) both
 	// merged upstream; real package verified via its exact real call
