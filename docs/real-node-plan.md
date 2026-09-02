@@ -2168,6 +2168,54 @@ scoreboard: clean. `typebox/compile` stays faked, still blocked by
 `#190`. Remaining fully-uninvestigated group-B fakes: `pi-tui`, `pi-ai`,
 `pi-agent-core`, `jiti`.
 
+**Eighteenth round (2026-09-02) — a real ledger group A gap, not another
+paserati bug: `atob`/`btoa` were entirely unimplemented.** With `#190`
+in progress upstream, pivoted to looking for a group-A (real Node
+builtin) gap instead of another engine bug — `pi-ai`'s `fake-off`
+scoreboard row had already surfaced one directly: `ReferenceError: atob
+is not defined`, and `typeof atob`/`typeof btoa` were both `undefined`
+outright, confirmed directly (not assumed from the error text alone).
+Real usage found in multiple real files, not just the one that
+surfaced it: `pi-ai`'s own OAuth PKCE flow (`btoa`, `utils/oauth/pkce.js`)
+and several provider auth modules, plus `pi-coding-agent`'s own HTML
+export template (`atob`).
+
+Implemented both as real globals (`internal/host/base64global.go`,
+wired into `process.go` alongside the existing `structuredClone`
+global — the same pattern, same registration point). Matched real
+Node's actual behavior, not just the happy path: `btoa` throws on any
+input character outside Latin1 range (0–255) rather than silently
+truncating high bits (real Node throws too — silent truncation would
+be exactly the kind of silent-wrong-output bug this whole project
+chases down when found in *other* code); `atob` strips ASCII
+whitespace per the WHATWG algorithm Node's own implementation follows,
+tolerates missing base64 padding (real-world callers often omit it),
+and throws on genuinely invalid input rather than decoding something
+silently wrong. One correctness detail worth recording: a decoded/encoded
+byte becomes one JS "character" via `rune(byte)`/`WriteRune`, matching
+`String.fromCharCode(n)`/`charCodeAt(n)` semantics — confirmed
+directly against plain paserati first — not a raw appended byte, which
+would have silently corrupted any decoded byte ≥ 0x80 once paserati's
+own rune-based string handling re-decoded it as UTF-8 later.
+
+Verified every case (round-trip, raw non-ASCII bytes 0–255 through
+`String.fromCharCode`/`charCodeAt`, missing padding, both throw paths)
+against **real Node running the identical script side by side** — matches
+exactly, not just "doesn't crash." Then exercised the actual real call
+site, `pi-ai`'s own `base64urlEncode` (byte array → `btoa` → URL-safe
+base64), against both noderati and real Node — identical output.
+
+**Practical effect: `pi-ai`'s `--version`/`--help` now match baseline
+exactly** (previously `ReferenceError: atob is not defined` on every
+invocation) — real progress, not yet a full unblock. `-p` (the one
+invocation that actually exercises real LLM streaming) now fails on a
+different, deeper error entirely
+(`Cannot create property 'responsePromise' on object '&{20 0 0x...}'`) —
+not investigated this round; flagged as the next thread if `pi-ai` is
+picked up again, though its Go-struct-shaped error text suggests a
+paserati VM issue rather than another node-coverage gap. Full
+build/vet/test, all three real `pi` invocations, full scoreboard: clean.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
