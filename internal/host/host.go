@@ -74,9 +74,28 @@ func installModules(p *driver.Paserati) {
 	// Ledger group B (docs/real-node-plan.md): third-party npm package
 	// fakes, individually toggleable for the Phase 2 scoreboard.
 	disabledFakes := disabledSet("NODERATI_DISABLE_FAKES")
-	if !isDisabled(disabledFakes, "pi-tui") {
-		declarePiTui()
-	}
+	// pi-tui's fake was deleted 2026-09-03 — paserati#195/#196 (v flag and
+	// \p{Default_Ignorable_Code_Point}), #218 (new RegExp() backreference
+	// fallback), and #222–#225 (arrow function `this` lost as an
+	// object-literal property value; a getter on a Function-typed
+	// prototype not found via inheritance — chalk's own real root cause
+	// for always emitting color; \p{RGI_Emoji} and \p{Script=Value}/
+	// \p{Script_Extensions=Value} regex property-escape gaps) all merged
+	// upstream. Deletion required both: the CLI-invocation scoreboard
+	// matching baseline (necessary but not sufficient, per the
+	// twenty-third round's own note that those three invocations only
+	// exercise pi-tui's import) AND a real functional exercise of the
+	// actual component surface (utils.js/fuzzy.js/keys.js/keybindings.js/
+	// terminal-colors.js, and the Box/Text/TruncatedText/Markdown/
+	// SelectList/SettingsList/Container components' render() methods,
+	// exercised via real call patterns and theme shapes copied from
+	// pi-coding-agent's own real theme.js) diffed byte-for-byte against
+	// real Node — see docs/real-node-plan.md's Phase 3 section. Not
+	// exercised (deliberately, not by oversight): TUI's live
+	// differential-render loop and raw-stdin listening, which need an
+	// actual attached terminal/pty to test meaningfully on any engine —
+	// that surface stays unverified by this deletion. node_modules
+	// resolution now always loads the real pi-tui package.
 	if !isDisabled(disabledFakes, "pi-ai") {
 		declarePiAi()
 	}

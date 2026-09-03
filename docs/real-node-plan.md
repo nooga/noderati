@@ -50,8 +50,7 @@ one.
 **B. Third-party npm package fakes — delete the shim, load the real
 package.** These aren't Node surface at all; they're interceptions of specific
 libraries pi-coding-agent depends on, hardcoded as JS strings in Go and
-registered ahead of the real files on disk: `@earendil-works/pi-tui` (every
-export is a no-op — the entire TUI is fake), `@earendil-works/pi-ai` (a
+registered ahead of the real files on disk: `@earendil-works/pi-ai` (a
 from-scratch reimplementation of the real LLM client, including its own model
 catalog and provider fetch calls — its bare-entry fake only exports
 `modelsAreEqual`, everything else lives in the separate `/compat` fake;
@@ -65,7 +64,11 @@ without the other, confirmed 2026-09-02), `@earendil-works/pi-agent-core`
 `typebox/value`/`typebox/compile` split off their own independent toggle
 that same day, as separate real npm entry points, before `typebox/value`
 itself cleared, then `typebox/compile` too once its own two-layer block
-(`#190` then `#192`) merged upstream; see Phase 3 below for all of these.)
+(`#190` then `#192`) merged upstream; `@earendil-works/pi-tui` — the
+entire TUI component library, every export a no-op — deleted 2026-09-03
+once paserati#195/#196/#218/#222–#225 all merged and a real functional
+exercise of its actual component surface matched real Node byte-for-byte;
+see Phase 3 below for all of these.)
 None of these belong in a "Node host." Removing them is a deletion task, not
 a build task, and it's most of `internal/host/`'s file count.
 
@@ -3780,6 +3783,57 @@ produces silently wrong output rather than crashing. `pi-tui`'s fake
 being green here was necessary but nowhere near sufficient. No noderati
 code changes this round — verification and issue-filing only. No fakes
 deleted.
+
+**Thirty-fifth round (2026-09-03) — all five of `#222`-`#226` merged
+in one PR (`#227`); re-verified each against its own filed repro; the
+full functional exercise now byte-identical to real Node; deleted
+`pi-tui`'s fake.** User reported the merge; per standing rule, verified
+directly rather than trusting the closed-issue state — re-ran all five
+exact repros from the thirty-fourth round's filed issues against fresh
+`paserati` `main` (`981401bb`/`8fdb9097`/`41a6ceaa`/`59c1d818`/
+`d123a4f8`, one commit per issue): the object-literal `this`-capture
+case now prints `42:x`, the nested self-referencing `const` arrow now
+resolves, the Function-typed-prototype getter chain now returns `5`
+instead of `undefined`, both `\p{Script=Han}` and
+`\p{Script_Extensions=Han}` now match, `\p{RGI_Emoji}` now matches —
+all five genuinely fixed, not just closed.
+
+Re-ran the *exact* functional-exercise script from the thirty-fourth
+round (same file, unmodified) with `pi-tui`'s fake still toggled off
+via env var first: **zero-line diff** against the real-Node baseline
+captured that round — every one of the four found bugs' symptoms
+(the `visibleWidth`/`wrapTextWithAnsi` throws, the `Markdown` crash,
+chalk's stray ANSI codes on `SelectList`/`SettingsList`) is gone, and
+nothing regressed elsewhere in the same 30-odd-case battery. Checked
+cross-fake coupling before deleting (grepped every other group-B fake
+file for `PiTui`/`pi-tui`/`pitui` — none found, unlike the documented
+`pi-ai`/`pi-agent-core` coupling) so the deletion couldn't silently
+change either of those.
+
+Deleted `internal/host/pitui.go` and its `declarePiTui()` registration
+in `host.go` (replaced with a dated comment matching every prior
+group-B deletion's style, listing every issue that had to land and
+noting the functional-exercise verification, plus the deliberately
+unexercised `TUI` differential-render-loop/raw-stdin surface); moved
+the two unrelated tests bundled into `pitui_test.go`
+(`TestPerfHooksShim`, `TestStringDecoderShim`) into a renamed
+`shims_test.go` rather than deleting them along with the pi-tui-
+specific ones; dropped `"pi-tui"` from `cmd/scoreboard/main.go`'s
+`fakeNames`. Full build/vet/test clean. Rebuilt and re-ran the same
+functional-exercise script with the fake *actually* gone (no env var)
+— still a zero-line diff against real Node. Full scoreboard re-run and
+diffed line-by-line against the pre-deletion capture: `baseline`
+unchanged, `fake-off:jiti` still exactly `#220`'s error,
+`fake-off:pi-agent-core` still the Class-extends error, `fake-off:pi-ai`
+still `Connection error`, `all-fakes-off` still jiti's error — nothing
+moved, exactly as the already-matching `fake-off:pi-tui` row from the
+prior round predicted, confirmed rather than assumed. All three real
+`pi` invocations (`--version`/`--help`/`-p "hello"`) unchanged.
+
+**Net effect**: `pi-tui` — the largest group-B fake, an entire TUI
+component library, 90 real call sites — is gone. Ledger group B is now
+down to `pi-ai`(+`/compat`), `pi-agent-core` (coupled to `pi-ai`'s fake
+per the standing note above), and `jiti/static` (blocked on `#220`).
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory

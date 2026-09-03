@@ -45,7 +45,7 @@ const perRunTimeout = 20 * time.Second
 
 // fakeNames mirrors installModules()'s ledger-group-B knobs.
 var fakeNames = []string{
-	"pi-tui", "pi-ai", "pi-agent-core",
+	"pi-ai", "pi-agent-core",
 	"jiti",
 }
 
