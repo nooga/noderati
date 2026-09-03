@@ -3835,6 +3835,56 @@ component library, 90 real call sites — is gone. Ledger group B is now
 down to `pi-ai`(+`/compat`), `pi-agent-core` (coupled to `pi-ai`'s fake
 per the standing note above), and `jiti/static` (blocked on `#220`).
 
+**Thirty-sixth round (2026-09-03) — `#228` merged, fixing both `#220`
+(jiti's blocker) and `#221` (the bound-method error-swallowing bug
+`vm.go`'s `vmThrow` worked around); verified both, simplified `vmThrow`
+away, found and filed jiti's next blocker (`#229`).** User reported the
+merge; verified rather than trusted, as standing practice requires:
+
+- `#220` — all seven previously-rejected TypeScript contextual keywords
+  (`satisfies`/`is`/`infer`/`readonly`/`override`/`abstract`/`keyof`)
+  now parse and run as function declaration names, confirmed against
+  the exact swept repro from the round that filed it.
+- `#221` — wrote a standalone Go program using paserati's driver
+  directly (a `Class` whose bound instance method returns
+  `(vm.Undefined, error)`) to confirm the underlying fix, independent
+  of noderati's own workaround: the error now propagates and is
+  genuinely caught as a JS exception, without `vmThrow`'s
+  `EnterHelperCall`/`ExitHelperCall` dance. Removed `vmThrow` from
+  `internal/host/vm.go` and reverted `vmScript`'s three `run*` methods
+  to the natural `return vm.Undefined, err` shape — the workaround this
+  round's own doc comment predicted removing once `#221` landed for
+  real, rather than leaving dead defensive code in place once its
+  reason stopped existing. Full `vm_test.go` suite (including the
+  syntax-error-through-`Script` regression test written specifically
+  to catch `#221`) still passes with the simpler code.
+
+**Real jiti chain progressed past `#220` into a new, different
+blocker** — re-ran the exact same env-var-gated `cjs.go` trace-and-
+lexer-dump methodology from two rounds ago (added, used, removed
+before committing) to locate it precisely: still `jiti/dist/babel.cjs`,
+now much further in (`1:158447` vs. the old `1:66759`). The failing
+text is an object literal with a method literally named `async`
+(`async(...t){return Promise.resolve(e.apply(this,t))}`, part of
+Babel's own async-wrapping helper) — a plain, non-async method whose
+*name* happens to be the word "async," not the async-method modifier.
+Minimized to a 4-line repro, then checked the boundary before filing:
+the analogous class-method case (`class Foo { async(...) {} }`) and
+the analogous `get`/`set`-as-object-literal-method-name cases already
+parse correctly — only the object-literal-shorthand-method-named-
+`async` case fails, root-caused to one missing disambiguator
+(`lexer.LPAREN`) in `parser.go`'s object-literal property parser
+(~line 7150), which otherwise correctly treats `async` as a plain name
+rather than a modifier when followed by `:`/`,`/`}` but was missing the
+fourth grammatically-unambiguous case, `(`. Filed
+[paserati#229](https://github.com/nooga/paserati/issues/229).
+
+Full build/vet/test, both real `pi` invocations, full scoreboard: clean
+— `fake-off:jiti`'s row now shows exactly `#229`'s error at the new
+position, confirming genuine forward progress rather than a
+regression; every other row unchanged. No fakes deleted this round;
+`jiti` moves one blocker closer.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

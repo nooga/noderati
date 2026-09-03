@@ -201,87 +201,29 @@ func newVMScript(p *driver.Paserati, vmInstance *vm.VM) func(code string) (*vmSc
 	}
 }
 
-// vmThrow makes a Go error surface as a catchable JS exception from a
-// vmScript method. Filed as paserati#221: unlike a module-level Function
-// (m.Function) or a class constructor - both of which special-case a
-// trailing (T, error) return and turn a non-nil error into a real throw -
-// a bound instance method's wiring (driver's createClassConstructor ->
-// bindStructMethods -> createBoundMethod) only ever reads results[0] and
-// hardcodes a nil error back to the VM, silently discarding whatever
-// vmScript.RunInThisContext/RunInContext/RunInNewContext actually returned.
-// Confirmed empirically: without this, `new vm.Script("(((").runInThisContext()`
-// returned undefined instead of throwing.
-//
-// The workaround calls the VM's own throwException machinery directly
-// (vm.ThrowExceptionValue / vm.ThrowTypeError) instead of relying on the
-// return value, mirroring exactly what the module-level Function path does
-// with a returned error: an ExceptionError already carries the real thrown
-// value (a SyntaxError from IndirectEvalCode, say) and that value is reused
-// as-is; anything else gets wrapped in a real Error instance via the global
-// Error constructor, falling back to a TypeError only if that constructor is
-// somehow unavailable. A throw made this way still needs the
-// EnterHelperCall/ExitHelperCall bracket below to actually reach the calling
-// try/catch - see vmThrow's own comment for why the naive version (throw,
-// then return) silently failed to propagate the first time this was tried.
-func vmThrow(vmInstance *vm.VM, err error) {
-	// EnterHelperCall/ExitHelperCall bracket a synchronous throw made from
-	// inside a native call rather than as its returned error (see call.go's
-	// own doc comment on EnterHelperCall: "should be called before native
-	// functions call helpers like ToPrimitive that might throw exceptions
-	// which need to be caught by try/catch blocks"). Confirmed necessary
-	// empirically, not just by reading the doc comment: without this bracket,
-	// handleCatchBlock (exceptions.go) finds the in-frame catch handler and
-	// correctly repoints frame.ip at it, but only sets vm.handlerFound when
-	// vm.helperCallDepth > 0 - and OpCallMethod's own "exception caught in
-	// the same frame, jump to handler" fallback check is gated behind
-	// !calleeVal.IsCallable(), which never applies to a bound method like
-	// this one. Without helperCallDepth > 0, neither path notices the
-	// pending jump and the call site just falls through as if nothing were
-	// thrown, using createBoundMethod's bogus discarded-error return value.
-	vmInstance.EnterHelperCall()
-	defer vmInstance.ExitHelperCall()
-
-	if ee, ok := err.(vm.ExceptionError); ok {
-		vmInstance.ThrowExceptionValue(ee.GetExceptionValue())
-		return
-	}
-	if errCtor, ok := vmInstance.GetGlobal("Error"); ok {
-		if res, callErr := vmInstance.Call(errCtor, vm.Undefined, []vm.Value{vm.NewString(err.Error())}); callErr == nil {
-			vmInstance.ThrowExceptionValue(res)
-			return
-		}
-	}
-	vmInstance.ThrowTypeError(err.Error())
-}
+// RunInThisContext/RunInContext/RunInNewContext return their error
+// naturally, the same way any other bound Class instance method does.
+// Until paserati#221 landed (fixed 2026-09-03, see docs/real-node-plan.md),
+// that path silently discarded a bound method's returned error -
+// `new vm.Script("(((").runInThisContext()` evaluated to `undefined`
+// instead of throwing - and these methods worked around it by throwing
+// directly via the VM's exception machinery. Removed now that #221's real
+// fix makes the plain (T, error) return propagate correctly on its own;
+// re-verified against the exact syntax-error repro these methods'
+// tests use before removing the workaround.
 
 func (s *vmScript) RunInThisContext() (vm.Value, error) {
-	val, err := vmEval(s.p, s.code)
-	if err != nil {
-		vmThrow(s.vmInstance, err)
-		return vm.Undefined, err
-	}
-	return val, nil
+	return vmEval(s.p, s.code)
 }
 
 func (s *vmScript) RunInContext(contextObj vm.Value) (vm.Value, error) {
-	val, err := vmRunInRealm(s.p, s.vmInstance, vmLookupContext(contextObj), s.code)
-	if err != nil {
-		vmThrow(s.vmInstance, err)
-		return vm.Undefined, err
-	}
-	return val, nil
+	return vmRunInRealm(s.p, s.vmInstance, vmLookupContext(contextObj), s.code)
 }
 
 func (s *vmScript) RunInNewContext(sandbox vm.Value) (vm.Value, error) {
 	ctxVal, err := vmCreateContext(s.p, s.vmInstance, sandbox)
 	if err != nil {
-		vmThrow(s.vmInstance, err)
 		return vm.Undefined, err
 	}
-	val, err := vmRunInRealm(s.p, s.vmInstance, vmLookupContext(ctxVal), s.code)
-	if err != nil {
-		vmThrow(s.vmInstance, err)
-		return vm.Undefined, err
-	}
-	return val, nil
+	return vmRunInRealm(s.p, s.vmInstance, vmLookupContext(ctxVal), s.code)
 }
