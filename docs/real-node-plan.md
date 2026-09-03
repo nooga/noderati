@@ -3286,6 +3286,118 @@ decoding through the real SDK stack is still unverified end-to-end.
 checked out anywhere accessible this round — nothing to verify there
 yet.
 
+**Thirty-first round (2026-09-02) — user reported a large batch of
+paserati merges; pulled `main`, verified all four outstanding issues
+fixed, ran the full sweep, found and filed one more.** `origin/main`
+had gained six commits since last round: `fc187d9d` (fixes `#212`,
+`#213`, `#214` together), `19b41dad` (fetch's JSON-body `TypeError`
+built safely off the VM goroutine), `078b5ce7` (a throwing
+`toString`/`valueOf` accessor now propagates out of string coercion
+instead of being swallowed), `27073103` (`#210`, `Intl`/
+`Intl.Segmenter`), `e89e75b3` (strings kept as canonical WTF-8,
+sliced/searched by UTF-16 code unit), `ee6f1aa6` (spreading/
+destructuring a string as an iterable). Switched the shared checkout
+off an unrelated already-merged WIP branch (`feat/intl-segmenter`,
+whose tip had landed on `main` the same way `fix/promise-goroutine-
+race` did two rounds ago) onto `main`, fast-forwarded, clean-cache
+rebuilt. Paserati's own full test suite: clean.
+
+**Verified all four fixes directly against their exact filed repros**,
+not just trusted the closing commit references:
+- `#210`: `new Intl.Segmenter(undefined, {granularity: "grapheme"})`/
+  `"word"` both construct and segment correctly (`"héllo"` → `h|é|l|l|o`
+  as graphemes, `"hi there"` → `hi| |there` as words).
+- `#212`: `TextDecoder.decode()` now correctly decodes a bare
+  `Uint8Array`, an `ArrayBuffer`, and a byte-offset subarray view — the
+  filed repro's single-byte view (`ij` vs `i`-with-no-offset would
+  look the same by coincidence) was re-checked with a genuinely
+  distinguishing two-byte offset view (`new Uint8Array([104,105,106,
+  107]).buffer` sliced `(1, 2)` → `"ij"`, not `"hi"` or `"jk"`) before
+  trusting that offset handling, not just presence, is correct.
+- `#213`: the exact bare, `AbortSignal`-free repro that previously
+  produced a fabricated `AbortError` now rejects with the real
+  `TypeError` carrying the actual dial-refused message.
+- `#214`: that same rejection is now a genuine `Error` instance
+  (`instanceof Error` true, `.name`/`.message` populated), not a bare
+  string.
+
+Rebuilt noderati against the fully-updated `main`: full test suite is
+now **fully green**, including `TestPiAiStreamSimpleFetchError` — the
+test left deliberately failing (not skipped) two rounds ago to track
+`#213` — passing again on its own, unedited, is itself confirmation
+the regression is genuinely fixed, not just that the issue was closed.
+Updated its doc comment to record the fix landed in `fc187d9d` rather
+than leaving the "currently failing" framing stale. Rebuilt the
+noderati binary and reran the three real `pi` invocations: the
+baseline `-p "hello"` error text is back to the historic, correct
+`dial tcp ...: connect: connection refused` — `#213`'s effect on this
+project's own baseline is fully gone.
+
+**Full scoreboard rerun — real, further movement on `pi-tui`, mixed
+signal on `pi-ai`.** `pi-tui` is now past `Intl` entirely (thanks to
+`#210`) and hits a new blocker: `numbered backreferences like \1 are
+not supported (Go regexp limitation)`, thrown with no informative
+stack trace (a `SyntaxError` from regex compilation, before any JS
+exception unwinding, so the exact line inside pi-tui's minified bundle
+wasn't pinned down). Minimized standalone: `new RegExp("(a)\\1")`
+throws that error, while the exact same pattern as a **literal**,
+`/(a)\1/`, works fine — the identical "constructor doesn't get the
+regexp2 fallback a literal does" asymmetry class `#190`/`#196` already
+documented for Unicode property escapes, this time for backreferences.
+Root-caused precisely in `pkg/vm/regex.go`: `compileRegexEngines`
+(regex literals) unconditionally falls back to `regexp2` on any
+`translateJSFlagsToGo`/`regexp.Compile` failure, but `NewRegExp` (the
+`new RegExp(...)` constructor) returns `translateJSFlagsToGo`'s error
+immediately — its own regexp2 fallback is gated by
+`needsRegexp2Fallback`, which only recognizes the four lookaround
+openers, not backreferences, so a backreference pattern trips the
+constructor's earliest possible error return before that gate is ever
+reached. Filed
+[paserati#218](https://github.com/nooga/paserati/issues/218) with the
+exact asymmetry and two concrete fix directions.
+
+`pi-ai` (real package, fake off) still shows `Connection error.`
+against the plain no-server baseline (still correctly matching real
+Node, since the real SDK normalizes every `fetch()` failure to that
+message regardless of type) — but exercising it against a real local
+SSE stub server surfaced something not yet root-caused: a bare
+`streamSimple(...)` call against the stub via a standalone script
+succeeds partially (returns a `stopReason: "error"` message with
+`errorMessage: "unexpected completions response"`, since the stub
+always sends SSE-shaped chunks even when the real client didn't
+request streaming) — but running the exact same stub through the real
+`pi-coding-agent` CLI's own `-p "hello"` path instead produces
+`ERROR: undefined is not a function`, a different failure entirely.
+The two paths clearly exercise different code (the CLI's own model/
+provider configuration presumably differs from the bare `getModels
+("openai")[0]` used in the standalone script). The standalone script's
+`unexpected completions response` is very likely just an artifact of
+this round's stub (it always sends SSE-shaped chunks regardless of
+whether the request asked for streaming, so a non-streaming call gets
+a body its own client can't parse) — **not** a real gap; the CLI's
+`undefined is not a function` is the one actually worth chasing, since
+that's the real invocation path. This round didn't narrow it down
+further — flagged as an open thread for whoever picks up `pi-ai` next,
+starting from the CLI path specifically, not filed anywhere yet since
+the exact
+call site isn't pinned down.
+
+Full build/vet/test (now **fully clean**, zero known failures), full
+scoreboard, three real `pi` invocations: consistent with the above,
+zero unexplained regressions. Shared paserati checkout left on `main`,
+clean, up to date with `origin/main`. Stub HTTP server used for this
+round's `pi-ai`/`#212` verification killed before finishing (checked
+`lsof -i:1234` explicitly this time before drawing conclusions from
+any run, after getting burned by leftover-stub contamination twice
+last round).
+
+**Net effect**: `#210`/`#212`/`#213`/`#214` all confirmed genuinely
+fixed by direct re-verification, not assumed from issue state. Real
+forward movement on `pi-tui` (now blocked on `#218`, a much narrower
+gap than a missing global) and a partially-characterized-but-not-yet-
+root-caused new gap on `pi-ai`'s real streaming path via the actual
+CLI. No fakes deleted yet — zero scoreboard rows clean.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
