@@ -3642,6 +3642,145 @@ rather than assuming "graceful" meant "deliberate."
 No noderati code changes this round — verification only. No fakes
 deleted.
 
+**Thirty-fourth round (2026-09-03) — the real functional TUI exercise
+the thirty-third round called for; found four distinct engine bugs and
+filed all of them (`#222`-`#225`), plus a fifth minor one (`#226`);
+`pi-tui`'s fake stays.** Built a standalone script
+(`/private/tmp/.../pitui-check/check.mjs`, scratchpad-only, not
+committed) importing the **real** `@earendil-works/pi-tui` package
+directly by absolute path and exercising its actual exported surface
+against real call patterns: `utils.js`'s width/truncation/wrapping
+functions, `fuzzy.js`, `keys.js`'s `parseKey`/`matchesKey` against a
+battery of raw terminal escape sequences, `keybindings.js`,
+`terminal-colors.js`'s OSC report parsers, and the `Box`/`Text`/
+`TruncatedText`/`Spacer`/`Markdown`/`SelectList`/`SettingsList`/
+`Container` components' `render(width)` methods — `Markdown`/
+`SelectList`/`SettingsList` constructed with theme objects whose field
+shapes were copied verbatim from pi-coding-agent's own real
+`dist/modes/interactive/theme/theme.js` (`getMarkdownTheme`/
+`getSelectListTheme`/`getSettingsListTheme`), rebuilt with real `chalk`
+colors instead of that file's own theme-loading machinery (typebox
+schemas, fs watchers, config-dir resolution — unrelated to pi-tui
+itself). Deliberately out of scope: `TUI`'s live differential-render
+loop and raw-stdin listening, which need an actual attached
+terminal/pty to test meaningfully on *any* engine, not just noderati.
+
+Ran the identical script under real Node (v26.3.0) first to establish
+a byte-exact baseline, then under noderati with `pi-tui`'s fake
+disabled, with every call wrapped so one failure couldn't abort the
+rest of the exercise (record success or `THREW <message>` per case,
+diff the two full reports afterward) — the lesson from the very first
+attempt, which crashed on the first emoji-width call and would have
+hidden everything behind it.
+
+**Four real, distinct engine bugs found, each root-caused to an exact
+file/line before filing** (ranked by severity):
+
+1. **[paserati#222](https://github.com/nooga/paserati/issues/222)** —
+   an arrow function written directly as an object-literal property's
+   value silently loses its lexical `this` binding when `this` is the
+   *only* thing it captures. `this` isn't tracked via the compiler's
+   `freeSymbols` mechanism (it compiles to a dedicated `OpLoadThis`
+   opcode, not a symbol lookup), so such an arrow has
+   `len(freeSymbols) == 0`; `compileObjectLiteral`'s named-arrow path
+   (`compileArrowFunctionWithName` + `emitClosureGeneric`) has a
+   zero-upvalue fast path that emits a bare `OpLoadConstant` instead of
+   `OpClosure` in that case, so `Closure.CapturedThis` — how arrow
+   `this` binding actually works at the VM level — never gets
+   populated. Isolated the *exact* boundary with nine variants (object
+   literal vs. array vs. separate-then-referenced; class method vs.
+   plain-object method; `this`-only vs. named-outer-var capture) before
+   filing, then grepped every other call site of both
+   `compileArrowFunctionWithName` and `emitClosureGeneric` to confirm
+   the blast radius really is exactly this one pattern — destructuring
+   defaults and plain `const x = () => ...` declarations all route
+   through a different, always-correct `emitClosure` helper. This is
+   real Node's own `pi-tui` `Markdown` component's actual pattern
+   (`getDefaultInlineStyleContext()`'s `applyText` field), so
+   `Markdown.render()` throws on any real markdown input. Flagged as
+   the most severe of the four: it fails **silently** whenever the
+   missing `this` happens not to be dereferenced in a way that throws,
+   not just here.
+2. **[paserati#223](https://github.com/nooga/paserati/issues/223)** —
+   a getter/setter defined via `Object.defineProperty` on a
+   **Function**-typed object isn't found via inherited property access
+   from a different object whose prototype is that function — the
+   lookup silently returns `undefined` rather than invoking the
+   getter, confirmed by instrumenting the getter body itself (it never
+   runs). A plain **data** property on the same function-as-prototype
+   *is* found correctly, and the same getter pattern on a **plain
+   object** prototype also works — narrowing this precisely to
+   accessor lookup specifically through a Function-typed link in the
+   chain. This is **chalk's actual root cause** for emitting color
+   unconditionally: confirmed directly against the real installed
+   `chalk/source/index.js` (not just the synthetic repro) that
+   `chalk.cyan.level` — the exact property `applyStyle` gates ANSI-code
+   emission on — reads `undefined` under noderati where real Node
+   reads `0`, because chalk's style-builder functions inherit `level`
+   from a Function-typed `proto` via exactly this getter shape, while
+   `chalk.level` itself (an own data property on the root object) reads
+   fine. Means **any** noderati output piping through chalk's
+   auto-detection gets stray ANSI codes in non-TTY contexts — not
+   `pi-tui`-specific at all, found through it.
+3. **[paserati#224](https://github.com/nooga/paserati/issues/224)** —
+   `\p{RGI_Emoji}` (a Unicode "property of strings" — matches whole
+   emoji *sequences*, not single codepoints, `v`-flag-only) isn't
+   recognized by either engine; confirmed regexp2 can't parse it either
+   (`unknown unicode category, script, or property`), so unlike
+   `#218`'s fix this can't be rescued by routing into the existing
+   fallback gate — it needs paserati to synthesize an alternation from
+   real Unicode emoji-sequence data, a harder class of gap than
+   `#190`/`#196`'s single-codepoint property gaps, flagged as such
+   explicitly. Blocks `pi-tui`'s `visibleWidth()` (and everything built
+   on it) on any string containing an emoji.
+4. **[paserati#225](https://github.com/nooga/paserati/issues/225)** —
+   the `\p{Name=Value}` property-escape *grammar* itself (`\p{Script=
+   Han}`, `\p{Script_Extensions=Han}`, `\p{General_Category=Letter}`)
+   isn't recognized by either engine at all — not a missing-value gap,
+   the whole syntax form fails identically regardless of which name is
+   used. `regex_properties.go`'s `expandDerivedUnicodeProperties` its
+   own doc comment says this form "passes through untouched for the
+   engines to judge" — checked whether either engine actually can
+   judge it, and neither can, so quoted that comment directly in the
+   filed issue since it's a documented deferral to a capability that
+   doesn't exist. Blocks `pi-tui`'s `wrapTextWithAnsi()` (used by
+   `Text`/`Markdown`) unconditionally, since the failing regex
+   (`cjkBreakRegex`) is built at module load time regardless of input.
+
+**Fifth, minor finding, filed rather than left in scrollback per
+advisor's prompt**:
+[paserati#226](https://github.com/nooga/paserati/issues/226) — a
+`const`-declared arrow function nested inside another function cannot
+reference itself by name from within its own body (`Cannot find name`
+from the type checker), even though this is legal and real Node/tsc
+both accept it; only affects a nested `const` arrow's self-reference
+specifically (top-level self-reference, and a nested named function
+declaration's self-reference, both work). Tripped over this while
+minimizing `#222`'s repro (mimicking chalk's real self-referencing
+`createBuilder` pattern) and routed around it with `-no-typecheck`
+rather than let it block that investigation.
+
+Advisor caught two things before this was called done: (1) initially
+inferred `#223` was chalk's cause from mechanism-reading alone without
+confirming against the real file — added the direct `chalk.cyan.level`
+check against the actual installed `chalk/source/index.js` before
+claiming the link; (2) hadn't checked whether `emitClosureGeneric`'s
+other call site (`ShorthandMethod`, `compiler.go:1519`) shared `#222`'s
+bug — grepped every caller of both `compileArrowFunctionWithName` and
+`emitClosureGeneric` and confirmed it's a method-compilation path
+unaffected by `CapturedThis`, narrowing the filed blast radius instead
+of leaving it an open question.
+
+**Net effect**: the functional exercise `pi-tui`'s own twenty-third-
+round note called for is done, and it answered the question definitively
+— three of the four bugs are hard failures on core rendering paths
+(`visibleWidth`, `Text`/`wrapTextWithAnsi`, `Markdown`), the fourth
+produces silently wrong output rather than crashing. `pi-tui`'s fake
+**stays** despite `#218` fixing its import-time blocker; the scoreboard
+being green here was necessary but nowhere near sufficient. No noderati
+code changes this round — verification and issue-filing only. No fakes
+deleted.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
