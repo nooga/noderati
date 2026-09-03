@@ -3398,6 +3398,193 @@ gap than a missing global) and a partially-characterized-but-not-yet-
 root-caused new gap on `pi-ai`'s real streaming path via the actual
 CLI. No fakes deleted yet — zero scoreboard rows clean.
 
+**Thirty-second round (2026-09-02/03) — implemented `node:vm`
+(`internal/host/vm.go`), the actual next `jiti` blocker; verified end
+to end against the real dependency chain; found and filed one more
+parser bug (`#220`).** User asked where `vm.runInThisContext` should
+live given noderati already instantiates a paserati VM — the answer,
+worked out in conversation before writing any code: Node-specific
+surface (not ECMAScript/WHATWG standard, unlike `fetch`/
+`ReadableStream`/`Intl`) belongs in noderati, same split every prior
+Node module has followed. First pass proposed only the narrow
+`runInThisContext` slice, reasoning `vm.createContext`/`runInContext`
+would need "a genuinely separate global object/realm" as if that were
+a big new paserati-side lift — user pushed back precisely: paserati
+already instantiates a VM and already has realms. Checking before
+answering (rather than defending the original claim) found this was
+completely right and the original claim wrong: `pkg/vm/realm.go`'s
+`Realm` type is a real, complete ECMAScript-Realm-shaped mechanism
+("the foundation for ECMAScript Realm support and ShadowRealm API",
+per its own doc comment) — `vm.CreateRealm()`, `vm.WithRealmValue()`,
+and `driver.InitializeRealmBuiltins()` (which even already clones the
+main realm's heap *layout* onto a new realm so compiled global-slot
+indices resolve identically across realms) together give everything
+`vm.createContext`/`runInContext`/`runInNewContext` need, already
+public, already wired end to end. `vm.runInThisContext` itself maps
+even more directly onto an existing primitive:
+`driver.Paserati.IndirectEvalCode`'s own doc comment ("creates a new
+declarative environment for let/const/class... var goes to the global
+environment... does NOT inherit strict mode") is a verbatim match for
+real Node's own description of `runInThisContext` as behaving like
+indirect `eval()`. So: the *whole* module, not just the narrow slice,
+needed zero new paserati-core work — user said "build it" once that
+was on the table.
+
+Implemented `internal/host/vm.go`: `createContext`/`isContext`/
+`runInThisContext`/`runInContext`/`runInNewContext` plus a `Script`
+class, mapped exactly onto the primitives above. A contextified
+sandbox object's identity (`*vm.PlainObject` pointer, stable across
+`vm.Value` wrappers) is the only piece with no existing paserati
+equivalent — kept in a package-level Go map to a `*vm.Realm`, since a
+JS object can't itself directly carry an opaque Go pointer; documented
+its one real limitation honestly (entries are never freed, so a
+context created and dropped leaks its Realm for the process's life —
+acceptable for real usage found so far, revisit if that changes).
+Also documented two other deliberate scope cuts rather than silently
+omitting them: `Script` doesn't eagerly parse at construction time the
+way real Node does (a syntax error only surfaces on first run, since
+`IndirectEvalCode` compiles and runs in one step with no reusable
+"compiled, not yet run" split) — a real, disclosed gap from spec
+fidelity, not a silent one; and sandbox-to-context linkage is
+one-directional (existing sandbox properties become context globals;
+a script defining a *new* global isn't synced back onto the sandbox
+afterward) rather than real V8's live two-way binding, since no real
+call site needs the two-way case and a fragile partial simulation of
+it would be worse than an honest one-way copy.
+
+Wrote 7 tests including one specifically checking Realm isolation is
+real, not just a naming trick (a value set as a global in the main
+realm is invisible inside a context; a global a context script defines
+is invisible in the main realm afterward) — all pass, including on
+the very first build (every API assumption from the design discussion
+held). Registered in `host.go`; added `"vm"` to `cjs.go`'s
+`nativeRequireNames` — the same second, separately-hand-maintained
+`require()`-routing list `node:v8` needed an entry in two rounds ago,
+confirmed needed again by testing `require("node:vm")` explicitly
+(not just `import`) before considering the module done.
+
+**Verified against the real dependency chain, not just synthetic
+tests**: `fake-off:jiti` no longer fails on `Cannot find module
+'node:vm'` — it progresses further into `jiti.cjs`'s own real load
+chain and hits a *different* error entirely
+(`Syntax Error at 1:66759: '(' expected`), with no informative stack
+trace (a parse-time error, before any JS exception machinery runs).
+Traced precisely rather than guessed at: added a temporary,
+env-var-gated trace to `cjs.go`'s `execFile` (removed before
+committing — investigation-only, not shipped) to log every file
+loaded; the last one before the crash was `jiti/dist/babel.cjs`
+(jiti's own vendored Babel build, loaded via `jiti-static.mjs`'s
+`import _babelTransform from "../dist/babel.cjs"` found two rounds
+ago) — confirming `node:vm` itself is no longer the blocker; something
+inside Babel's own real bundle is. Used the same paserati-lexer-dump
+technique from the original jiti investigation (rather than
+unreliable raw byte-offset text slicing) to tokenize the *exact*
+wrapped source paserati actually parses and find the real position:
+`function satisfies(e,t,r){...}` — a plain function declaration named
+`satisfies`, tokenized as the reserved `SATISFIES` keyword (paserati's
+TS `satisfies`-operator token) rather than a plain identifier.
+
+Minimized standalone, then swept every TypeScript contextual keyword
+as a function-declaration name and checked each against real Node
+before filing: **wrongly rejected** (real Node accepts all seven):
+`satisfies`, `is`, `infer`, `readonly`, `override`, `abstract`,
+`keyof`; correctly already accepted: `as`, `asserts`, `type`,
+`module`, `namespace`, `of`, `static`, `declare`, `accessor`,
+`unique`, `global`, `out`; correctly rejected by both engines (genuine
+reserved words, not contextual, so paserati's rejection here is
+right even if its error text is less specific than real Node's):
+`interface`, `enum`, `implements`, `in`, `const`. Root-caused to
+`pkg/parser/parser.go`'s `parseFunctionLiteral` (~line 2601) — the
+same hand-maintained-keyword-allowlist class of bug as `#203`/`#204`,
+this time for function declaration/expression names (used by both
+`function` and `async function`), with a precedent fix already in the
+same file for the *adjacent* case (function **parameter** names,
+`d97d4bf6`) that evidently didn't also cover this position. Filed
+[paserati#220](https://github.com/nooga/paserati/issues/220) with the
+full swept scope and both fix directions (extend the list, or switch
+to the general `isIdentifierNameToken()` helper the way `#203`/`#204`
+already suggested elsewhere).
+
+Full build/vet/test, all three real `pi` invocations, full scoreboard:
+clean, zero regressions — `fake-off:jiti`'s row now shows exactly
+`#220`'s error, confirming it's the sole remaining blocker at this
+depth. Shared paserati checkout was found switched to another agent's
+WIP branch for `#218` (fast turnaround — already a real commit,
+`7bf84209`, pushed since last round) partway through this round;
+confirmed clean, switched back to `main` without touching it.
+
+**Advisor pass caught two real gaps before this round was called done**,
+both fixed rather than waved off:
+
+1. *Untested error path.* No test exercised `runInContext`/`Script`
+   against a non-context object actually throwing — only that
+   `isContext({})` reports `false`. Added
+   `TestVMRunInContextRejectsNonContext` covering both the
+   module-level function and the `Script` method. It caught a real
+   bug: `new vm.Script(code).runInContext({})` (and, once probed
+   further, *any* error from *any* `Script` method, including a plain
+   syntax error from `runInThisContext()`) silently evaluated to
+   `undefined` instead of throwing — full stop, not narrower to the
+   context-rejection case.
+2. *Isolation test proved less than its own doc comment claimed.*
+   `TestVMContextIsolation` only checked a *property* assigned via
+   `globalThis.x = ...`, which could pass even if realms shared heap
+   storage (property vs. heap-slot bindings are different storage).
+   Added `TestVMContextIsolationRealBinding`, declaring a genuine
+   `var` binding in each direction — it also passed, so isolation is
+   confirmed real, not an artifact of testing the wrong mechanism.
+
+Root-causing gap 1 (not just patching around it) led one level
+deeper than the module itself. `pkg/driver/native_module.go`'s
+`createBoundMethod` — the reflection wiring behind every `m.Class`
+instance method, `Script`'s three `run*` methods included — only ever
+reads `results[0]` from a Go method's return and hardcodes a nil error
+back to the VM, never checking for the `(T, error)` shape at all. Both
+`goFunctionToVM` (module-level `Function`s) and
+`createClassConstructor`'s own constructor-call path already
+special-case exactly this shape and turn a non-nil error into a real
+throw (the constructor path fixed once already, for `#167`) — only the
+*instance method* wiring never got the same treatment. Filed
+[paserati#221](https://github.com/nooga/paserati/issues/221) with the
+comparison and a suggested shared-helper fix.
+
+Until `#221` lands, `vm.go`'s `Script` methods work around it directly:
+`vmThrow` calls the VM's own `ThrowExceptionValue`/`ThrowTypeError`
+inline rather than trusting the return value, reusing an
+`ExceptionError`'s real thrown value when there is one and building a
+generic `Error` otherwise (mirroring what the *working* module-Function
+error path already does). The first version of this workaround
+compiled and looked right but still didn't propagate — instrumenting
+confirmed why: `handleCatchBlock` (`pkg/vm/exceptions.go`) finds the
+in-frame catch handler and correctly repoints `frame.ip` at it, but
+only sets `vm.handlerFound` when `vm.helperCallDepth > 0`, and
+`OpCallMethod`'s own same-frame-catch fallback check is gated behind
+`!calleeVal.IsCallable()` — never true for a real bound method. Wrapping
+the throw in `vm.EnterHelperCall()`/`vm.ExitHelperCall()` (the exact
+bracket `call.go`'s own doc comment prescribes for "native functions
+[that] call helpers... that might throw exceptions which need to be
+caught by try/catch blocks") fixed it; confirmed via a new
+`TestVMScriptRunInThisContextSyntaxError`, mirroring the existing
+module-level syntax-error test but through the `Script` class. All 10
+`vm_test.go` tests pass; full build/vet/test, all three real `pi`
+invocations, and the full scoreboard re-run clean afterward —
+`fake-off:jiti`'s row is unchanged (still exactly `#220`'s error),
+confirming this fix is additive, not a behavior change to anything
+already working.
+
+**Net effect**: `jiti` gained a real, substantial noderati-side
+capability (`node:vm`, likely useful to more than just jiti, matching
+`OSPathResolver`'s CJS-interop fix two rounds ago) and is now blocked
+on `#220` — one specific, narrow parser gap, not a missing module. Along
+the way, found and fixed a real correctness gap in `vm.Script` (every
+method's error path was silently swallowed) rather than shipping it
+unnoticed, and filed the paserati-side root cause (`#221`) rather than
+leaving the workaround unexplained. `pi-tui`'s blocker, `#218`, shows
+as **closed** upstream as of this round (seen via `gh issue list` while
+filing `#221`) — not yet re-verified against the actual merged fix;
+next round should pull paserati and re-check before deleting anything.
+No fakes deleted yet.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

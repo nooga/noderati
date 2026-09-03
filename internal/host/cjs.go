@@ -36,6 +36,7 @@ var nativeRequireNames = map[string]bool{
 	"stream/promises": true, "constants": true,
 	"diagnostics_channel": true,
 	"v8":                  true,
+	"vm":                  true,
 }
 
 type cjsLoader struct {
