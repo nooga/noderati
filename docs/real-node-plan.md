@@ -3585,6 +3585,63 @@ filing `#221`) — not yet re-verified against the actual merged fix;
 next round should pull paserati and re-check before deleting anything.
 No fakes deleted yet.
 
+**Thirty-third round (2026-09-03) — pulled paserati, confirmed `#218`
+genuinely fixed; `fake-off:pi-tui` matches baseline for the first time,
+but the fake stays (not yet a real deletion candidate).** Checkout was
+clean on `main`; pulled in `39ba5a67` ("fix(vm): fall back new RegExp()
+backreferences to regexp2 like literals do") — read the diff before
+trusting the issue-closed state, same as every prior round: it routes
+`translateJSFlagsToGo`'s hard-coded backreference error into the same
+narrow `needsRegexp2Fallback` gate `NewRegExp` already had for
+lookaround, rather than special-casing it separately, and extends that
+gate to trigger on `\1`-`\9` (skipped under `u`/`v`, where Annex B's
+relaxed backreference rule doesn't apply and a bare `\1`-`\9` must stay
+a `SyntaxError` — confirmed the author checked this against
+`unicode_restricted_octal_escape.js` in Test262, per the commit
+message). Verified against the exact filed repro in plain paserati
+first: `new RegExp("(a)\\1")` now compiles and `.test("aa")`/
+`.test("ab")` return `true`/`false` correctly, not just "no longer
+throws."
+
+Rebuilt noderati against the pulled checkout (`go.mod`'s `replace`
+points at the local path, no version bump needed) — full build/vet/
+test clean. Scoreboard run twice for stability: `fake-off:pi-tui` now
+matches `baseline` on all three invocations (`version`/`help`/`print`),
+the **first non-empty line ever on the "candidates to actually delete"
+list** in this phase. Checked for stub-server contamination on the
+matching `print` failure (`lsof -i:1234`, empty) — both sides
+genuinely fail to connect to a nonexistent local LLM server for the
+same real reason, not a coincidence.
+
+**Did not delete the fake.** The twenty-third round's own note on this
+exact fake says exactly why not: "its eventual deletion will need a
+real functional exercise of TUI components specifically — the three
+baseline invocations exercise none of it, only the import." `#218`
+fixed precisely the import-time blocker that note anticipated — the
+scoreboard turning green here confirms the *load path* now works, not
+that any of the 90 real call sites' actual rendering/component behavior
+does. That still needs the same kind of real-call-site functional
+exercise `typebox`/`diff`/`glob`/`proper-lockfile` each got before their
+fakes came out, not yet done for `pi-tui`.
+
+One more thing checked rather than assumed, prompted by advisor:
+`pi-tui`'s real `native-modifiers.js` best-effort-loads a platform/arch-
+gated `.node` native addon (`darwin-modifiers.node`, arm64/x64 only)
+through a `try/catch` that falls through to `undefined` on failure — a
+real risk if noderati's `require()` on a `.node` path aborted instead of
+throwing a catchable error. It doesn't abort: `require()` on that exact
+path throws a catchable `Syntax Error at 1:63: Invalid character` —
+noderati has no native-addon loading at all, so `require()` falls back
+to treating the binary's bytes as JS source and hits garbage on the
+first non-ASCII byte. The degradation is real and catchable, just via
+an accidental mechanism (a parse failure) rather than a deliberate
+"native modules unsupported" rejection — functionally fine for now
+(both catch and continue identically), but worth knowing precisely
+rather than assuming "graceful" meant "deliberate."
+
+No noderati code changes this round — verification only. No fakes
+deleted.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
