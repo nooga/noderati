@@ -4248,6 +4248,59 @@ diagnose the 404, then passed to a `curl` command to confirm the fix)
 — worth a rotation if the user is ever concerned about a transcript
 being shared.
 
+**Forty-first round (2026-09-04) — `#235` merged; verified genuinely
+fixed; jiti moved past its syntax-error blocker entirely into a new,
+more severe compiler crash, root-caused and filed as `#239`.** User
+reported the merge; pulled `paserati` `main` (`61959df9`) and
+re-verified directly: all three original boundary-sweep repros
+(`for`/`if`/`while` with an un-braced regex-starting body) now match
+real Node exactly, and the fix ships with its own regression test
+(`tests/scripts/regex_after_unbraced_control_flow.ts`). Full build/
+vet/test clean.
+
+Re-ran the scoreboard: `fake-off:jiti`/`all-fakes-off` moved again —
+`babel.cjs` now **parses completely** (confirms `#235`'s fix is
+real, not just passing its own narrow repro), but compiling it now
+crashes with `panic: Compiler Error: Ran out of registers!` deep in a
+long `compileInfixExpression`→`compileNode`→`compileInfixExpression`→
+... recursive stack. Root-caused with a synthetic repro rather than
+trying to bisect the minified bundle by hand: a plain left-associative
+chain of 300 `x + x + x + ...` compiles fine (each partial sum frees
+its temporary immediately), but the same length **right**-nested
+(`x + (x + (x + (x + ...)))`) panics past ~120-130 levels — matches
+`RegisterAllocator`'s hard 255-register-per-function cap
+(`regalloc.go:97/105`) exactly, since a right-nested shape forces the
+compiler to hold every outer pending left operand's register live
+across the whole remaining right subtree, so live-register count grows
+linearly with depth instead of staying flat. Confirmed real Node
+handles the identical shape trivially at 1000+ levels.
+
+Also confirmed, via the standalone-repro path (not through noderati's
+CJS require() nesting), that this is **worse** than the babel.cjs
+symptom suggested: hit from a top-level compile, it's a raw uncaught
+Go panic that kills the whole process outright, not a catchable JS
+error - the babel.cjs case only looked like a normal `PS4001 [ERROR]`
+because it happened to occur while compiling was triggered lazily
+inside an already-running VM frame (`require()`), whose own `run()`
+loop has a `defer`/`recover()` that incidentally caught it. Filed
+[paserati#239](https://github.com/nooga/paserati/issues/239) with
+both the minimal repro and this severity distinction, plus a
+suggested minimum-safety-net fix (turn the panic into a catchable
+compile error even before the deeper register-allocator work lands).
+
+Noticed in passing, not touched: the paserati checkout (shared with
+the paserati team's own concurrent work per this session's standing
+context) has an uncommitted, in-progress fix for `#237` sitting in
+`pkg/builtins/fetch_init.go` - a `SetInternalSlots`-based
+`mergeHeadersFrom` that looks like exactly the right shape for the fix
+suggested in that issue. Left it alone; not this session's work to
+commit or evaluate.
+
+**Net effect**: `#235` is confirmed fixed. jiti's fake is not close to
+deletable - the blocker just moved from a parse-time to a compile-time
+failure, and the new one (`#239`) is a more severe class of bug (an
+uncatchable process crash) than the one it replaced. No fakes deleted.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
