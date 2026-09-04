@@ -3885,6 +3885,125 @@ position, confirming genuine forward progress rather than a
 regression; every other row unchanged. No fakes deleted this round;
 `jiti` moves one blocker closer.
 
+**Thirty-seventh round (2026-09-04) — went after `pi-ai`'s real
+CLI-path `undefined is not a function` (both group-B fakes off); ruled
+out the stub as the cause, found and filed two engine bugs instead
+(`#230`, `#231`), plus a smaller compat gap (`#232`); the call site
+itself is still open.** `#229` and `#204` are reported fixed upstream
+but not yet landed, so this round picked up the other standing
+question: an earlier round's `-p` invocation against real `pi-ai`/
+`pi-agent-core` produced a bare `undefined is not a function` with no
+stack, and that round left open whether it was a real engine bug or an
+artifact of the hand-rolled SSE stub used in place of a real LLM
+endpoint.
+
+Rebuilt the stub (`sse_stub.py`, OpenAI-compatible `/v1/chat/
+completions`) correctly this time, having found two real bugs in the
+*stub itself* first — always worth stating plainly since both would
+have looked like noderati bugs otherwise: it didn't send the trailing
+empty-choices `usage` chunk `stream_options.include_usage` requires,
+and it left the connection open with no `Content-Length` on an SSE
+body, so the client (real Node's OpenAI-SDK-based HTTP client) waited
+forever for a close signal that never came. Fixed both — final empty-
+usage chunk after `finish_reason`, `Connection: close` +
+`self.close_connection = True` — and verified under **real Node
+first**, established as the known-good oracle before testing
+noderati: real `pi` completes an entire turn against the stub
+end-to-end, including a full tool-call round trip (the stub
+conditionally emits a `bash` tool call on the first request, a plain
+reply on the follow-up). With the stub now demonstrably correct,
+re-ran the same `-p` invocation under noderati with `pi-ai` and
+`pi-agent-core` both disabled: **same `undefined is not a function`,
+occurring before any HTTP request reaches the stub at all.** That
+settles the open question from the earlier round — this is a real
+compat gap, not a stub artifact — even though the exact throw site is
+still unknown.
+
+Two debugging attempts to get a stack trace, both by temporarily
+patching the *real installed npm package* (never paserati's own
+source), each backed up first and restored via `cp` + `diff`-confirmed
+byte-identical after: patching `print-mode.js`'s `catch (error)` to
+also try `error.stack` found nothing new (the actual line printing
+`ERROR: ...` turned out to be a different one,
+`assistantMsg.errorMessage || ...`, which never carries an `Error`
+object to begin with); patching `pi-agent-core`'s `agent.js`
+`handleRunFailure` with an unconditional debug print never fired at
+all — confirmed this wasn't a broken `process.env` gate by probing
+`process.env` support directly (`FOO=1 noderati -e
+'console.log(process.env.FOO)'` → `1`, works fine) — so the real
+failure happens **before** `Agent.run`'s own try/catch is ever entered,
+ruling out that whole code path as the origin.
+
+Tried a third technique: a wrapper `.mjs` entry script
+(`tracewrap.mjs`) monkeypatching `globalThis.TypeError` to a
+subclass that logs a stack trace whenever a `"... is not a function"`
+message is constructed, then `import()`s the real `cli.js`. Building
+this surfaced two more findings before it could even run:
+
+- Top-level `await import(...)` in the `.mjs` wrapper threw
+  `ReferenceError: await is not defined` — paserati doesn't support
+  top-level await in ES modules at all, a real ECMA-262 feature gap,
+  independent of anything pi-specific. Routed around it with a bare
+  `import(...)` (no `await`) rather than blocking on it, then filed
+  [paserati#232](https://github.com/nooga/paserati/issues/232)
+  separately with a clean 3-line repro so it doesn't get lost — not
+  chased further, since this round wasn't about the module system.
+- With that workaround in place, loading the wrapper **crashed the
+  entire process** — a raw Go panic
+  (`index out of range [4096] with length 4096`), not a catchable JS
+  exception. Traced it: `ThrowTypeError` re-resolves the global
+  `TypeError` binding fresh on every call via
+  `vm.getRealmAwareGlobal("TypeError")`, so once JS code reassigns
+  `globalThis.TypeError`, any internal engine-triggered
+  `ThrowTypeError` call (e.g. for `undefined()`) recurses through the
+  user's replacement constructor indefinitely — and this reentrant
+  `vm.Call` path doesn't share the stack-depth guard that already
+  exists at the bytecode level (`OpCall`/`OpSpreadNew` in `vm.go` /
+  `op_spreadnew.go`) for exactly this class of runaway recursion, so
+  it blows a fixed-size internal buffer instead of raising `RangeError:
+  Maximum call stack size exceeded` like every other unbounded-
+  recursion case in the engine already does. Minimized to a 5-line
+  repro (a plain empty-constructor class, no `extends`, assigned to
+  `globalThis.TypeError`, crashed by any subsequent internal
+  `TypeError` trigger), confirmed real Node handles the identical
+  script with zero special behavior, and filed
+  [paserati#231](https://github.com/nooga/paserati/issues/231) with
+  the traced root cause and a suggested two-part fix (cache the
+  original native constructor at VM-init time, and/or route the
+  reentrant call through the existing depth check). This is the
+  session's most severe finding by a wide margin: an uncatchable
+  process crash from five lines of legal, unexceptional JS, not a
+  compatibility gap — and it means the monkeypatch-a-global technique
+  itself is now off-limits for any future debugging on this engine
+  until `#231` lands.
+
+Separately, while reading `console_init.go` during this investigation,
+noticed `console.error`/`console.warn` write to **stdout**, not
+stderr, and add a non-standard `"LEVEL: "` prefix real Node doesn't —
+this is why `-p`'s crash message actually reads `ERROR: undefined is
+not a function` instead of the bare `undefined is not a function` a
+real Node stderr write would produce. Filed
+[paserati#230](https://github.com/nooga/paserati/issues/230) with a
+clean repro. To be precise about what this does and doesn't explain:
+it accounts for the *formatting* of the printed message (channel and
+prefix), not the underlying `undefined is not a function` failure
+itself — that root cause is still open.
+
+**Net effect**: the original question this round set out to answer —
+is `pi-ai`'s CLI-path failure real or a stub artifact — is now
+answered (real), but the actual throw site inside `pi-ai`/
+`pi-agent-core` is still unknown; the two debugging techniques tried
+so far both dead-ended (one ruled out a code path, the other crashed
+the engine and got redirected into filing `#231`). No noderati code
+changes this round beyond the leftover-process/state cleanup below;
+`internal/host/vm.go`'s `TypeError`-adjacent code untouched (the crash
+lives entirely in paserati). No fakes deleted, no fakes' scoreboard
+status changed. Housekeeping: killed a stray `sse_stub.py` left
+running on `:1234` from an earlier test in this round (confirmed via
+`lsof` before and after), and confirmed both patched-then-restored npm
+files (`print-mode.js`, `agent.js`) and the `paserati` checkout
+(`git status` clean on `main`) left no residue.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
