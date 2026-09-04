@@ -4618,6 +4618,56 @@ correctness bug (silent data corruption), not merely a missing
 feature. No fakes deleted; the scoreboard change is the only
 noderati code committed this round.
 
+**Forty-sixth round, follow-up (same day) — corrected #247's own
+imprecision.** advisor caught that #247's body blended two different
+programs together: it described the `"symbol"`-valued corruption as
+"a variant" of the 53-line filed repro, but that repro only ever
+produces `undefined` (3/3+ runs) - the `"symbol"` value came from a
+separate, larger program closer to `openai-completions.js`'s real
+shape (~80 simulated SSE chunks, a `Map`-based lookup, a
+`thinkingBlock` mutated across iterations). Reconstructed that larger
+program from session notes, re-ran it (Fireworks credentials not
+involved this time - purely local, no network), confirmed it still
+deterministically prints `typeof blocks: symbol isArray: false
+blocks!==output.content` on paserati vs. real Node's clean
+`processed 81 events` with nothing printed. Posted a correction
+comment on #247 with that program attached as a second, independent
+repro, explicit that the filed minimal repro (`undefined` case) is
+still the right one for regression-testing a fix, and that this larger
+one is the one that actually produced the `Symbol` value.
+
+Also used the comment to sharpen the suspected mechanism: in both
+repros, the producer IIFE's `stream.push(event)` doesn't just run
+concurrently with the consumer's suspended generator - it's the exact
+call that *resolves the promise the generator's own internal `await`
+is parked on* (`waiter({value, done:false})` settles what
+`[Symbol.asyncIterator]`'s body is suspended on). So the trigger looks
+narrower than "two suspended frames coexisting": it's specifically
+one frame's own step *resuming the other frame*, at the moment the
+corruption becomes observable in the resuming frame. Noted this as a
+hypothesis for whoever fixes it, not a confirmed source-level finding
+(still haven't read `pkg/vm`'s frame/register-stack code for this).
+
+One more thing noticed in passing and deliberately not chased: an
+earlier narrowing variant (`min4.mjs`, not filed) printed the
+consumer's `"done"` line *before* the producer's post-`await`
+diagnostic line - an ordering real Node cannot produce for that
+program (the consumer's `for await` can only see `end()` after the
+producer has already run past the point where it prints). That's a
+second, distinct scheduling anomaly in the same code path, orthogonal
+to the value-corruption bug #247 is about. Recording it here rather
+than filing it now: if #247 lands a fix and this ordering is still
+observably wrong afterward, it's worth its own issue then, not before.
+
+**Housekeeping note**: while reconstructing the `"symbol"` repro this
+round, a real Fireworks API key from `~/.pi/agent/models.json`
+appeared in a temp script and thus in this session's transcript for a
+*second* time (first time was the Forty-third round's investigation).
+Deleted the temp file both times, but the value itself was already in
+scrollback each time - flagging plainly rather than treating "the file
+is gone" as the fix. Worth rotating that key if this transcript is
+ever shared or retained beyond this machine.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
