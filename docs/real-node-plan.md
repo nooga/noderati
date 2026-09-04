@@ -4346,6 +4346,55 @@ new register-exhaustion message at the same `@babel/types` file;
 round. No fakes deleted - jiti's fake stays, its blocker just keeps
 changing shape and severity rather than clearing.
 
+**Forty-third round (2026-09-04) — root-caused the actual construct
+behind `@babel/types`' register exhaustion: not a right-nested `+`
+chain (`#239`'s trigger) at all, but a long comma-operator chain that
+issue `#121`'s existing chain-folding fix simply doesn't cover. Filed
+`#242`.** User asked to dig into the babel/types failure specifically.
+Extracted the real virtual module's source directly from `babel.cjs`
+(it's a bundler-packed `"path"(exports,module,require){...}` map, not
+a separate file on disk) rather than guessing: `Object.
+defineProperty(t,"__esModule",...)` followed by exactly 308
+comma-joined `t.assertName=function(...){...}` assignments, all one
+expression statement - a completely ordinary minifier statement-
+merging pattern, not anything exotic.
+
+Built a minimal synthetic repro of that exact shape (N comma-joined
+function assignments) and found the threshold: ~230 terms compile
+fine, ~250+ hit the identical `PS3001 register exhaustion` diagnostic
+`#239` introduced. Real Node handles the real 308-term case instantly,
+as expected.
+
+Read `compile_expression.go` (read-only, as always) to find why comma
+specifically, when `+` chains of the same length are already fine
+since `#121`: `compileInfixExpression` has a comma-operator special
+case (~line 1441, needed for its "discard left, keep right in tail
+position" semantics) that recurses into `node.Left` after allocating
+a register for it - the exact register-per-recursion-level pattern
+the comment on the very next block down (~line 1463) says `#121`
+already fixed for arithmetic/comparison/bitwise chains via an
+iterative fold (`compileInfixChain`). The comma special case returns
+*before* ever reaching that fold path, so `foldableChainLink`'s
+explicit operator list (`+ - * / % ** <= >= == != < > in instanceof
+=== !== & | ^ << >> >>>`) never gets a chance to include or exclude
+comma on purpose - it's excluded by control flow, not by a semantic
+decision the way `&&`/`||`/`??` (which need real short-circuit
+control flow and genuinely can't fold the same way) are. Comma's
+"discard left, evaluate next" semantics are if anything an *easier*
+fit for iterative folding than arithmetic accumulation - no running
+accumulator needed - and `compile_class.go` already has a
+`flattenCommaExpression` helper (built for class-field-initializer
+comma chains) that does exactly the tree-flattening a comma-chain
+fold would need. Filed
+[paserati#242](https://github.com/nooga/paserati/issues/242) with the
+exact code locations, the real-world repro, and the fix direction
+already sitting in the same file.
+
+**Net effect**: the `@babel/types` blocker now has a precise,
+narrowly-scoped root cause distinct from `#239`'s - not a deeper
+architectural register-width problem, just one operator that missed
+an already-built fix. No fakes deleted, no noderati code changes.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
