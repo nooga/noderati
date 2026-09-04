@@ -4219,6 +4219,35 @@ standard `Headers` API - which is most real HTTP client code,
 including the SDK pi-ai itself depends on. No fakes deleted, no
 noderati code changes.
 
+**Follow-up same round, post-advisor-review**: `#237`'s own body had
+initially speculated it "may also explain" the thirty-seventh round's
+`undefined is not a function` failure — wrong, and corrected on the
+issue directly: that older failure was confirmed (with a request-
+logging stub) to happen *before any HTTP request left the process*,
+so a header-dropping bug can't be its cause; the two are unrelated.
+Also ran the discriminating check that should have been in the
+original filing: pointed pi's real CLI (`--provider local`, fakes off)
+at a raw-socket header logger (no HTTP framework normalizing
+anything) instead of Fireworks, to see the literal bytes on the wire.
+Confirmed directly rather than inferred: **every** SDK-set header is
+gone — `Content-Type`, `Authorization`, `Accept`, `OpenAI-
+Organization`, all of it, not just `Content-Type` — only Go's http
+client's own defaults (`Host`/`User-Agent`/`Content-Length`/`Accept-
+Encoding`) survive. Confirms `#237`'s scope as filed (the whole
+`Headers` object is invisible to the request builder) and explains why
+Fireworks answered `415` rather than `401`: `Authorization` was
+equally missing, so whichever check the server runs first is the one
+that surfaces. Posted both corrections as an issue edit + comment on
+`#237` rather than leaving a misleading trail for whoever picks it up.
+
+Housekeeping worth recording since it's outside this repo and won't
+show in any `git status` here: `~/.pi/agent/models.json`'s `fireworks.
+baseUrl` is now permanently fixed (missing `/v1`), and the Fireworks
+API key from that file appeared in this session's transcript (read to
+diagnose the 404, then passed to a `curl` command to confirm the fix)
+— worth a rotation if the user is ever concerned about a transcript
+being shared.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
