@@ -88,7 +88,7 @@ func runFile(execPath, filename string, extra []string) int {
 
 	var val vm.Value
 	var errs []errors.PaseratiError
-	if ext == ".ts" || ext == ".mts" || looksLikeESM(source) {
+	if ext == ".ts" || ext == ".mts" || ext == ".mjs" || looksLikeESM(source) {
 		val, errs = p.RunCode(source, driver.RunOptions{ModuleName: abs})
 	} else {
 		val, errs = host.RunCJS(p, source, abs)

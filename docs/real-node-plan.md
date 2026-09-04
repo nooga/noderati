@@ -4004,6 +4004,90 @@ running on `:1234` from an earlier test in this round (confirmed via
 files (`print-mode.js`, `agent.js`) and the `paserati` checkout
 (`git status` clean on `main`) left no residue.
 
+**Thirty-eighth round (2026-09-04) — `#234` merged, fixing `#230`,
+`#231`, and `#232` in one PR; verified all three against original
+repros; found and fixed a fourth, noderati-side bug hiding behind
+`#232`'s misdiagnosis (`.mjs` files not always treated as ESM).** User
+reported the merge; pulled `paserati` `main` (`e79eb07d`) and verified
+each fix directly rather than trusting the merge:
+
+- `#230` (console routing) — re-ran the exact filed repro
+  (`console.error`/`warn`/`log` in one script) with stdout and stderr
+  captured separately: `error`/`warn` now land on stderr with no
+  prefix, `log` stays on stdout, byte-identical to real Node on both
+  streams.
+- `#231` (TypeError-recursion crash) — re-ran the exact filed 5-line
+  repro (plain class assigned to `globalThis.TypeError`, then an
+  internally-triggered `TypeError`): now prints `"caught"` and exits 0,
+  matching real Node exactly, no panic. Per the PR's own write-up the
+  fix covers a second, worse variant (a revoked `Proxy` assigned the
+  same way, previously an unrecoverable `fatal error: stack overflow`
+  that `panic`/`recover` can't even catch) — built that repro too
+  rather than trusting the description, confirmed it also now matches
+  real Node byte-for-byte (`"caught"`, exit 0).
+- `#232` (top-level await) — this is where verifying paid off. The
+  PR's own body flags that my original diagnosis was wrong: top-level
+  await itself was never broken; my filed repro's *actual* failure
+  (traced by the paserati maintainer to `cmd/paserati`) was an absolute
+  entry path breaking relative-import resolution, since `os.DirFS`
+  rejects any path starting with `/` and `cmd/paserati` was passing the
+  CLI's absolute filename argument straight through as the resolver's
+  base path. Built that exact scenario (absolute-path `.mjs` entry
+  importing a relative sibling module) and confirmed it now resolves,
+  matching real Node.
+
+  But re-running my *original* filed repro (a bare `await
+  Promise.resolve()`, no import at all) through `noderati` still threw
+  the identical `ReferenceError: await is not defined` — unchanged.
+  Confirmed this wasn't stale by running the same file through
+  `cmd/paserati` directly: it worked (module-mode top-level await is
+  fine in paserati itself, as the PR claimed — modulo a separate, minor
+  `Promise.resolve()` zero-arg type-check quirk that's out of scope
+  here). So the discrepancy is entirely on noderati's side, not
+  paserati's. Root cause: `cmd/noderati/main.go`'s `runFile` decides
+  module vs. CommonJS by extension for `.ts`/`.mts` only — everything
+  else, `.mjs` included, falls through to `looksLikeESM`, a heuristic
+  that just greps for `import `/`export ` prefixes. My repro has
+  neither (only a bare top-level `await`), so a `.mjs` file with no
+  static import/export statements was silently routed through
+  `host.RunCJS`'s function-wrapping, where `await` genuinely isn't
+  valid syntax — matching CJS's real behavior, but real Node treats
+  `.mjs` as always-ESM by extension alone, never by sniffing content.
+  Added `.mjs` to the always-module extension check in
+  `cmd/noderati/main.go`; re-ran the original repro — now prints
+  `before`/`after` and exits 0, matching real Node. `go build`/`go
+  vet`/`go test ./...` clean. This means `#232` as I filed it was a
+  compound report: the maintainer's fix addresses a real paserati bug
+  my repro also happened to trip over in a different way at the time,
+  but the specific symptom I described (bare top-level await failing)
+  was never paserati's bug — it was this noderati-side extension gap,
+  now fixed here instead.
+
+Also found and cleared unrelated environment rot while re-running the
+scoreboard to confirm no regressions: a stale `~/.pi/agent/
+settings.json.lock` directory (no process holding it, empty, dated
+from an earlier crashed run in this session) was making even
+`baseline` fail every invocation with a lockfile error, which would
+have made every scoreboard row's `[DIFF]`/`[=]` marker meaningless
+until removed. After clearing it, full scoreboard: `baseline` and
+`fake-off:pi-ai` both green on `version`/`help` again; `print` differs
+only because no LLM stub was running this round (expected, not
+compared). `fake-off:pi-agent-core` unchanged (`Class extends value
+undefined`, the documented `pi-ai` coupling). `fake-off:jiti` and
+`all-fakes-off` both moved to a **new** syntax-error position
+(`242:314286`, further in than `#229`'s old failure) — confirms
+`#229`'s separate fix (landed in the same `paserati` pull, commit
+`3bf33d90`) is genuinely in and jiti progressed again, but this round
+didn't chase the new blocker; that's for next time.
+
+**Net effect**: three upstream fixes verified genuine (not just
+closed), one additional real noderati bug found and fixed as a direct
+result of doing that verification carefully instead of taking the PR's
+"top-level await works fine" claim at face value for *my* specific
+repro. No fakes deleted, no fakes' scoreboard status changed this
+round (jiti's new blocker is a forward step, not a deletion
+candidate).
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
