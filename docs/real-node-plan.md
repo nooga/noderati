@@ -4088,6 +4088,49 @@ repro. No fakes deleted, no fakes' scoreboard status changed this
 round (jiti's new blocker is a forward step, not a deletion
 candidate).
 
+**Thirty-ninth round (2026-09-04) — picked up jiti's new blocker from
+the thirty-eighth round; root-caused and filed `#235`.** Reproduced
+directly (`NODERATI_DISABLE_FAKES=jiti`, `-p "hello"`): same file as
+two rounds ago, `jiti/dist/babel.cjs`, now failing further in
+(`242:314286` vs. the old `1:158447`). Re-added the env-var-gated
+`cjs.go` trace (added, used, removed before committing, same
+methodology as before) to confirm the file, then located the exact
+character at that position directly in the real file (`awk`/`python3`
+indexing — line 242 is 546,029 characters long, a single bundled/
+minified line): a `/` starting `/[^ \t]/.exec(r[e])` inside
+`for(let e=0;e<r.length;e++)/[^ \t]/.exec(r[e])&&(i=e);` — an
+un-braced `for` loop whose entire body is a regex-literal expression
+statement.
+
+Minimized to a 3-line repro, then swept the boundary before filing
+(same discipline as every prior round's filed issues): `if`/`while`
+with an un-braced regex-starting body fail identically; the braced
+equivalents (`for (...) { hit = /x/.test(...); }`) work fine; plain
+division after a value-producing parenthesized expression
+(`(4 + 2) / 3`) works fine. So the bug is exactly "control-flow header
+`)` followed by an un-braced body starting with `/`" — not regex
+literals or `for`-loops in general.
+
+Root-caused in paserati's parser (read-only, as always): the lexer's
+`canBeRegexStart` is a pure previous-token lookup table, and there's
+already a purpose-built escape hatch for cases like this —
+`Parser.rescanPeekAsRegex()`, called after every other statement-
+boundary token the parser recognizes (closing braces, semicolons,
+etc. — ~14 call sites). It's just never called after the `RPAREN` that
+closes an `if`/`while`/`for` header before falling into the un-braced-
+body parse path; `parseIfStatement` and `parseWhileStatement` have the
+identical missing-call shape at the exact same spot. Filed
+[paserati#235](https://github.com/nooga/paserati/issues/235) with the
+repro, the boundary sweep, and the precise fix location (didn't verify
+`parseForStatement`'s equivalent spot carries the same shape, but the
+repro fails identically for `for` so it's presumably the same gap).
+
+Full build/vet/test, scoreboard: clean, `fake-off:jiti`/`all-fakes-off`
+now show `#235`'s error at the new position — forward progress
+confirmed, nothing else moved. No fakes deleted, no noderati code
+changes (trace instrumentation added and removed within this round,
+confirmed via `git diff` before committing).
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
