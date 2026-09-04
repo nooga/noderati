@@ -4395,6 +4395,65 @@ narrowly-scoped root cause distinct from `#239`'s - not a deeper
 architectural register-width problem, just one operator that missed
 an already-built fix. No fakes deleted, no noderati code changes.
 
+**Forty-fourth round (2026-09-04) — `#242` merged; verified genuinely
+fixed against every prior repro (including 5000-term chains); jiti
+moved past `babel.cjs` entirely into a fresh, `#242`-caused regression
+in its own `jiti.cjs` loader, bisected and filed as `#244`.** User
+reported the merge; pulled `paserati` `main` (`c2fea91b`).
+
+Verified `#242` itself first, thoroughly: the synthetic 250/308/1000/
+5000-term comma-chain repros from the forty-third round all now
+compile and run correctly (previously failing past ~230-250 terms).
+
+Re-ran jiti end to end: it moved *past* `babel.cjs` completely - no
+more register-exhaustion error there at all - into a new failure one
+file over, in `jiti.cjs` itself (jiti's own loader/bootstrap, a
+separate webpack-bundled file, not `babel.cjs`): a raw Go panic,
+`index out of range [17] with length 0`, on `OpLoadUninitialized`
+inside `vm.run`. Found a one-line standalone repro
+(`require("<path-to>/jiti.cjs")` alone, no pi CLI involved) and used
+it to bisect cleanly: checked out `pkg/compiler/compile_expression.go`
+alone at `5ba1d1ad` (pre-`#242`) inside an otherwise-`c2fea91b` tree -
+the repro loads fine; back at `c2fea91b`'s version of that one file -
+crashes every time. `#242` is confirmed the cause, isolated to the
+single file it touched.
+
+Traced the mechanism precisely via `call.go`'s frame setup
+(`requiredRegs := calleeFunc.RegisterSize; newFrame.registers =
+vm.registerStack[...:...+requiredRegs]`): some function's
+`RegisterSize` - computed by `regAlloc.MaxRegs()` at the end of
+compiling that function's body - is coming out as `0` despite its own
+bytecode needing at least register 17, so its call frame gets a
+zero-length register window and the first register write past that
+panics. Read `RegisterAllocator.MaxRegs()`/`Free()`/`TryAlloc()`
+directly (read-only) looking for the exact defect and came up empty -
+the free-list-based design looks internally consistent for every
+scenario checked by hand.
+
+Tried nine synthetic repro shapes to isolate it standalone
+(object/class methods - sync, async, generator, async-generator,
+static, instance; comma chains as a whole function body, mid-function,
+inside a zero-arity IIFE matching jiti.cjs's own outer shape; a comma
+chain with a nested closure term inside a function with several
+already-active locals) - all compiled and ran correctly. None
+reproduced it. Filed
+[paserati#244](https://github.com/nooga/paserati/issues/244) with the
+bisection, the traced mechanism, and an explicit list of what was
+tried and ruled out, recommending the real file (a reliable,
+one-line repro) as the better bisection starting point over further
+blind synthetic guessing - the same honesty-about-the-boundary
+approach used for `#238`'s race when a full interleaving proof wasn't
+in reach either.
+
+Cleaned up the env-var-gated `cjs.go` trace added mid-investigation
+(added, used to locate `jiti.cjs` as the crashing file, removed before
+committing - confirmed via `git diff` showing no residual change).
+
+**Net effect**: `#242` is genuinely fixed. jiti's fake stays - the
+blocker is now a fresh regression `#242` itself introduced, one file
+further into jiti's real dependency chain than before. No fakes
+deleted, no noderati code changes.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
