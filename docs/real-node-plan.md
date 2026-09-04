@@ -4531,6 +4531,93 @@ common `hasOwnProperty`-as-bare-identifier minification pattern, not
 specific to jiti or babel. jiti's fake stays; the blocker keeps moving
 forward without clearing. No fakes deleted, no noderati code changes.
 
+**Forty-sixth round (2026-09-04) — while `#246` was in progress,
+root-caused the long-standing `pi-ai`/`pi-agent-core` CLI-path
+`undefined is not a function` mystery (open since a round many
+sessions back), reproduced it standalone, and filed
+[paserati#247](https://github.com/nooga/paserati/issues/247). Also
+added a `fake-off:pi-ai+pi-agent-core` scoreboard row, since the two
+individual rows have never measured the coupled pair.** User asked
+for something else to work on; offered a choice, picked
+`fake-off:pi-agent-core`'s blocker.
+
+First correction before any real digging: `fake-off:pi-agent-core`
+alone tests an incoherent combination — pi-ai's fake stays *on* while
+only pi-agent-core is disabled, a mismatch the standing coupling note
+already flags. That row's `TypeError: Class extends value undefined`
+isn't a real finding; it's the expected shape of a broken combination
+and always has been. Tested the coupled pair together instead
+(`NODERATI_DISABLE_FAKES=pi-ai,pi-agent-core`): `--version`/`--help`
+already matched baseline cleanly - real, previously-unmeasured
+progress the scoreboard's one-at-a-time-plus-all-off structure has
+never been able to show.
+
+`-p` against a live Fireworks completion (real endpoint, `#237`'s
+fixed `models.json`) still failed with the exact old `undefined is not
+a function`. Traced it precisely this round, now that `#237`/`#238`
+had eliminated two major confounding variables (dropped headers, the
+false-deadlock race):
+
+- A minimal script using the real `openai` npm SDK directly against
+  Fireworks (bypassing `pi-ai` entirely) streamed a complete response
+  correctly under noderati - ruling out the SDK's own `Promise`
+  subclassing (`APIPromise extends Promise`, overridden `then`/`catch`/
+  `finally`) and the fetch/streaming layer as the cause; both work.
+  Confirmed the `APIPromise` shape specifically with its own isolated
+  repro too - also fine.
+- Patched `pi-ai`'s real `openai-completions.js` (backed up, restored,
+  `diff`-confirmed after - same methodology used throughout this
+  project) with a `try/catch` right around the exact failing call,
+  found via a first patch that printed `error.stack` on the
+  `stopReason: "error"` path: `getContentIndex`, a closure over `const
+  blocks = output.content` declared near the top of a fire-and-forget
+  `(async () => {...})()` IIFE that streams chunks in via `for await`.
+  Instrumented `getContentIndex` directly per plan: `blocks` was
+  `typeof "object"`, **not an array**, `blocks !== output.content`
+  even though nothing in the source ever reassigns `output.content` -
+  a `const`, still in the same unbroken lexical scope, had lost its
+  value.
+
+Reproduced standalone (not guessed cold): built a class with a real
+`async *[Symbol.asyncIterator]()` method that `await`s a manually-
+created `Promise` before yielding (matching `pi-ai`'s own hand-rolled
+`EventStream`), driven via `for await` by one function while a
+*separate*, concurrently-running fire-and-forget async IIFE declares a
+`const` over a nested property and reads it back through a closure
+after its own `await`. Minimal repro corrupts the `const` every time
+(3/3+ runs) - in one narrowing variant, the corrupted value was even a
+`Symbol`, not just `undefined`, which rules out "silently defaults to
+undefined" and points at an unrelated value bleeding in from
+elsewhere. Removing any one ingredient (a generator that only `yield`s
+without its own internal `await`; never actually consuming the
+generator; collapsing producer and consumer into one function) made
+the corruption disappear in every variant tried - it's specifically
+*two independently-suspended async frames running concurrently* that
+triggers it. Filed with the repro, the narrowing notes, and an
+explicit "didn't verify against `pkg/vm` source, filed from black-box
+narrowing" disclosure (the corrupted-into-a-Symbol detail, plus this
+session's three already-fixed register-allocator bugs, points at
+frame/register-window isolation for concurrently-suspended async
+frames as the likely area, but that's a hypothesis for whoever picks
+it up, not a confirmed read of the source).
+
+Added `fake-off:pi-ai+pi-agent-core` to `cmd/scoreboard/main.go`
+(`configs`), with a comment explaining why the two individual rows
+were never a real signal on their own. Confirmed the new row shows
+exactly what was found by hand:
+`version[=]`/`help[=]` matching baseline, `print[DIFF]` on the still-
+open `#247`. Full build/vet/test clean.
+
+**Net effect**: the multi-round-old pi-ai/pi-agent-core mystery finally
+has a name and a standalone repro - not a header/fetch/race issue (all
+three already fixed this session), but a genuine async/generator
+concurrency bug in the VM. This is very plausibly the single most
+consequential finding of the whole push: it blocks the *entire*
+group-B pair, not one file in one dependency chain, and it's a
+correctness bug (silent data corruption), not merely a missing
+feature. No fakes deleted; the scoreboard change is the only
+noderati code committed this round.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

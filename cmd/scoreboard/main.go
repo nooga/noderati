@@ -102,6 +102,13 @@ func main() {
 	for _, name := range fakeNames {
 		configs = append(configs, config{label: "fake-off:" + name, fakes: name})
 	}
+	// pi-ai and pi-agent-core are documented as coupled (neither de-fakes
+	// cleanly without the other — see docs/real-node-plan.md), so their
+	// individual fake-off:* rows above each test a mismatched combination
+	// (one real, one still faked) and have never been a real signal on
+	// their own. This row measures the pair together, which is what's
+	// actually being worked toward.
+	configs = append(configs, config{label: "fake-off:pi-ai+pi-agent-core", fakes: "pi-ai,pi-agent-core"})
 	configs = append(configs, config{label: "all-fakes-off", fakes: "all"})
 
 	var baseline map[string]result
