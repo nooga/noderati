@@ -4454,6 +4454,83 @@ blocker is now a fresh regression `#242` itself introduced, one file
 further into jiti's real dependency chain than before. No fakes
 deleted, no noderati code changes.
 
+**Forty-fifth round (2026-09-04) — `#244` merged; verified genuinely
+fixed; jiti moved past both `babel.cjs` and its own register-exhaustion
+class of bugs entirely into a new, unrelated bug - unqualified
+`Object.prototype` methods (`hasOwnProperty`, `toString`, ...) throw
+`ReferenceError` instead of resolving through the global object's
+inherited properties. Root-caused precisely and filed as `#246`.**
+User reported the merge; pulled `paserati` `main` (`157a2161`).
+
+`#244`'s own title (`fix register-count wraparound at the
+255-register boundary`) immediately explained why nine synthetic
+repro shapes from the forty-fourth round all failed to reproduce it:
+`Register` is a `uint8`, and `RegisterAllocator.MaxRegs()`'s `ra.maxReg
++ 1` silently wraps to `0` in `uint8` arithmetic exactly when a
+function's peak usage lands on register 255 - a boundary condition no
+hand-written test happens to land on by chance, but a 190KB real
+bundle can. Verified directly: the exact `require(jiti.cjs)`
+one-liner from `#244`'s own filed repro now loads cleanly. Tried to
+reconstruct the boundary condition itself with a synthetic 255-local
+function to confirm the exact mechanism further, but it didn't
+reproduce even pre-fix (different register-allocation path than
+whatever `#244`'s own new `regalloc_test.go` exercises) - didn't chase
+that further since the real repro and the commit's own explanation
+already settle it. Full build/vet/test clean.
+
+Ran the full `pi` pipeline (`--version`/`--help`/`-p "hello"`, `jiti`
+fake off) end to end: jiti now gets *past* both `babel.cjs` and
+`jiti.cjs` completely - deep into `@babel/core`'s own transformation
+pipeline - before hitting a brand new, unrelated failure:
+`ReferenceError: hasOwnProperty is not defined`, thrown from inside
+`@babel/core`'s bundled code the moment it references
+`hasOwnProperty` bare (`hasOwnProperty.call(t,"sourceMap")` and
+`h[hasOwnProperty.call(h,a)?a:".js"]`, found by extracting the exact
+virtual module's source from the bundle, same technique as prior
+rounds).
+
+Recognized this immediately as a real spec-compliance gap rather than
+broken vendor code (real Node ships this exact `@babel/core` build
+fine): in sloppy-mode, non-module code, an unresolved bare identifier
+falls back to a property lookup on the global object, and `globalThis`
+is an ordinary object whose prototype chain reaches `Object.prototype`
+- so `hasOwnProperty`/`toString`/`valueOf`/`isPrototypeOf`/
+`propertyIsEnumerable`/`toLocaleString`/`constructor`, referenced bare
+with no receiver, all resolve via inheritance in real Node. Confirmed
+with a clean repro (`typeof hasOwnProperty` → `"function"` in real
+Node, `"undefined"` under paserati; calling it bare throws under
+paserati) and, critically, isolated the bug precisely by confirming
+what *does* work: `globalThis.hasOwnProperty` and `obj.hasOwnProperty`
+(ordinary property access) both already resolve correctly under
+paserati, matching real Node exactly - so the gap is specifically in
+unqualified-identifier resolution, not in prototype-chain lookup
+generally.
+
+Root-caused in `pkg/vm/vm.go` (read-only): `OpGetGlobal` and
+`OpTypeofIdentifier`'s "not in the heap, check `GlobalObject` for a
+manually-defined property" fallback both call
+`vm.GlobalObject.HasOwn(name)` - an **own**-properties-only check -
+instead of `vm.GlobalObject.Has(name)`, which already exists and is
+implemented as a real `[[Get]]`-based lookup
+(`pkg/vm/object.go:1373`, the same one ordinary property access goes
+through). Checked for other occurrences of the same pattern before
+filing: a third `GlobalObject.HasOwn` call in `OpSetGlobal`'s
+strict-mode delete-detection is checking something genuinely
+different (was this specific previously-read own property removed)
+and is correct as-is - not part of the bug. Filed
+[paserati#246](https://github.com/nooga/paserati/issues/246) with
+both exact call sites and the swap-`HasOwn`-for-`Has` fix direction.
+
+**Net effect**: `#244` is genuinely fixed - two consecutive
+register-allocator regressions from the comma-chain work are now both
+resolved, and jiti has cleared the entire register-exhaustion class of
+blockers. The new `#246` finding is a different kind of bug than the
+last several rounds' compiler/VM internals - a general spec-
+compliance gap likely to recur in any bundled code that uses this
+common `hasOwnProperty`-as-bare-identifier minification pattern, not
+specific to jiti or babel. jiti's fake stays; the blocker keeps moving
+forward without clearing. No fakes deleted, no noderati code changes.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
