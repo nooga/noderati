@@ -4301,6 +4301,51 @@ deletable - the blocker just moved from a parse-time to a compile-time
 failure, and the new one (`#239`) is a more severe class of bug (an
 uncatchable process crash) than the one it replaced. No fakes deleted.
 
+**Forty-second round (2026-09-04) — `#237`, `#238`, `#239` all merged;
+verified all three directly against their exact original repros
+(never the closed-issue label alone).** User reported the merges;
+pulled `paserati` `main` (`5ba1d1ad`) - the same shared checkout's
+in-progress `#237` work noticed last round had landed for real. Full
+build/vet/test clean before touching anything.
+
+- `#237` (headers dropped) - verified the best way available: the
+  exact real-world case, not just the earlier synthetic `httpbin.org`
+  repro. Pointed pi's real CLI (fakes off) at the raw-socket header
+  logger from the fortieth round again. Every header the SDK sets now
+  arrives - `Authorization: Bearer lm-studio`, `Content-Type:
+  application/json`, `Accept`, every `X-Stainless-*` header - nothing
+  missing. Genuinely fixed.
+- `#238` (intermittent false-deadlock race) - reran the exact
+  single-`fetch()` repro 20 times on a normal build (0/20 failures,
+  was ~1-in-15) and 5 times on a fresh `-race` build (0/5, was
+  near-100% under `-race` before the fix). Genuinely fixed.
+- `#239` (register-exhaustion crash) - the original 150-level
+  threshold repro now compiles and runs correctly (the "ease
+  right-nested chains" half of the fix genuinely raised the practical
+  ceiling); pushed further to 1000 and 5000 levels to confirm the
+  other half - both now fail as a clean, catchable `PS3001 [ERROR]:
+  register exhaustion: expression too deeply nested` compile error,
+  exit code 1, no raw panic. Genuinely fixed as scoped (the crash).
+
+Re-ran jiti end to end with the fix in hand: `babel.cjs` still doesn't
+run, but the failure mode improved again in exactly the way `#239`'s
+fix should - it's now a clean, catchable, well-named compile error
+naming the exact file (`@babel/types`' generated assertions index)
+instead of a process-killing panic. This is real, live confirmation
+that the underlying 255-register architectural cap `#239`'s own body
+flagged as needing a deeper fix (wider register operands / more
+aggressive spilling) is still reachable by real bundled code, even
+past the improved threshold - left as a comment on the now-closed
+`#239` (with the exact file and error text) as a ready-made real-world
+test case for whenever that deeper fix is picked up, rather than
+filing a redundant new issue for the same root cause.
+
+Full scoreboard re-run: `fake-off:jiti`/`all-fakes-off` now show the
+new register-exhaustion message at the same `@babel/types` file;
+`fake-off:pi-agent-core` and `fake-off:pi-ai` unchanged from last
+round. No fakes deleted - jiti's fake stays, its blocker just keeps
+changing shape and severity rather than clearing.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
