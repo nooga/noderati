@@ -96,12 +96,10 @@ func installModules(p *driver.Paserati) {
 	// actual attached terminal/pty to test meaningfully on any engine —
 	// that surface stays unverified by this deletion. node_modules
 	// resolution now always loads the real pi-tui package.
-	if !isDisabled(disabledFakes, "pi-ai") {
-		declarePiAi()
-	}
-	if !isDisabled(disabledFakes, "pi-agent-core") {
-		declarePiAgentCore()
-	}
+	// @earendil-works/pi-ai and @earendil-works/pi-agent-core's fakes were
+	// deleted 2026-09-05 (round 47/48) — see the deletion note atop
+	// piai.go for the verification and the Bedrock-provider caveat.
+	// node_modules resolution now always loads both real packages.
 	declarePerfHooks()
 	declareStringDecoder()
 	// typebox's own top-level entry (Type.Object etc.) was deleted

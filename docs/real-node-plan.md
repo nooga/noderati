@@ -4778,6 +4778,108 @@ strong enough that deleting `fake-off:pi-ai`/`fake-off:pi-agent-core`
 looks like the obvious next step, but that's a call to make explicitly
 next round, not fold into a check-in-progress-fixes round.
 
+**Forty-eighth round (2026-09-05, same day) — deleted pi-ai/pi-agent-core's
+fakes, verified `#252` fixed, found and filed jiti's next blocker
+(`#254`).** User asked directly whether pi-ai/pi-agent-core could be
+marked done given `#252` was "underway," or whether they needed more
+fixes first. Investigated rather than assuming: read pi-ai's own
+`package.json` and every one of its `dist/api/*.js` provider files -
+only `bedrock-converse-stream.js` imports `http-proxy-agent`/
+`https-proxy-agent` (and through them `debug`), and it does so via a
+genuinely lazy dynamic `import()` (`bedrock-converse-stream.lazy.js`,
+confirmed by reading it), matching the empirical fact that the
+Forty-seventh round's real Fireworks test never touched it. Confirmed
+directly that requiring `https-proxy-agent` standalone fails today on
+`Cannot find module 'net'` - noderati has no `net` module at all, a
+separate, pre-existing Phase 5 gap unrelated to `#252` or `#247`.
+Checked the Google/Vertex provider path too (`google-logging-utils`,
+which is what would pull in `debug` there) - its `debug` wiring is
+opt-in via an explicit `setBackend(getDebugBackend(require('debug')))`
+call that nothing in this dependency tree actually makes, so it's dead
+code here. Net: `#252`/`#247` landing doesn't gate pi-ai/pi-agent-core's
+main path at all - every non-Bedrock provider was already clear before
+`#252` even existed; `#252` was really jiti's blocker specifically,
+discovered by continuing past `#246`'s fix into `debug`'s own
+`tty.isatty(process.stderr.fd)` call. Presented this via AskUserQuestion
+- user chose "mark done now, note Bedrock gap."
+
+Deleted `internal/host/piagentcore.go` entirely and stripped
+`internal/host/piai.go` down to just `findPiCodingAgentNodeModulesRoots`
+(the real resolver helper `New()` still needs - not part of the fake),
+replacing the removed shim declarations with a dated note carrying the
+verification and the Bedrock caveat. Removed the two
+`declarePiAi()`/`declarePiAgentCore()` calls from `host.go`. Three
+existing unit tests (`TestPiAiCompatShim`, `TestPiAiStreamSimpleFetchError`,
+`TestPiAgentCoreShim`) tested the *fake's own* invented API surface
+(a `/compat` and `/oauth` subpath that never existed in the real
+package) - replaced with `TestPiAiReal`/`TestPiAgentCoreReal`, network-
+free smoke tests against the real packages' actual exports
+(`modelsAreEqual` from `models.js`, `Agent`/`uuidv7` from the real
+`agent.js`/`harness/session/uuid.js`) matching the pattern already used
+for `TestHostedGitInfoReal`. Updated `cmd/scoreboard/main.go`:
+`fakeNames` drops to just `jiti`; the coupled-pair combined row (added
+Round 46, obsolete the moment there's nothing left to combine) is gone
+too. `go build`/`go vet`/`go test ./...` all clean.
+
+Meanwhile the user reported `#253` (the PR fixing `#252`) merged. Pulled
+paserati main (`c987c5b1`): confirmed the fix covers more than my own
+filed repro - `vmValueToReflectValue`'s three `.AsFloat()` call sites
+plus a fourth I hadn't noticed (`ValueConverter.convertVMValueToReflectValue`,
+a duplicate of the same logic) all now use `.ToFloat()`, and the
+Int/Int64 case additionally now does `.Convert(targetType)` /
+`reflect.Zero(targetType)` instead of assuming `int64` always matches
+the target - a real additional fix beyond what I'd suggested. Re-ran
+the exact standalone `tty.isatty(process.stderr.fd)` repro: clean, 3/3.
+
+Ran the full `fake-off:jiti` pipeline again with `#252` fixed: past
+`debug`'s `tty.isatty` crash entirely, past `babel.cjs`'s whole
+config-chain loading, into a *new* failure one file over -
+`@babel/plugin-proposal-decorators/lib/transformer-legacy.js`,
+`undefined is not a function`. Root-caused precisely via the same
+backup/patch/test/restore methodology used on `openai-completions.js`
+earlier this session (temporary diagnostic `console.log`, confirmed
+byte-identical restoration via `diff` after): the real `@babel/template`
+package builds its public export as
+`t.default = Object.assign(i.bind(void 0), { smart: i, statement: o,
+statements: a, expression: l, program: p, ast: i.ast })` - a bound,
+callable function with named sub-builders `Object.assign`ed onto it -
+and `@babel/core` re-exports that via a lazy `template` getter
+(`get template() { return _template().default }`). The decorators
+plugin then does `n.template.statement(...)` at module-load time;
+`n.template.statement` comes back `undefined`.
+
+Minimized standalone, outside jiti/babel entirely: `Object.assign`
+onto *any* function value (bound or plain - narrowed both ways)
+silently drops every property (`hasOwnProperty` false afterward,
+`Object.assign` onto a plain object or array in the same script works
+fine). Direct assignment (`fn.prop = x`) does work and reads back
+correctly - only `Object.assign`'s copy path is broken for a function
+target. Found a second, related defect while narrowing: a *bound*
+function's directly-assigned own property is readable
+(`hasOwnProperty` true, correct value) but isn't enumerable
+(`Object.keys`/`for...in` both miss it), while the identical operation
+on a plain function is enumerable correctly - very likely the same
+underlying gap (function values not getting a normal property bag the
+rest of the object machinery agrees on), filed together rather than as
+two issues. Filed as
+[paserati#254](https://github.com/nooga/paserati/issues/254) with both
+repros and the exact `@babel/template` real-world trigger. Caught and
+fixed one overclaim in the Impact section before it shipped (advisor,
+the third time this session after `#237`/`#247`) - "a pattern used
+elsewhere in the ecosystem" had exactly one confirmed instance;
+narrowed to just that.
+
+**Status after this round**: pi-ai/pi-agent-core done for every
+provider path except Bedrock (a pre-existing, separate gap - no `net`
+module at all - not something this round's work changed). jiti stays
+blocked, now on `#254` - its eighth distinct blocker shape this
+project, each one real forward progress even though the fake still
+isn't deletable. Re-ran the scoreboard post-deletion: `baseline`'s
+`print` failure text changed from the old fake's `dial tcp
+127.0.0.1:1234` wording to the real pi-ai client's `Connection error.`
+- expected, since pi-ai is unconditionally real now and nothing is
+listening at the scoreboard's stub target; not a regression.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

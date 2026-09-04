@@ -44,8 +44,16 @@ const defaultTarget = "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-
 const perRunTimeout = 20 * time.Second
 
 // fakeNames mirrors installModules()'s ledger-group-B knobs.
+//
+// pi-ai and pi-agent-core's fakes were deleted 2026-09-05 (round 47/48 of
+// docs/real-node-plan.md) — a real Fireworks end-to-end test with both
+// fakes off returned correct completions 3/3 runs, the first time this
+// coupled pair worked against a live backend. Their individual
+// fake-off:* rows (and the fake-off:pi-ai+pi-agent-core combined row this
+// tool used to also run, back when the pair had to be tested together to
+// mean anything) are gone along with them — there's no toggle left to
+// flip; node_modules resolution always loads both real packages now.
 var fakeNames = []string{
-	"pi-ai", "pi-agent-core",
 	"jiti",
 }
 
@@ -102,13 +110,6 @@ func main() {
 	for _, name := range fakeNames {
 		configs = append(configs, config{label: "fake-off:" + name, fakes: name})
 	}
-	// pi-ai and pi-agent-core are documented as coupled (neither de-fakes
-	// cleanly without the other — see docs/real-node-plan.md), so their
-	// individual fake-off:* rows above each test a mismatched combination
-	// (one real, one still faked) and have never been a real signal on
-	// their own. This row measures the pair together, which is what's
-	// actually being worked toward.
-	configs = append(configs, config{label: "fake-off:pi-ai+pi-agent-core", fakes: "pi-ai,pi-agent-core"})
 	configs = append(configs, config{label: "all-fakes-off", fakes: "all"})
 
 	var baseline map[string]result

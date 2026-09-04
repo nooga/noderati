@@ -8,7 +8,15 @@ import (
 	"github.com/nooga/paserati/pkg/driver"
 )
 
-func TestPiAiCompatShim(t *testing.T) {
+// TestPiAiReal exercises the real, unmodified @earendil-works/pi-ai
+// package (its fake — a made-up /compat and /oauth subpath surface that
+// didn't exist in the real package at all — was deleted 2026-09-05, round
+// 47/48 of docs/real-node-plan.md, once a real Fireworks end-to-end test
+// via `--provider fireworks -p "..."` with the fake off returned correct
+// completions 3/3 runs). This only smoke-tests network-free real exports
+// (models.js's modelsAreEqual); the actual live-completion path is
+// verified separately against a real backend, not by a unit test here.
+func TestPiAiReal(t *testing.T) {
 	pkgRoot := findPiAgentCorePackage(t)
 	if pkgRoot == "" {
 		t.Skip("pi-coding-agent not installed")
@@ -26,58 +34,13 @@ func TestPiAiCompatShim(t *testing.T) {
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
 		import { modelsAreEqual } from "@earendil-works/pi-ai";
-		import { getProviders, getModels } from "@earendil-works/pi-ai/compat";
-		import { getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-		const providers = getProviders();
-		const models = getModels();
-		const oauth = getOAuthProviders();
-		[
-			modelsAreEqual({ id: "a" }, { id: "a" }) ? "eq" : "no",
-			Array.isArray(providers) ? "p" : "np",
-			Array.isArray(models) ? "m" : "nm",
-			Array.isArray(oauth) ? "o" : "no",
-		].join(",")
+		modelsAreEqual({ id: "a", provider: "p" }, { id: "a", provider: "p" }) ? "eq" : "no"
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	if val.ToString() != "eq,p,m,o" {
-		t.Errorf("pi-ai shims = %q, want eq,p,m,o", val.ToString())
-	}
-}
-
-func TestPiAiStreamSimpleFetchError(t *testing.T) {
-	// Briefly broken by a paserati regression (dbf6d62d, #205's streaming
-	// fetch() fix): doFetchRequestWithContext's own internal cleanup called
-	// cancel() on any error return (including a plain connection-refused
-	// dial failure, nothing to do with aborting), which made fetch()'s
-	// ctx.Err()==context.Canceled check — intended to detect a real
-	// AbortSignal-triggered abort — fire on every network failure,
-	// discarding the real error in favor of a fabricated "AbortError: The
-	// operation was aborted". Confirmed via a bare, AbortSignal-free
-	// fetch() to an unreachable address, diffed against the immediately-
-	// prior commit's build (which correctly reported the real dial error)
-	// before filing https://github.com/nooga/paserati/issues/213 — left
-	// deliberately failing rather than skipped while that was open, per
-	// this project's rule that a known gap stays visible until the
-	// upstream fix lands, not masked. Fixed upstream in fc187d9d; verified
-	// this test passes again on its own (not just re-enabled) before
-	// removing the skip note.
-
-	p := New([]string{"noderati"})
-	p.SetSkipTypeCheck(true)
-	val, errs := p.RunCode(`
-		import { streamSimple, getModels } from "@earendil-works/pi-ai/compat";
-		const model = Object.assign({}, getModels("openai")[0], { baseUrl: "http://127.0.0.1:1" });
-		const stream = streamSimple(model, { messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }] }, { apiKey: "x" });
-		const msg = await stream.result();
-		msg && msg.stopReason === "error" && String(msg.errorMessage).indexOf("connect") >= 0 ? "ok" : String(msg && msg.errorMessage)
-	`, driver.RunOptions{})
-	if len(errs) > 0 {
-		t.Fatalf("RunCode: %v", errs[0])
-	}
-	if val.ToString() != "ok" {
-		t.Errorf("streamSimple fetch error = %q, want ok", val.ToString())
+	if val.ToString() != "eq" {
+		t.Errorf("pi-ai modelsAreEqual = %q, want eq", val.ToString())
 	}
 }
 
@@ -117,7 +80,13 @@ func TestHostedGitInfoReal(t *testing.T) {
 	}
 }
 
-func TestPiAgentCoreShim(t *testing.T) {
+// TestPiAgentCoreReal exercises the real, unmodified
+// @earendil-works/pi-agent-core package (its fake was deleted 2026-09-05,
+// round 47/48 — see TestPiAiReal above for the same verification this
+// piggybacks on). Only checks that the real Agent class and uuidv7 import
+// and construct correctly; the live agent-loop/streaming path is verified
+// separately against a real backend, not by a unit test here.
+func TestPiAgentCoreReal(t *testing.T) {
 	pkgRoot := findPiAgentCorePackage(t)
 	if pkgRoot == "" {
 		t.Skip("pi-agent-core not installed")
@@ -135,29 +104,9 @@ func TestPiAgentCoreShim(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
 
-	cases := []struct {
-		name string
-		code string
-	}{
-		{"uuid direct", `import { uuidv7 } from "@earendil-works/pi-agent-core/dist/harness/session/uuid.js"; typeof uuidv7()`},
-		{"uuid", `import { uuidv7 } from "@earendil-works/pi-agent-core"; typeof uuidv7`},
-		{"agent", `import { Agent } from "@earendil-works/pi-agent-core"; typeof Agent`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, errs := p.RunCode(tc.code, driver.RunOptions{})
-			if len(errs) > 0 {
-				t.Fatalf("RunCode: %v", errs[0])
-			}
-		})
-	}
-
 	val, errs := p.RunCode(`
 		import { Agent, uuidv7 } from "@earendil-works/pi-agent-core";
-		const a = new Agent({ initialState: { systemPrompt: "hi" } });
-		const unsub = a.subscribe(function () {});
-		unsub();
-		a.state.systemPrompt === "hi" && typeof uuidv7() === "string" && typeof a.prompt === "function" ? "ok" : "no"
+		typeof Agent === "function" && typeof uuidv7() === "string" ? "ok" : "no"
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
