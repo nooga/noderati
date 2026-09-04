@@ -4131,6 +4131,94 @@ confirmed, nothing else moved. No fakes deleted, no noderati code
 changes (trace instrumentation added and removed within this round,
 confirmed via `git diff` before committing).
 
+**Fortieth round (2026-09-04) — tested `pi-ai`'s real CLI path against
+a live Fireworks endpoint (user's own configured account) instead of
+the hand-rolled SSE stub; found and fixed a user config bug, then found
+and filed two real, precisely-traced `fetch()` engine bugs (`#237`,
+`#238`).** User pointed out their `~/.pi/agent/models.json` already has
+a `fireworks` provider configured — a real LLM backend removes the
+stub as a variable entirely, closing off the "is this a stub artifact"
+question for good rather than just arguing it's unlikely.
+
+First request 404'd (`Path not found: /chat/completions`) — the
+configured `baseUrl` (`https://api.fireworks.ai/inference`) was
+missing `/v1`; confirmed with a direct `curl` before touching anything
+(`.../inference/chat/completions` → 404, `.../inference/v1/chat/
+completions` → 200 with the same key/model). Asked before editing the
+user's own global config file (outside the repo, a standing personal
+setting); user confirmed. Fixed the `baseUrl`, verified against **real
+Node first** as always: `pi --provider fireworks --model
+accounts/fireworks/models/glm-5p2 --no-session -p "..."` returns a
+real completion end-to-end.
+
+Ran the identical invocation under noderati with `pi-ai`+
+`pi-agent-core` both off: a **new, different** failure —
+`415 Incorrect content type, was  but should be application/json` from
+Fireworks' own server. This is real progress in itself: unlike the
+old client-side `undefined is not a function` (which happened *before*
+any request left the process, per the thirty-seventh round), this is
+an actual HTTP response from a real server, meaning the request now
+gets far enough to leave the process and reach the network — the
+`#234` fixes and/or the `#232`-adjacent `.mjs` fix moved something
+forward, even though this specific run wasn't set up to isolate which.
+
+Traced the 415 directly rather than guessing: wrote a minimal `fetch()`
+repro sending `Content-Type` via a real `new Headers()` object (not a
+plain object literal) to `httpbin.org`'s echo endpoint - dropped,
+deterministically, every time. Read `pkg/builtins/fetch_init.go`
+(read-only): `createHeadersObject` builds a `Headers` instance whose
+*only* own properties are its methods (`get`/`set`/`append`/etc, all
+`SetOwnNonEnumerable`) - the actual header data lives entirely in
+Go-side closure state, never exposed as an own enumerable JS property.
+But `doFetchRequestWithContext`'s header-extraction only knows how to
+read a plain object's `OwnKeys()`. So `new Headers()` - the constructor
+initializer, `.set()`, `.append()`, all of it - silently loses every
+header, 100% of the time; a bare object literal passed as `headers`
+works fine, which is exactly why this is easy to miss with casual
+testing and only bites once real code goes through the spec-correct
+`Headers` API - which the `openai` npm SDK dependency does internally
+(`buildHeaders()` in its own `internal/headers.js`), explaining the
+415 exactly. Filed
+[paserati#237](https://github.com/nooga/paserati/issues/237) with the
+precise mechanism and a suggested fix location.
+
+While isolating that repro, hit a second, unrelated symptom: a plain
+single `fetch()` with no custom headers at all intermittently
+(~1-in-15 across repeated runs) failed with `"Top-level await: promise
+remains pending with no microtasks to process"` - something real Node
+never did across the same repeated testing. Rather than file "flaky",
+traced the mechanism: `fetch()`'s success path resolves the returned
+promise from one goroutine (`fetchFn`'s own, once
+`doFetchRequestWithContext` returns) while a *separate* goroutine (the
+body-drain goroutine `doFetchRequestWithContext` spawns internally)
+independently decrements the `BeginExternalOp`/`EndExternalOp` counter
+the top-level-await drain loop in `vm.go` watches - and nothing
+orders these two relative to each other. For a small/fast body (like
+httpbin's tiny JSON), the body-drain goroutine can finish and zero the
+counter before the other goroutine gets scheduled to actually resolve
+the promise, so the drain loop can observe "no pending external ops"
+and "still pending" in the same instant and falsely declare deadlock.
+Corroborated rather than just asserted: built with `-race` (which
+perturbs scheduling and tends to widen real ordering races), the exact
+same single-fetch repro went from ~1-in-15 to failing on essentially
+every run - and no `WARNING: DATA RACE` was printed, meaning this is a
+genuine unsynchronized-ordering bug between two goroutines rather than
+a raw memory-safety issue (`-race` would have caught that separately).
+Filed [paserati#238](https://github.com/nooga/paserati/issues/238)
+with the traced mechanism, the `-race` corroboration, and an honest
+caveat that no actual interleaving was captured to prove it outright.
+
+**Net effect**: the Fireworks connection did what it was for - it
+replaced "is my stub correct" with "what does a real backend actually
+see," and that surfaced two real, previously-invisible `fetch()` bugs
+that a stub (or manual testing with plain object header literals, the
+easy path) would never have caught, plus fixed a real misconfiguration
+in the user's own `models.json`. `pi-ai`'s CLI path is still blocked,
+now on `#237` specifically for anything that builds requests via the
+standard `Headers` API - which is most real HTTP client code,
+including the SDK pi-ai itself depends on. No fakes deleted, no
+noderati code changes.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
