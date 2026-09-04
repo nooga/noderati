@@ -4668,6 +4668,116 @@ scrollback each time - flagging plainly rather than treating "the file
 is gone" as the fix. Worth rotating that key if this transcript is
 ever shared or retained beyond this machine.
 
+**Forty-seventh round (2026-09-05) — verified `#246`/`#247` fixed, hit
+the pi-ai+pi-agent-core pair working end-to-end for the first time,
+found a noderati gap and a new engine bug along the way.** User
+reported `#246`/`#247` plus "some other fixes" merged to paserati
+main. Pulled: three new commits landed, not one -
+`64b7e5e5` (`#246`), and for `#247` a trio - `88712482` (the actual
+fix: stop a suspended generator/async closure's captured local from
+aliasing whatever reuses its freed register-stack slot), plus two
+follow-ups the paserati team found while fixing it -`64703c62`
+(spill slots weren't restored across a suspend/resume, same bug class
+as `#247` but for spilled locals instead of register-backed ones) and
+`393f229b` (a suspended-frame-reuse path left stale open-upvalue
+chains, discovered chasing what first looked like a timer-ordering bug
+and turned out to be the same root issue). Re-verified against the
+exact original repros rather than trusting "merged" - `#246`'s bare
+`hasOwnProperty`/`toString`/etc. repro, `#247`'s filed 53-line minimal
+repro (the `undefined` case), and the larger `"symbol"`-producing
+program from this session's correction comment - all three clean, the
+`#247` ones 3/3 runs. `#247` still shows OPEN on GitHub despite the
+fix commit landing - noting the label mismatch rather than assuming
+it means anything.
+
+**The headline result**: ran the real pi CLI's actual print-mode path
+against a real Fireworks endpoint
+(`--provider fireworks --model accounts/fireworks/models/glm-5p2
+--no-session -p "..."`) with `NODERATI_DISABLE_FAKES=pi-ai,pi-agent-core`
+- the exact command that's been failing with `getContentIndex`'s
+`undefined is not a function` since the Forty-third round. It now
+returns the correct completion, 3/3 runs, both for a single-word
+reply and a multi-line one. This is the first time the coupled
+pi-ai/pi-agent-core pair has worked end-to-end against a real backend.
+The scoreboard's own `fake-off:pi-ai+pi-agent-core` row still shows
+`print[DIFF]` - that's *not* a remaining bug, it's the scoreboard's
+`-p "hello"` invocation dialing a local stub at `127.0.0.1:1234` with
+nothing listening, same as `baseline` does; the failure text differs
+(`Connection error.` vs. baseline's `dial tcp ... connection refused`)
+only because the real `pi-ai` HTTP client reports a closed connection
+differently than whatever baseline's fake path reports - it's an
+artifact of the scoreboard's fixed unreachable test target, not
+evidence of anything wrong. `version[=]`/`help[=]` already matched
+baseline cleanly. Recording this explicitly so a future reader doesn't
+mistake `print[DIFF]` here for a regression.
+
+**jiti**: re-tested with `#246`'s fix in place. Moved past `babel.cjs`
+and `jiti.cjs`'s own register-exhaustion class of bugs entirely (both
+already confirmed fixed in earlier rounds) into a brand new failure:
+`--version` with `fake-off:jiti` now panics inside `debug`'s (an
+npm package jiti bundles) Node backend with `undefined is not a
+function`. Traced it by hand through the bundled, minified
+`debug@4.4.3/src/node.js` module body to `t.destroy=s.deprecate(...)`
+- called unconditionally at module-load time - where `s` is
+`require("util")`. Two real noderati gaps: `util.deprecate` and
+`util.formatWithOptions` didn't exist in `internal/host/util.go` at
+all. Implemented both properly (not stubs): `deprecate(fn, msg)`
+returns a wrapper that still calls `fn` and stays callable (no
+warning emitted - this host has no `process.emitWarning`/`warning`
+event machinery for a caller to suppress or listen to, and printing
+an ad-hoc line on first call would just be surprise stderr output
+mid-run for whoever happens to trigger it first, e.g. `debug`'s own
+`destroy()` on teardown); `formatWithOptions`/`format` now share a
+real `%s/%d/%i/%f/%j/%o/%O/%%`-directive implementation instead of
+just space-joining args (verified: directives substitute correctly,
+leftover args append, zero-vararg call doesn't crash). Caught and
+fixed one self-inflicted bug before committing: an initial draft of
+`deprecate` dropped the unused `msg string` parameter from its Go
+signature entirely, which panicked with "reflect: Call with too many
+input arguments" the moment `debug` called it with both arguments -
+paserati's native-module reflection binding has no arity tolerance,
+so a Go function's parameter count must exactly match every call site
+in practice, not just the ones that use every parameter.
+
+With that fixed, hit the *next* failure past `debug` cleanly: a raw Go
+panic, "value is not a float", inside `tty.isatty(process.stderr.fd)`
+- a completely ordinary call `debug`'s node.js backend makes to decide
+whether to color its output. Root-caused precisely and standalone
+(`tty.isatty(process.stderr.fd)` alone reproduces it, no jiti/babel
+involved): `pkg/driver/native_module.go`'s `vmValueToReflectValue`
+converts a `vm.Value` argument into a Go native-module function's
+`float64`/`float32`/`int`/`int64` parameter by calling `.AsFloat()`
+whenever `vmVal.IsNumber()` is true - but `IsNumber()` covers *both*
+of paserati's internal number representations
+(`TypeFloatNumber` and `TypeIntegerNumber`), while `.AsFloat()` is a
+raw accessor that panics on anything but `TypeFloatNumber`.
+`process.stderr.fd` is set via `vm.IntegerValue(...)` in
+`internal/host/process.go` - an entirely ordinary host-side value,
+indistinguishable from any other JS number at the JS level. The
+engine already has the right general conversion for this
+(`Value.ToFloat()`, which every one of paserati's own builtins that
+needs a number - e.g. `Math.abs` - goes through via `VM.ToNumber`);
+`vmValueToReflectValue` just reaches for the wrong one in three
+identical spots. Filed as
+[paserati#252](https://github.com/nooga/paserati/issues/252) with the
+standalone repro, the exact three call sites, and the one-line fix
+(`.AsFloat()` → `.ToFloat()`, no signature changes needed). Posted a
+follow-up correction after advisor caught that the issue's Impact
+section overclaimed string `.length` as a second reachable path -
+checked directly, it isn't (that `IntegerValue` use in `vm.go:17825`
+is in a narrower path than plain string `.length` reads); narrowed the
+issue to what's actually confirmed (`process.stdout/stderr.fd` and,
+by construction, any other host-set `IntegerValue` property).
+
+jiti's fake stays blocked - now on `#252`, a fresh, precisely-scoped
+engine bug rather than any of the six prior blockers. Committed
+`internal/host/util.go`'s two new real implementations (build, vet,
+`go test ./internal/host/...` all clean) - no fakes deleted this
+round; the pi-ai/pi-agent-core pair's real-network verification is
+strong enough that deleting `fake-off:pi-ai`/`fake-off:pi-agent-core`
+looks like the obvious next step, but that's a call to make explicitly
+next round, not fold into a check-in-progress-fixes round.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
