@@ -5635,6 +5635,90 @@ freshly-`npm pack`'ed tarball. `go build`/`go vet`/`go test -count=1
 ./...` and the scoreboard all clean; no noderati source changed this
 round.
 
+**Fifty-sixth round (2026-09-05, same day) — kept digging on the
+`Generator`-argument divergence per user request, found the actual
+signature (paserati's own native `.next` implementation leaking into a
+`yield` result as a value), and filed it without a minimal repro -
+the maintainer has the VM source to grep for what's actually leaking;
+this session doesn't.** User asked to keep digging and file with
+paserati if anything was needed from it.
+
+Confirmed, before anything else, that the earlier round's "the
+`#13`/`#25` generator-as-argument calls might be harmless" reasoning
+was wrong: counted every `.next()` call across a full real-Node run
+(1246 total) and found **zero** function-typed and **zero**
+generator-typed arguments anywhere in it. Real Node computes nothing
+divergent at those points at all - so whatever noderati computes there
+is evidence of a wrong computation even where its immediate effect
+happens to be masked by spec-mandated first-call argument discarding.
+Corrects this round's own earlier framing, caught within the round
+rather than left standing.
+
+Tagged the two most-likely candidate generators directly in real
+babel.cjs (backup/restore/diff-confirmed against a fresh `npm pack`
+tarball each time, as established) - `mergeChainOpts`'s own instance,
+and the plugins/presets loader-thunk results it calls via `yield*r()`/
+`yield*n()` - neither carried the tag when the divergence fired,
+ruling both out as the self-passing generator's identity. Traced the
+call stack for the actual failing generator's first-ever invocation in
+full instead: six-plus frames deep, nested inside two separate
+`evaluateSync` calls with `mergeChainOpts` between them but no other
+named frame - consistent with `@babel/core`'s real caching machinery
+(`makeCachedFunction`/`onFirstPause`, read in round 53) but not
+confirmed by tagging alone.
+
+Formed and tested four more specific hypotheses, all measured directly,
+all ruled out: `yield*` resume-value forwarding through 7 levels of
+nesting (not just 3, tested last round) - correct; multiple distinct
+`buildOperation`-protocol leaf operations called sequentially (not
+nested) from one enclosing generator, mirroring `makeCachedFunction`'s
+own multi-step body - correct; `isAsync` invoked via `yield*` (the
+exact real call shape) - correct, confirming #265's fix holds under
+real usage, not just its own `.sync()`-based repro; and the `async`/
+`errback` variants of #265's exact bug shape (a function stored as an
+object-literal property whose key matches a closed-over outer variable
+name, using those two property names instead of `sync`) - both correct,
+confirming #265's fix is general rather than narrowly special-cased.
+
+Reapplied the technique that found #265: patched gensync's one shared
+`buildOperation` generator body (the `const n=yield t; if(!n){...}`
+line every gensync operation compiles to) to print the value whenever
+`n` ("resume") comes back truthy - which should be structurally
+impossible under a pure synchronous drive, since gensync's own
+`evaluateSync` loop never sends a value into `.next()` at all. It
+printed `function function next() { [native code] }` - **paserati's
+own native `Generator.prototype.next` implementation**, an internal
+engine value no JS code anywhere in this chain could have supplied.
+This is what makes the operation wrongly take gensync's async branch
+under a sync-only transform, which is what produces the function-typed
+`.next()` arguments observed at calls #62/#69-73 (gensync's own
+`evaluateAsync` legitimately passes resume *callbacks*, just never
+under a working `.sync()` drive) and ultimately the `incompatible
+receiver` crash itself.
+
+Filed as
+[paserati#267](https://github.com/nooga/paserati/issues/267) without a
+standalone repro - explicit per-advisor guidance and the user's own
+"file if anything is needed" framing this round, after eight total
+reconstruction attempts (this round and last) failed to reproduce it
+outside the real pipeline, several at patterns already measured to
+work. The issue leads with the strongest evidence (the 1246-call
+zero/zero real-Node count vs. noderati's divergence profile), gives the
+exact instrumentation applied to reproduce the native-`next` signature
+against real jiti/babel, lists every ruled-out mechanism from this
+round and the last, and states plainly that the exact structural
+trigger is unidentified - a measured symptom report, not a guess,
+handed to the person with VM-source-level grep access instead of
+attempting a ninth hand-reconstruction.
+
+**Status**: no noderati source changed this round - all investigation,
+instrumentation, and filing on the paserati side. Sixth real bug filed
+against this one pipeline (#256, #258, #260, #262, #263, #265 already
+fixed; #267 newly filed). No successful jiti transform has been
+observed at any point across this entire multi-round investigation.
+Both `babel.cjs` and `jiti.cjs` confirmed clean against a freshly-`npm
+pack`'ed tarball before finishing.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
