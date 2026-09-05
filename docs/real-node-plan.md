@@ -5555,6 +5555,86 @@ investigation. Both `babel.cjs` and `jiti.cjs` confirmed clean against
 a freshly-`npm pack`'ed tarball before finishing. `go build`/`go
 vet`/`go test -count=1 ./...` and the scoreboard all clean.
 
+**Fifty-fifth round (2026-09-05, same day) — pulled #265's fix
+(`2aa36815`), verified it against both filed repros, confirmed
+(measured, not assumed) that it does *not* clear the pipeline - the
+"implicated, not sole cause" hedge in #265's own filing turned out to
+be right - and narrowed the remaining divergence further without yet
+finding its root cause.** User asked to continue after the merge.
+
+Pulled `2aa36815` ("fix(compiler): don't self-bind an inferred function
+name over a same-named outer variable"). Re-verified against both of
+#265's repro variants (the fast-crashing generator-driven one and the
+tail-position one that hangs rather than crashing - confirmed the
+tail-position case now returns `42` cleanly too, no hang) plus
+regression-checked #256/#258/#260/#262/#263 - all clean.
+
+Re-ran jiti's real pipeline: **same crash, same call site**
+(`TypeError: Method Generator.prototype.next called on incompatible
+receiver`, inside `loadPluginDescriptor`). Re-ran the call-count/
+argument-type diff from round 54 to confirm this precisely rather than
+assume it: identical divergence profile as before #265's fix - argument
+type differs from real Node's `undefined` at calls #13 and #25 (now
+confirmed via direct inspection to be an actual `Generator` object,
+`String(v) === "[object Generator]"`, not just "some non-undefined
+object"), and at calls #62 and #69-73 (a `function`, consistent with
+`evaluateAsync`'s resume-callback pattern - unexplained why that driver
+would be active at all under a pure `transformSync` call; noted, not
+chased further this round). #265's fix genuinely fixed a real,
+distinct bug (verified independently against its own repros) but,
+exactly as its filing hedged, doesn't touch this call site.
+
+Checked one loose thread from round 54's `[SEQ]` output repeating
+several times with counters resetting: instrumented babel.cjs's own
+`transform()` entry point (backup/restore/diff-confirmed against a
+fresh `npm pack`'ed tarball, as established) to count real invocations
+- it's called exactly once per file under noderati (matching real
+Node's count of one call per file, two files total) - the repeated
+`[SEQ]` bursts were an artifact of the diagnostic harness itself, not a
+retry loop in babel/jiti. Ruled out cleanly rather than left as an open
+question.
+
+Formed and tested the most direct hypothesis for the `Generator`-as-
+`.next()`-argument divergence: since neither of gensync's own two
+drivers could produce it (`evaluateSync` passes no argument at all;
+`evaluateAsync` passes a resume *function*, matching calls #62/#69-73
+separately), the remaining candidate is paserati's own `yield*`
+implementation forwarding the wrong value when delegating a resume
+value into a nested delegate. Tested directly and cleanly, no
+gensync/babel involved: a three-level `yield*` chain
+(`outer` → `mid` → `inner`), driven with explicit resume values
+(`it.next("SENT-1")`, `it.next("SENT-2")`) rather than the no-argument
+driving every previous round's `yield*` tests used (which is exactly
+why none of them exercised this path) - resume values forward correctly
+through all three levels, matching real Node exactly. This specific,
+well-targeted hypothesis is ruled out; the actual mechanism producing a
+`Generator` object as a `.next()` argument at calls #13/#25 remains
+unidentified. Three attempts this round to hand-construct the exact
+compound gensync shape at that call site (nested `yield*` through a
+cache-wrapping layer, mirroring `makeCachedFunction`'s
+`isIterableIterator`/`onFirstPause` structure read in round 53) failed
+to reproduce - one of the three attempts turned out to be an invalid
+construction (failed identically in real Node, not a real repro at
+all) rather than a genuine negative result, a mistake caught before it
+was treated as evidence.
+
+**Status**: #265 verified fixed and confirmed (not assumed) not to be
+the pipeline's remaining blocker. The divergence is now precisely
+characterized - two distinct symptom clusters (a `Generator` object
+appearing as a `.next()` argument at calls #13/#25; a resume-style
+`function` appearing at #62/#69-73, real Node passes `undefined` at
+every one of these) - but neither has a confirmed root cause or a
+minimal repro yet; the most direct standalone hypothesis for the first
+cluster was tested and ruled out. Not filed - a symptom without a
+located mechanism isn't yet actionable the way #256/#258/#260/#262/
+#263/#265 were, each of which had a precise, minimal, hand-verified
+trigger before filing. This pipeline is now five real paserati bugs
+deep (all fixed upstream) with no successful transform observed at any
+point. Both `babel.cjs` and `jiti.cjs` confirmed clean against a
+freshly-`npm pack`'ed tarball. `go build`/`go vet`/`go test -count=1
+./...` and the scoreboard all clean; no noderati source changed this
+round.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
