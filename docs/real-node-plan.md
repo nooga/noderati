@@ -5104,6 +5104,24 @@ test needs both `fsCache: false` *and* `rm -rf` on `$TMPDIR/jiti` /
 `$TMPDIR/node-jiti` beforehand, or a prior real-Node run (or even a
 prior noderati run) can silently make a broken path look like it works.
 
+**A second correction, found next round**: this round's "restored
+babel.cjs cleanly (diff-confirmed)" claim was also false - the
+`[DBG]`-prefixed print statements from this round's bisection were
+still present in the real, installed
+`.../jiti/dist/babel.cjs` at the start of the *next* round, meaning
+every real-Node baseline and every noderati run in this round actually
+ran against a modified file, not the pristine package. The backup this
+round relied on (`/tmp/gensync_dig/babel.cjs.orig`) was itself deleted
+as part of this round's own end-of-round temp-file cleanup, so there
+was no way to re-verify the restore after the fact - the "diff-
+confirmed" claim was checked once, immediately after the patch/restore
+cycle, and then silently didn't survive to the next session. This is a
+second, independent contamination source alongside `fsCache` above -
+not a duplicate of it. Fixed going forward (see next round): verify a
+restored real npm file against `npm pack <name>@<version>` output
+extracted fresh, not only a `/tmp` backup that a later cleanup step can
+delete out from under the claim.
+
 **Fifty-first round (2026-09-05, same day) — root-caused the "gensync
 bug" precisely: it isn't gensync's, it's paserati's compiler, and it's
 not the sixth blocker, it's the *only* one. Filed as paserati#256.**
@@ -5204,6 +5222,99 @@ root-causing and issue-filing only). jiti's fake stays not-deletable,
 now blocked on a single, precisely-identified, filed upstream compiler
 bug (#256) instead of a vague "gensync" symptom. Re-testing jiti's full
 pipeline is pending #256 landing upstream - not attempted yet.
+
+**Fifty-second round (2026-09-05, same day) — pulled paserati main with
+#256's fix merged, verified it, verified #258 (a sibling bug filed by
+the paserati maintainer while fixing #256), then found and filed a
+second, distinct this-binding bug one call site further into jiti's
+real pipeline: paserati#260.** User asked to pull latest paserati main
+and resume.
+
+`git pull` hit a `cannot lock ref 'refs/remotes/origin/main'` race (the
+paserati repo is concurrently edited by its own maintainer/agent in the
+same shared checkout - expected per this doc's standing note); a retry
+a few seconds later succeeded cleanly. Fast-forwarded to `5c9d39a1`,
+three commits ahead of the `8599a674` this doc's ledger last recorded:
+`250d7de6` (fix: thread `this` through `obj?.[expr](...)` continuations
+- turned out to be the fix for paserati#258, filed by the maintainer
+while working on #256), `e89ae9db` (fix: handle spread args in
+optional-chain call continuations - #256's actual fix), `5c9d39a1`
+(a doc/comment fixup). `go build`/`go vet` clean on both repos.
+
+Re-verified **#256 fixed**, precisely, against both original repro
+variants plus every control from the filing: `obj?.push(...arr)` (was:
+silent full-script abort) now prints `pushed [1, 2, 3]` / `done`,
+matching real Node exactly; the `obj = null` variant (was: `Unknown
+opcode 255` crash) now evaluates to `undefined` with no crash, also
+matching real Node exactly; all four controls (`obj.push?.(...arr)`,
+`obj?.push(1,2,3)`, `obj?.["push"](...arr)`, `f?.(...arr)`) still work.
+
+Re-verified **#258 fixed** (found by the maintainer, not filed by this
+investigation, but load-bearing for jiti so re-checked directly rather
+than trusted from the "CLOSED" label alone): `o?.["m"](5)` now returns
+`12` with the correct `this`, matching `o?.m(5)`'s already-correct
+result.
+
+With both confirmed, re-ran jiti's real transform pipeline (import
+shape, `fsCache: false`, cache dirs cleared first) against a fresh
+two-file `.ts` extension (interface, enum, private class field,
+async/await) - the interface/enum/class/async transform itself now
+succeeds and produces correct output (previously round 50/51's target
+never got this far). It then hit a **new, distinct crash**:
+`TypeError: String.prototype.replace called on null or undefined`
+inside babel's bundled error-formatting code
+(`e.code?.replace("BABEL_","").replace(...)`, used to sanitize a Babel
+error's code/message for jiti's own error-reporting path). Re-patched
+`babel.cjs` with one line of debug printing (backup taken *and this
+time cross-checked against a freshly-`npm pack`'ed `jiti@2.7.0` tarball,
+not only the `/tmp` backup - see the correction on round 51's entry
+above) to confirm the real error being formatted was itself a genuine
+`GENSYNC_EXPECTED_START` gensync error with a well-formed `.message`
+and `.code` - ruling out a "the thrown error object is malformed" theory
+before restoring the file (diff-confirmed against the `npm pack` output
+this time, not just the deleted `/tmp` copy).
+
+Minimized outside jiti/babel entirely: `e.code?.replace("a","").replace
+("b","c")` (no spread, no bracket access - both already-fixed shapes)
+throws the same TypeError under paserati, prints the correct string
+under real Node. Built a `this`-tracing repro
+(`makeChainable`/`.next().next()`) to see *why*: the **first** chained
+call after an optional-chain continuation gets the correct `this`
+(confirmed: `this===obj? true`), the **second** call chained onto the
+first call's result does not (`this===obj? false`, silently becomes a
+plain function call) - and separately confirmed the same loss happens
+whether the continuation starts via dot-access or via `?.[...]`
+(#258's shape), so this is a different bug from both #256 (spread) and
+#258 (bracket-form *first* call), at the same fix site
+(`compileOptionalContinuationWithReceiver`) but a different call depth.
+Root-caused by reading the current `pkg/compiler/compile_expression.go`
+directly: the function's single `receiverReg` parameter, threaded
+unchanged through every recursive call, is only ever used to set `this`
+when `node.Function == nil` (`isFirstCall`) - any *later* call in the
+same continuation, whose `Function` is itself a `MemberExpression`
+wrapping an earlier call's result, computes the right object register
+internally (`objReg`, in the `MemberExpression` case) but never surfaces
+it back up as a receiver, so the enclosing `CallExpression` falls
+through to a plain, receiver-less call.
+
+Filed as
+[paserati#260](https://github.com/nooga/paserati/issues/260), with
+both repros (a `this`-tracing method-chain and the minimal
+`.replace().replace()` case), the bracket-form cross-product test, the
+explicit "not #256/#258" distinction (both original repros re-verified
+against current `main` before filing), the exact root-cause walkthrough
+of the compiler's recursive receiver handling, and a suggested fix
+(compile a non-first call's `MemberExpression`/`IndexExpression`
+`Function` sub-expression as its own object+property pair and use that
+call's own object register as its receiver, independent of
+`isFirstCall`/the outer `receiverReg`).
+
+**Status**: no noderati source changed this round. jiti's fake stays
+not-deletable - one confirmed blocker down (#256), one sibling bug
+independently found and fixed by the maintainer (#258), one new
+blocker filed (#260) one call site further into the same real pipeline.
+Re-testing the full jiti pipeline remains pending #260 (and anything
+past it) landing upstream - not attempted past this point this round.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
