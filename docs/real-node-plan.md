@@ -4979,6 +4979,110 @@ rather than guessing how many more remain. jiti's fake stays exactly
 where it was: not deletable, and the scoreboard's all-clean row is a
 known, documented blind spot, not evidence to the contrary.
 
+**Fiftieth round (2026-09-05, same day) — picked up the
+`eval_evalModule` crash: root-caused and fixed two more real gaps,
+jiti's self-contained transform path now genuinely works, but an
+extension that imports anything still fails, six blockers deep.**
+User asked to pick up where the last round stopped.
+
+Root-caused `undefined is not a constructor`: jiti's own module-loading
+core does `new Be.Module(c)` (`Be = require("module")`) to build a bare
+module record for a freshly transformed file. Real Node's
+`require("module")` IS the `Module` constructor itself
+(`Module.Module === Module`, self-referencing), with
+`builtinModules`/`_nodeModulePaths`/`createRequire` as static
+properties directly on it - confirmed field-by-field against real
+Node (`new Module(id)` gives `id`, `path` (`dirname(id)`), `exports:
+{}`, `filename: null`, `loaded: false`, `children: []`). noderati's
+`module` shim was a plain namespace object holding those three as
+named exports, not a constructable class. Rewrote
+`internal/host/module.go` as a real `class Module` matching the shape
+exactly, with the three statics attached directly on it. First
+cross-builtin import among noderati's own shims (`module` importing
+`path` for `dirname`) - noted as safe today (no cycle back) but worth
+knowing about.
+
+That cleared into "reflect: Call with too many input arguments" from
+`vm.runInThisContext(code, {filename, lineOffset, displayErrors})` -
+jiti passes real Node's actual optional options argument, which
+paserati's native-module reflection binding (zero arity tolerance,
+same class of bug as `util.deprecate` two rounds ago) doesn't accept a
+slot for. Added tolerant (accepted, ignored - matching this file's own
+already-documented "no Script constructor options" scope) trailing
+options parameters to `createContext`/`runInThisContext`/
+`runInContext`/`runInNewContext` and the `Script` class's constructor
+and three `run*()` methods.
+
+With both fixed: **jiti's actual transform-and-load path now works**.
+A real `.ts` extension file (interface, enum, default export) and a
+second, more complex one (private class field, async/await, a real
+`setTimeout`-based await) both loaded via jiti's real API - both entry
+points that matter (`jiti-static.mjs`, the one pi's own `loader.js`
+actually imports, and plain `jiti.mjs`) - produced output identical to
+real Node, 3/3 runs, both shapes. First time jiti's *actual job* (not
+just its import graph) has been verified working.
+
+Per advisor: neither test extension imported anything from inside the
+transformed file, and every real pi extension does exactly that -
+tested the discriminating case directly (one bare specifier, one
+relative file). Hit a real `undefined is not a constructor` again, one
+layer up: `new URL(relativeSpec, parentFileURL)` - real Node's optional
+second `base` argument for resolving a relative URL, which
+`internal/host/url.go`'s `newJSURL` didn't accept at all (one
+parameter only). Implemented it via Go's `url.URL.ResolveReference`
+(RFC 3986 relative resolution - not WHATWG-exact, but every real
+base+relative-path combination found so far doesn't need the
+difference, same disclosure style as the file's existing "no live
+setters" scope note - `jsURL` is still a construction-time snapshot,
+`base` resolution included, not a live-recomputing URL). Verified
+against real Node: resolving a sibling path, a parent-directory path,
+the absolute-no-base case, and the correct-throw-on-truly-relative
+case all match exactly.
+
+That cleared into a sixth blocker, this one **located but not
+root-caused**: transforming the *imported* file (not the entry file)
+throws inside babel's own `gensync`-based `transformSync` -
+`Error: Got unexpected yielded value in gensync generator: undefined.
+Did you perhaps mean to use 'yield*' instead of 'yield'?`. Traced via
+the same backup/patch/test/restore methodology used all session:
+splitting a fused conditional expression
+(`r.babel&&Array.isArray(r.babel.plugins)&&...`) into separate
+statements with prints between them changed the *visible* symptom from
+`TypeError: Cannot read property 'error' of undefined` to this gensync
+error - meaning the `.error of undefined` was a downstream mask, not a
+separate bug, and gensync's `${JSON.stringify(e)}` in its own error
+message renders as `"undefined"` for a wrong *Symbol* too (symbols
+aren't JSON-serializable in real Node either), so the literal word
+"undefined" in the message doesn't mean the yielded value actually was
+JS `undefined`.
+
+Formed and disproved two hypotheses rather than guessing which one is
+right: (1) a blanket generator/yield-value bug - built a minimal
+gensync-shaped repro (a real `Symbol.for` start-sentinel, a real
+`function*` yielding it, driven by the same `evaluateSync` loop
+gensync itself uses) outside jiti/babel entirely; matches real Node
+exactly, no bug found. (2) a `Symbol.for` registry split across
+nested/recursive call contexts (jiti's recursive `createJiti` call for
+an imported file looked like it could do this) - tested `Symbol.for`
+identity across a nested function call, across a `yield`, and across a
+real `await`; all three match real Node exactly. Both ruled out
+empirically, not by inspection. What's left is somewhere inside
+`@babel/core`'s own, more complex nested gensync chains (config
+loading/plugin resolution for a *second*, freshly-encountered file) -
+not reproducible standalone, so not filed; recorded here as
+located-not-root-caused with the four things ruled out, for whoever
+picks this up next (including a future round of this same
+investigation).
+
+**Status**: jiti's transform path genuinely splits in two now - a
+self-contained `.ts` extension (no imports) works correctly, verified
+two shapes/two entry points/3-for-3; an extension that imports
+anything (the shape every real pi extension actually has) still fails,
+now inside babel's own gensync machinery rather than any host gap.
+jiti's fake stays not-deletable. `go build`/`go vet`/`go test -count=1
+./...` and the scoreboard all clean; only `internal/host/url.go`'s fix
+was uncommitted mid-investigation, committed with this entry.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

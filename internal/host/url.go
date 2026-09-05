@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/nooga/paserati/pkg/driver"
+	"github.com/nooga/paserati/pkg/vm"
 	"golang.org/x/net/idna"
 )
 
@@ -53,10 +54,35 @@ func (u *jsURL) ToJSON() string   { return u.Href }
 // an scp-style-URL correction path. Go's net/url.Parse is far more
 // permissive than WHATWG and rarely errors on its own; the empty-scheme
 // check is what makes this throw where it needs to.
-func newJSURL(href string) (*jsURL, error) {
-	parsed, err := url.Parse(href)
-	if err != nil {
-		return nil, fmt.Errorf("Invalid URL: %s", href)
+//
+// The optional `base` second argument (real `new URL(href, base)`) is
+// what makes a *relative* href resolve instead of hard-erroring — needed
+// for e.g. an ESM loader resolving "./helper.ts" against a parent file's
+// URL, found via jiti's own relative-import resolution (see
+// docs/real-node-plan.md's round 50 entry). Resolved via Go's
+// url.URL.ResolveReference, which implements RFC 3986 relative
+// resolution — the same rule WHATWG's URL spec's relative-resolution
+// step is built on, close enough for every real base+relative-path
+// combination found so far (no dot-segment/scheme-relative edge case
+// yet needed a WHATWG-exact implementation).
+func newJSURL(href string, base vm.Value) (*jsURL, error) {
+	var parsed *url.URL
+	var err error
+	if base.IsString() && base.AsString() != "" {
+		baseURL, berr := url.Parse(base.AsString())
+		if berr != nil || baseURL.Scheme == "" {
+			return nil, fmt.Errorf("Invalid base URL: %s", base.AsString())
+		}
+		ref, rerr := url.Parse(href)
+		if rerr != nil {
+			return nil, fmt.Errorf("Invalid URL: %s", href)
+		}
+		parsed = baseURL.ResolveReference(ref)
+	} else {
+		parsed, err = url.Parse(href)
+		if err != nil {
+			return nil, fmt.Errorf("Invalid URL: %s", href)
+		}
 	}
 	if parsed.Scheme == "" {
 		return nil, fmt.Errorf("Invalid URL: %s", href)
