@@ -5719,6 +5719,88 @@ observed at any point across this entire multi-round investigation.
 Both `babel.cjs` and `jiti.cjs` confirmed clean against a freshly-`npm
 pack`'ed tarball before finishing.
 
+**Fifty-seventh round (2026-09-05, same day) — pulled #267's fix
+(`9a66741f`, a register-contiguity bug in `yield*`/error-throw argument
+allocation - exactly the mechanism this doc's round 56 entry
+described, root-caused by the maintainer directly), verified it,
+confirmed the pipeline advances rather than loops, and root-caused +
+filed a seventh bug at the new failure point.** User asked to pull
+latest paserati main and continue.
+
+Pulled `8f5e5e04` (four commits past round 56's last-recorded
+`2aa36815`: `9a66741f` fixes #267 - "OpCallMethod/OpCall read their
+arguments from funcReg+1 onwards... the yield* lowering allocated them
+with two separate Alloc() calls and assumed adjacency... once earlier
+statements in the generator had freed registers in a non-contiguous
+pattern the two were no longer neighbours and iterator.next() received
+whatever stale value happened to live at nextMethodReg+1 - in babel's
+gensync pipeline that was the freshly loaded native next method
+itself"; plus `2f590bb6` adding type annotations on catch clause
+bindings, incidentally fixing the `catch (e: any)` parser gap hit
+several times this investigation; plus a docs commit). `go build`/`go
+vet` clean on both repos.
+
+Re-ran jiti's real transform pipeline: the `GENSYNC`/`incompatible
+receiver` crash is gone, replaced by a **new, different** crash -
+`TypeError: [BABEL] /: undefined is not a constructor` - confirming
+#267's fix genuinely moved the pipeline forward rather than looping on
+a masked version of the same bug. Traced with the same babel.cjs
+instrumentation technique used throughout this investigation (backup/
+patch/restore, diff-confirmed against a fresh `npm pack` tarball) to
+`loadPluginDescriptor`'s own `new o.default(c,t,s,i)` call site, one
+line further into the exact function the previous six bugs on this
+pipeline all led into.
+
+Read `@babel/core`'s bundled source around that call site: a sibling
+generator (`makeWeakCache`-wrapped, feeding `loadPluginDescriptor`) has
+a conditional block (`if(c.inherits){ const o = yield*forwardAsync(...);
+...}`) declaring a block-scoped `const o`, with `new o.default(...)`
+later in the *same* generator intending to reference an outer,
+module-level `o` (an imported `Plugin` class) - not the block-scoped
+one. Minimized to two small, `yield`-free repros entirely outside
+jiti/babel/gensync: a generator with an `if` block (condition false,
+block never runs) declaring a `const` that shadows an enclosing
+function's variable of the same name, and later returning
+`new o(...)` - `undefined is not a constructor` under paserati, correct
+under real Node; and a bare-block (no `if`, no condition) variant -
+`object is not a constructor` (the block *did* run this time, so `o`
+resolves to the shadow's value instead of being left uninitialized -
+same underlying shared-binding bug, different symptom depending on
+whether the block executed). Confirmed generator-specific (the
+identical structure with a plain function reads correctly) and
+independent of any `yield`/suspend behavior (neither repro yields at
+all).
+
+Read paserati#262's actual fix commit (`be20f91d`) directly rather than
+inferring the root cause from behavior alone: its own commit message
+explains a generator body is compiled via a hand-rolled statement loop
+that bypasses the normal `BlockStatement` "pass 0" pre-registration
+step for `let`/`const` names, and the fix added exactly that
+pre-registration - but only for the generator body's own **direct,
+top-level** statements (the `for _, stmt := range remainingStmts`
+loop in `pkg/compiler/compile_literal.go`, switching on
+`*parser.LetStatement`/`*parser.ConstStatement`/the two destructuring
+declaration types). It doesn't recurse into nested block-bearing
+statements (`*parser.IfStatement`, bare `*parser.BlockStatement`) to
+predefine names declared inside them - confirming, not just inferring,
+that this is a precise sibling gap in #262's own fix, one block level
+deeper than what it covered.
+
+Filed as
+[paserati#271](https://github.com/nooga/paserati/issues/271), with
+both repros, the generator-specific/yield-independent narrowing, the
+confirmed (not inferred) root cause read directly from #262's fix
+commit, and the real-pipeline context - the seventh distinct bug found
+on this one pipeline (#256/#258/#260/#262/#263/#265/#267 all already
+fixed), each one leading directly into the next rather than the
+pipeline looping on a single masked failure.
+
+**Status**: no noderati source changed this round. Both `babel.cjs`
+and `jiti.cjs` confirmed clean against a freshly-`npm pack`'ed tarball
+before finishing. No successful jiti transform has been observed at
+any point across this entire multi-round investigation; jiti's fake
+stays not-deletable, now blocked on #271.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
