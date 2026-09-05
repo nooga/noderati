@@ -5801,6 +5801,107 @@ before finishing. No successful jiti transform has been observed at
 any point across this entire multi-round investigation; jiti's fake
 stays not-deletable, now blocked on #271.
 
+**Fifty-eighth round (2026-09-05, same day) — pulled #271's fix
+(`bf3f78ee`) plus three other VM commits, verified #271 against both
+its own filed repros, re-ran the full regression suite, and pushed the
+real jiti pipeline one bug further — past plugin-descriptor
+construction and into real plugin *execution* for the first time this
+investigation, where it hit an eighth distinct bug: `Object.assign`
+never invokes source getters or target setters.** User asked to pull
+latest paserati main and continue.
+
+Pulled paserati main to `bf3f78ee` (four commits past round 57's
+`8f5e5e04`): `bf3f78ee` fixes #271 - `isCompilingFunctionBody` (a flag
+meant to be consumed by exactly one `BlockStatement` `compileNode`
+call, telling it not to open its own enclosed scope) was left `true`
+across the entire hand-rolled statement-by-statement generator-body
+compile walk; since a generator's own top-level body never itself
+passes through `compileNode`, the flag survived to be wrongly consumed
+by the *first nested* block statement instead (an `if`'s consequent, a
+bare block), which then predefined its `let`/`const` bindings straight
+into the generator's top-level symbol table, leaking them past the
+block. Fix: don't set the flag for the generator body's special
+compile path at all - it was never read at that level. Plus three
+further VM commits (`23934449`, `3d5f89df`, `939014ec`: async frame
+`args`/`calleeValue` setup, rest-parameter population and
+arguments-cache reset in async calls, fresh empty-rest identity and
+constant-pool capacity checks) pulled and present for this round's
+tests but not individually re-derived. `go build`/`go test -count=1
+./...` clean on both repos.
+
+Verified #271 directly against its own two filed repros
+(`check1.ts`/`check2.ts`, the if-block and bare-block variants): both
+now return the correct `{"value":{"tag":"real"},"done":true}`, no
+leaked binding. Re-ran the standing regression suite covering
+#256/#258/#260/#262/#263/#265: all six still pass.
+
+Re-ran jiti's real transform pipeline (the two-file `ext3/`
+interface/enum/private-field/async extension test): the previous
+`undefined is not a constructor` crash from round 57 is gone, replaced
+by a new crash - `TypeError: [BABEL] /: Cannot read property
+'importExpression' of undefined`. Confirmed it reproduces even for the
+most trivial possible input (`console.log("hello")` alone), consistent
+with it firing during Babel's own bundled-plugin setup, before any
+input-file content is examined - a genuinely different failure class
+from every prior round's crash, all of which fired during descriptor
+*construction*; this one fires during a plugin factory's own body,
+i.e. plugin *execution* has now begun for the first time in this
+investigation.
+
+Instrumented `babel.cjs`'s `transform()` catch block (backed up via a
+fresh `npm pack jiti@2.7.0`, diff-confirmed pristine before patching,
+restored and diff-confirmed clean again after) to print the real
+error's name/message/stack, tracing the crash into
+`loadPluginDescriptor`'s plugin-invocation chain. Grepped for
+`importExpression` and found the exact source:
+`@babel/plugin-transform-modules-commonjs`'s visitor object literal
+uses a computed key `["CallExpression" + (e.types.importExpression ?
+"|ImportExpression" : "")]`, where `e` is the plugin's `api` parameter
+and `e.types` comes back `undefined`. Read `@babel/core`'s own
+descriptor-loading code building that API object:
+`u=Object.assign({},i,e(a,l))`, merging a base API object `i` - which
+provides `.types` via a lazy getter, a real babel convention avoiding
+the cost of resolving `@babel/types` for plugins that never touch it -
+with per-plugin-kind extras. Hypothesized `Object.assign` silently
+drops the getter's value rather than invoking it, and confirmed this
+directly and minimally: `Object.assign({}, source)` where `source` has
+an accessor property copies the *key* (`"types" in target` is `true`,
+appears in `Object.keys`) but not the *value* (reads back `undefined`
+instead of calling the getter); object spread (`{...source}`) on the
+identical source correctly invokes the getter, isolating the defect to
+`Object.assign`'s own implementation, not a shared enumerable-property-
+copy path. Checked the write side too, since `Object.assign` also
+`[[Set]]`s onto the target: a target-side setter is never invoked
+either (`Object.assign(target, {x: 42})` against a `target` with an
+`x` setter leaves the setter's captured value `undefined` instead of
+`42`, where real Node gives `42`) - the defect is two-sided, not one.
+
+Checked for prior related issues before filing: #168 ("copies
+properties as non-enumerable") and #254 ("`Object.assign` onto a
+function target drops every property") are both closed, both distinct
+from this getter/setter defect, both in the same builtin - making this
+the third separately-found `Object.assign` bug via real package usage
+alone, noted in the filing as a pattern worth the maintainer's
+attention without prescribing a fix. Called `advisor` before filing,
+who confirmed the finding was clean and complete, named the missing
+setter-side test as one cheap addition (added, and it also failed,
+confirming the two-sided defect above), and suggested naming the
+tested commit explicitly (added). Filed
+[paserati#274](https://github.com/nooga/paserati/issues/274) - the
+eighth distinct bug found on this one pipeline
+(#256/#258/#260/#262/#263/#265/#267/#271 all already fixed), with the
+minimal repro, the key-lands-value-doesn't narrowing, the spread
+control, the setter-side confirmation, and the exact real-babel
+connection traced from source to crash.
+
+**Status**: no noderati source changed this round. Both `babel.cjs`
+and `jiti.cjs` confirmed clean against a freshly-`npm pack`'ed tarball
+before finishing. No successful jiti transform has been observed at
+any point across this entire multi-round investigation; jiti's fake
+stays not-deletable, now blocked on #274 - though the pipeline crossed
+a real boundary this round, advancing from plugin-descriptor
+construction into actual plugin execution for the first time.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
