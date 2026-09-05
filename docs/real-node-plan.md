@@ -5083,6 +5083,128 @@ jiti's fake stays not-deletable. `go build`/`go vet`/`go test -count=1
 ./...` and the scoreboard all clean; only `internal/host/url.go`'s fix
 was uncommitted mid-investigation, committed with this entry.
 
+**Correction (same day, filed with the next round's entry below): the
+"self-contained `.ts` extension works" claim above is false. It was a
+false positive from jiti's own filesystem cache** (`fsCache`, written
+under `$TMPDIR/jiti` and `$TMPDIR/node-jiti`, keyed by content hash -
+independent of which engine produced the cached output). The "self-
+contained, no imports" test in this round ran *after* an earlier real-
+Node run had already populated that cache for the same file content;
+noderati's run then silently read the real-Node-produced cached
+transform instead of exercising its own transform path at all. Caught
+next round by explicitly clearing both cache directories and passing
+`fsCache: false` to every `createJiti(...)` call - at which point the
+previously-"working" self-contained case immediately failed with the
+same error as the import case. There is no working/failing split: every
+transform was broken by the same bug (paserati#256, see below) once
+cache-masking was removed. The "six blockers deep" / "sixth blocker,
+gensync" framing above was chasing a downstream symptom of that same
+bug, not a distinct one. **Methodology note for next time**: any jiti
+test needs both `fsCache: false` *and* `rm -rf` on `$TMPDIR/jiti` /
+`$TMPDIR/node-jiti` beforehand, or a prior real-Node run (or even a
+prior noderati run) can silently make a broken path look like it works.
+
+**Fifty-first round (2026-09-05, same day) — root-caused the "gensync
+bug" precisely: it isn't gensync's, it's paserati's compiler, and it's
+not the sixth blocker, it's the *only* one. Filed as paserati#256.**
+User asked to keep digging on the gensync bug and file an issue.
+
+Rebuilt the repro environment fresh (the prior round's `/tmp` scratch
+dir had been cleaned up) and immediately hit the fsCache trap described
+in the correction above - clearing it changed the symptom. With the
+cache genuinely out of the way, re-bisected inside `jiti/dist/babel.cjs`
+using the same backup/patch/print/restore/diff-confirm method as every
+prior round: split the fused
+`r.babel&&Array.isArray(r.babel.plugins)&&c.plugins?.push(...r.babel.plugins);`
+line into separate statements with a print between each, narrowing the
+silent-stop point down to the `c.plugins?.push(...r.babel.plugins)` call
+itself. Restored `babel.cjs`/`jiti.cjs` clean afterward (diff-confirmed
+byte-identical).
+
+Reduced to a minimal, jiti/babel-independent repro:
+`obj?.push(...arr)`. Confirmed the shape and both its symptom variants
+directly:
+
+```js
+const arr = [1, 2, 3];
+const obj = { push: (...a) => console.log("pushed", a) };
+console.log("before");
+obj?.push(...arr);
+console.log("done");
+```
+
+Real Node: `before` / `pushed [ 1, 2, 3 ]` / `done`. Paserati: prints
+`before` only - no `pushed`, no `done`, no thrown error, no non-zero
+exit, `try/catch` around it catches nothing; execution just silently
+stops making progress past that statement. With `obj = null` instead
+(the chain's own short-circuit should apply, evaluating to `undefined`
+without calling anything - confirmed directly against real Node with
+`console.log(JSON.stringify(obj?.push(...arr)))`, which prints
+`undefined`, not just inferred from spec): paserati instead crashes with
+`[VM Debug] Unknown opcode 255 at ip=55` - a raw invalid-bytecode panic,
+not a JS-level exception.
+
+Checked `gh issue list --search "optional chaining spread"` before
+filing anything new: found #188 (CLOSED), read its full body, and
+re-verified both its original repros still pass right now. #188 covers
+`obj.method?.(...args)` - optional **call** on a plain member-expression
+callee. This is the mirror image, `obj?.method(...args)` - optional
+**member access**, with an ordinary trailing call folded into the same
+chain per spec. Isolated the exact discriminating boundary with control
+variants, all run against both real Node and paserati in the same
+script: `obj.push?.(...arr)` (optional call, #188's shape) works;
+`obj?.push(...arr)` (optional access, spread call) is broken;
+`obj?.push(1,2,3)` (optional access, literal args) works;
+`obj?.["push"](...arr)` (bracket variant) is broken the same way;
+`f?.(...arr)` (no member access at all) works. Confirms a genuinely
+distinct, unfixed bug, not a regression or partial fix of #188.
+
+Root-caused by reading paserati source directly (no edits, no commits -
+not my repo): `pkg/parser/parser.go`'s `parseOptionalChainContinuation`
+(~line 8809) parses `obj?.method(...)` as a single
+`OptionalChainingExpression` node whose `.Continuation` is a
+`*parser.CallExpression{Function: nil}` placeholder, filled in at
+compile time - a different AST shape from #188's, built by a different
+parser path entirely.
+`pkg/compiler/compile_expression.go`'s
+`compileOptionalContinuationWithReceiver` (~line 393) compiles that
+continuation; its `case *parser.CallExpression:` branch (~lines 465-509)
+is a second, separate call-compiling path from the main
+`compileCallExpression` dispatcher - and unlike that dispatcher (which
+checks `c.hasSpreadArgument(node.Arguments)` at ~line 2267 and routes to
+`compileSpreadCallExpression`/`compileMultiSpreadCall` for real spread
+handling), this continuation branch has **no spread check at all**: it
+computes `argCount := len(node.Arguments)` (wrong when one argument is a
+spread - 1 instead of the spread's actual runtime length) and compiles
+each argument, spread included, via the generic `compileNode` dispatch
+into a fixed contiguous register block, then emits `emitCall`/
+`emitCallMethod` against that block. Whatever `compileNode` emits for a
+bare `*parser.SpreadElement` in this position is bytecode the fixed-
+block calling convention was never designed to receive - consistent
+with both observed symptoms (sometimes corrupts the following bytecode
+stream badly enough to leave an invalid jump target behind, landing on
+`255 255`; sometimes the corruption is silent).
+
+Filed as
+[paserati#256](https://github.com/nooga/paserati/issues/256), with the
+full repro (both variants), an explicit "this is NOT #188" section with
+the control variants, the exact root-cause file/line locations and
+buggy snippet, and a suggested fix (add the same
+`hasSpreadArgument`/spread-aware-array-building path the main dispatcher
+already has, for both the `emitCallMethod` and `emitCall` cases).
+Per-advisor correction made before filing: softened an initial "this is
+very likely the root cause of jiti's blocker" claim to state plainly
+that it's *a* confirmed blocker on that path (a real call site in
+babel.cjs hits this exact shape) without claiming it's the *only* one -
+the full jiti pipeline hasn't been re-run against a fixed paserati
+build yet, so anything waiting behind #256 is still unknown.
+
+**Status**: no noderati source changed this round (paserati-side
+root-causing and issue-filing only). jiti's fake stays not-deletable,
+now blocked on a single, precisely-identified, filed upstream compiler
+bug (#256) instead of a vague "gensync" symptom. Re-testing jiti's full
+pipeline is pending #256 landing upstream - not attempted yet.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
