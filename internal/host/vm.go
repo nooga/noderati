@@ -84,23 +84,34 @@ func declareVM(p *driver.Paserati) {
 	vmInstance := p.GetVM()
 
 	p.DeclareModule("vm", func(m *driver.ModuleBuilder) {
-		m.Function("createContext", func(sandbox vm.Value) (vm.Value, error) {
+		m.Function("createContext", func(sandbox vm.Value, _ vm.Value) (vm.Value, error) {
 			return vmCreateContext(p, vmInstance, sandbox)
 		})
 		m.Function("isContext", func(v vm.Value) bool {
 			return vmLookupContext(v) != nil
 		})
-		m.Function("runInThisContext", func(code string) (vm.Value, error) {
+		// The trailing `_ vm.Value` options parameters below exist only so
+		// a real caller passing real Node's actual optional second/third
+		// argument (filename, lineOffset, timeout, ...) doesn't panic:
+		// paserati's native-module reflection binding has no arity
+		// tolerance (a Go function's parameter count must exactly match
+		// the call site - found the hard way via util.deprecate and this
+		// same class of bug, see docs/real-node-plan.md's round 49 entry)
+		// so an omitted parameter here would crash on the very first real
+		// options object passed, not silently ignore it. The options
+		// themselves are still unimplemented, same scope note as this
+		// file's declareVM doc comment already states.
+		m.Function("runInThisContext", func(code string, _ vm.Value) (vm.Value, error) {
 			return vmEval(p, code)
 		})
-		m.Function("runInContext", func(code string, contextObj vm.Value) (vm.Value, error) {
+		m.Function("runInContext", func(code string, contextObj vm.Value, _ vm.Value) (vm.Value, error) {
 			realm := vmLookupContext(contextObj)
 			if realm == nil {
 				return vm.Undefined, fmt.Errorf("contextified sandbox argument is not a vm.Context")
 			}
 			return vmRunInRealm(p, vmInstance, realm, code)
 		})
-		m.Function("runInNewContext", func(code string, sandbox vm.Value) (vm.Value, error) {
+		m.Function("runInNewContext", func(code string, sandbox vm.Value, _ vm.Value) (vm.Value, error) {
 			ctxVal, err := vmCreateContext(p, vmInstance, sandbox)
 			if err != nil {
 				return vm.Undefined, err
@@ -195,8 +206,8 @@ type vmScript struct {
 	code       string
 }
 
-func newVMScript(p *driver.Paserati, vmInstance *vm.VM) func(code string) (*vmScript, error) {
-	return func(code string) (*vmScript, error) {
+func newVMScript(p *driver.Paserati, vmInstance *vm.VM) func(code string, _ vm.Value) (*vmScript, error) {
+	return func(code string, _ vm.Value) (*vmScript, error) {
 		return &vmScript{p: p, vmInstance: vmInstance, code: code}, nil
 	}
 }
@@ -212,15 +223,15 @@ func newVMScript(p *driver.Paserati, vmInstance *vm.VM) func(code string) (*vmSc
 // re-verified against the exact syntax-error repro these methods'
 // tests use before removing the workaround.
 
-func (s *vmScript) RunInThisContext() (vm.Value, error) {
+func (s *vmScript) RunInThisContext(_ vm.Value) (vm.Value, error) {
 	return vmEval(s.p, s.code)
 }
 
-func (s *vmScript) RunInContext(contextObj vm.Value) (vm.Value, error) {
+func (s *vmScript) RunInContext(contextObj vm.Value, _ vm.Value) (vm.Value, error) {
 	return vmRunInRealm(s.p, s.vmInstance, vmLookupContext(contextObj), s.code)
 }
 
-func (s *vmScript) RunInNewContext(sandbox vm.Value) (vm.Value, error) {
+func (s *vmScript) RunInNewContext(sandbox vm.Value, _ vm.Value) (vm.Value, error) {
 	ctxVal, err := vmCreateContext(s.p, s.vmInstance, sandbox)
 	if err != nil {
 		return vm.Undefined, err
