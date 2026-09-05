@@ -5446,6 +5446,115 @@ against a freshly-`npm pack`'ed `jiti@2.7.0` tarball before finishing
 (not a `/tmp` backup alone, per round 51/52's corrections). Re-testing
 the full jiti pipeline remains pending #262 and #263 landing upstream.
 
+**Fifty-fourth round (2026-09-05, same day) — pulled #262/#263's fix
+(`64073a29`), verified both, found and fixed a real noderati-side CJS
+`this`-binding bug along the way (the first noderati source change in
+four rounds), and root-caused + filed a third, distinct paserati bug
+(#265) after a long, partly-unproductive detour that a JS-level
+interception hook eventually cut through.** User asked to pull latest
+paserati main and continue.
+
+Pulled `64073a29` ("feat(builtins): add Error.captureStackTrace (#263)"
++ "fix(compiler): predefine a generator body's own let/const before
+OpInitYield (#262)"). Re-verified both against their exact filed
+repros (`inner n: 99`, matching real Node; `typeof
+Error.captureStackTrace === "function"` and a working call) plus
+regression-checked #256/#258/#260 - all clean.
+
+Re-ran jiti's real transform pipeline (import shape, `fsCache: false`,
+cache cleared) - **cleared `GENSYNC_EXPECTED_START` for the first time
+this entire investigation**, progressing into a new crash: `TypeError:
+[BABEL] /: Method Generator.prototype.next called on incompatible
+receiver` deep inside `@babel/core`'s real plugin-loading
+(`loadPluginDescriptor`).
+
+Intercepted `Generator.prototype.next` from plain JS (wrapping
+`Object.getPrototypeOf(Object.getPrototypeOf((function*(){})()))
+.next`, no engine changes needed) to log the failing receiver directly
+instead of guessing from minified source - the first two rounds of
+this technique cost real time on a wrong turn, corrected below. The
+receiver was `globalThis` (confirmed by its enumerable own keys:
+`__noderatiSpawnSync,__noderatiSpawn,Buffer` - noderati's own
+process-spawning natives, set directly on `globalThis` in
+`child_process.go`). Built a `probe.cjs` test (`this` at a CJS module's
+own top level) that confirmed a genuine, distinct **noderati** bug
+(not paserati's): `internal/host/cjs.go`'s CJS module wrapper called
+the module function with `thisArg: vm.Undefined` instead of real
+Node's actual convention (`this === module.exports` at CJS top level,
+until reassigned) - for a non-strict wrapper function, `vm.Undefined`
+correctly-per-sloppy-mode-rules resolves to `globalThis`, matching
+paserati's (correct) semantics but not real Node's actual CJS
+contract. Fixed in
+[`internal/host/cjs.go`](../internal/host/cjs.go) by passing
+`exportsVal` as the `thisArg` instead - re-verified with `probe.cjs`
+directly against real Node (`this === module.exports: true` now
+matches on both). First noderati source change in four rounds of
+paserati-side-only investigation.
+
+The `globalThis`-as-receiver crash persisted unchanged after that fix
+though - a different call site, not the CJS top-level one. Spent
+significant, partly wasted effort chasing *where the bad receiver came
+from* (tested `.call()`/`.apply()` explicit-this forwarding, arrow
+function lexical `this` across a `.call()` boundary, destructured
+generator parameters shadowing enclosing parameters, webpack's own
+`e[r].call(s.exports,...)` module-invocation convention - all
+correct, all ruled out one at a time, none of it the actual bug)
+before recognizing the real question was backwards: real Node's
+*identical* unbound-call/sloppy-`this` mechanics also produce
+`globalThis` as a receiver (verified directly) - so real Node must
+simply never *reach* this particular `.next()` call, not receive a
+different receiver at it. Re-aimed the same interception hook at
+*counting* calls and diffing argument shapes call-by-call against an
+identical real-Node run of the same script: real Node makes 1246 total
+`.next()` calls and completes; noderati's argument types first diverge
+from real Node's at calls #13, #25, #62 (an `object`/`function` where
+real Node passes `undefined`) and noderati dies at call #75.
+
+That diff pointed squarely at gensync's own `isAsync` check
+(`@babel/core`'s bundled `gensync-utils/async.js`:
+`t.isAsync=_gensync()({sync:()=>!1,errback:e=>e(null,!0)})`, called
+pervasively - `yield*(0,n.isAsync)()` - throughout real plugin/preset
+loading) - an `object`/`function` argument where `undefined` is
+expected is exactly what a `resume` value that should be falsy but
+isn't would produce. Testing `gensync`'s real, unmodified npm package
+directly (no babel/jiti) with this exact `{sync, errback}` operation
+shape reproduced a **third, distinct paserati bug**: calling
+`gensync({sync: () => 42}).sync()` recurses into itself indefinitely
+instead of returning `42`. Bisected (removing pieces until it stopped
+reproducing, not guessing new ones) to the essential ingredient: an
+object-literal property whose *key* is `sync`, whose function *value*
+closes over an outer variable *also named* `sync`, calling that
+variable - reading it back inside the property's own body resolves to
+itself instead of the outer closure, causing infinite self-recursion
+(a tail-position variant spins forever with no stack growth; a
+non-tail variant crashes cleanly with `Maximum call stack size
+exceeded`, a stack of frames literally named `sync` calling `sync`).
+Confirmed the *same* closure-nesting depth with a **named function
+declaration** instead of an object-literal property does not
+reproduce - isolating property-key name inference specifically, not
+closure depth in general, as the trigger.
+
+Filed as
+[paserati#265](https://github.com/nooga/paserati/issues/265), with
+both repro variants (the hanging tail-position one and the
+fast-crashing one, explicitly flagged which is which), the ruled-out
+named-function-declaration control, and the measured (not assumed)
+link to the real plugin-loading crash via the call-count/argument-type
+diff - stated as "implicated, not confirmed as the sole cause," since
+the crash's own symptom (an invalid-receiver `TypeError`) differs from
+this bug's two directly-observed symptoms (a hang or a clean overflow),
+so something downstream may still be unaccounted for.
+
+**Status**: one real noderati bug found and fixed this round (the CJS
+`this` binding - `internal/host/cjs.go`), verified against real Node.
+#262/#263 verified fixed upstream. A third paserati bug filed (#265),
+strongly implicated in (but not proven to fully explain) the plugin-
+loading crash that's now jiti's blocker. No successful jiti transform
+has been observed yet at any point across this entire multi-round
+investigation. Both `babel.cjs` and `jiti.cjs` confirmed clean against
+a freshly-`npm pack`'ed tarball before finishing. `go build`/`go
+vet`/`go test -count=1 ./...` and the scoreboard all clean.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

@@ -297,7 +297,17 @@ func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.Pasera
 		return vm.Undefined, errs
 	}
 
-	_, err = vmInst.Call(fn, vm.Undefined, []vm.Value{
+	// Real Node's CJS wrapper calls the module function with `this` bound
+	// to `module.exports` (not `undefined` and not `globalThis`) - the
+	// same object as the `exports` parameter, until the module reassigns
+	// `module.exports` to something else. The wrapper function isn't
+	// strict-mode, so passing `vm.Undefined` here would (correctly, per
+	// ordinary non-strict `this`-substitution rules) resolve to
+	// `globalThis` instead - a real behavioral gap from real Node found via
+	// jiti's real transform pipeline (a real webpack-bundled CJS module
+	// using top-level `this` freely, per docs/real-node-plan.md's
+	// investigation into paserati#262/#263's aftermath).
+	_, err = vmInst.Call(fn, exportsVal, []vm.Value{
 		exportsVal,
 		requireFn,
 		moduleVal,
