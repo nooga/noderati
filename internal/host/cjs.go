@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/nooga/paserati/pkg/driver"
@@ -24,7 +25,11 @@ import (
 // import of the same name works fine (found the hard way: adding v8.go's
 // declareV8(p) call didn't make require("node:v8") work until this map was
 // also updated by hand) — when adding a new declareX(p) module, add its
-// name here too.
+// name here too. Also now the source for Module.builtinModules
+// (builtinModulesArray below, added round 48) — a name missing here isn't
+// just an unreachable require(), it's a wrong answer to "is this a
+// builtin", which real code (jiti's own bundling check, found via
+// Module.builtinModules.includes(name)) can act on silently.
 var nativeRequireNames = map[string]bool{
 	"fs": true, "path": true, "os": true, "util": true,
 	"assert": true, "url": true, "querystring": true,
@@ -104,6 +109,38 @@ func declareCJSInterop(p *driver.Paserati) {
 		}
 		return loader.bindRequire(abs), nil
 	}))
+	obj.SetOwn("__noderatiNodeModulePaths", vm.NewNativeFunction(1, false, "__noderatiNodeModulePaths", func(args []vm.Value) (vm.Value, error) {
+		from := "."
+		if len(args) > 0 {
+			from = args[0].ToString()
+		}
+		dirs := nodeModulePaths(from)
+		vals := make([]vm.Value, len(dirs))
+		for i, d := range dirs {
+			vals[i] = vm.String(d)
+		}
+		return vm.NewArrayWithArgs(vals), nil
+	}))
+	obj.SetOwn("__noderatiBuiltinModules", builtinModulesArray())
+}
+
+// builtinModulesArray mirrors Module.builtinModules: every name this host
+// treats as a builtin (nativeRequireNames — the same list require() itself
+// checks), so "is this specifier a builtin" queries (e.g. jiti's own
+// `Module.builtinModules.includes(name)` bundling check) agree with what
+// require() actually does, rather than a separately-maintained list drifting
+// out of sync with it.
+func builtinModulesArray() vm.Value {
+	names := make([]string, 0, len(nativeRequireNames))
+	for name := range nativeRequireNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	vals := make([]vm.Value, len(names))
+	for i, n := range names {
+		vals[i] = vm.String(n)
+	}
+	return vm.NewArrayWithArgs(vals)
 }
 
 func resolveRequireFilename(filenameOrURL string) (string, error) {
@@ -121,13 +158,103 @@ func resolveRequireFilename(filenameOrURL string) (string, error) {
 }
 
 func (l *cjsLoader) bindRequire(fromFile string) vm.Value {
-	return vm.NewNativeFunction(1, false, "require", func(args []vm.Value) (vm.Value, error) {
+	reqFn := vm.NewNativeFunctionWithProps(1, false, "require", func(args []vm.Value) (vm.Value, error) {
 		spec := ""
 		if len(args) > 0 {
 			spec = args[0].ToString()
 		}
 		return l.require(spec, fromFile)
 	})
+	props := reqFn.AsNativeFunctionWithProps()
+	if props == nil || props.Properties == nil {
+		return reqFn
+	}
+
+	// require.resolve(specifier[, options]): delegates to the same
+	// resolveSpecifier logic require() itself uses to actually load a
+	// module - this returns the path instead of loading it, it doesn't
+	// implement a separate resolution algorithm. options.paths (real
+	// Node's override-the-search-directories option) is honored by
+	// anchoring resolution at its first entry, matching the one real
+	// caller found so far (jiti's own `nativeRequire.resolve(spec,
+	// {paths})`, which passes exactly one directory in practice) - a
+	// scoped delegation, not the real multi-directory search Phase 4's
+	// node_modules walk-up work will eventually replace this with (see
+	// docs/real-node-plan.md).
+	resolveFn := vm.NewNativeFunctionWithProps(1, true, "resolve", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vm.Undefined, fmt.Errorf("require.resolve: missing specifier")
+		}
+		spec := args[0].ToString()
+		anchor := fromFile
+		if len(args) > 1 && args[1].IsObject() {
+			if obj := args[1].AsPlainObject(); obj != nil {
+				if pathsVal, ok := obj.GetOwn("paths"); ok && pathsVal.IsArray() {
+					if arr := pathsVal.AsArray(); arr != nil && arr.Length() > 0 {
+						anchor = filepath.Join(arr.Get(0).ToString(), "_")
+					}
+				}
+			}
+		}
+		resolved, err := l.resolveSpecifier(spec, anchor)
+		if err != nil {
+			return vm.Undefined, fmt.Errorf("Cannot find module '%s'", spec)
+		}
+		return vm.String(resolved), nil
+	})
+	if rprops := resolveFn.AsNativeFunctionWithProps(); rprops != nil && rprops.Properties != nil {
+		rprops.Properties.SetOwn("paths", vm.NewNativeFunction(1, false, "paths", func(_ []vm.Value) (vm.Value, error) {
+			dirs := nodeModulePaths(filepath.Dir(fromFile))
+			vals := make([]vm.Value, len(dirs))
+			for i, d := range dirs {
+				vals[i] = vm.String(d)
+			}
+			return vm.NewArrayWithArgs(vals), nil
+		}))
+	}
+	props.Properties.SetOwn("resolve", resolveFn)
+	// .cache/.extensions/.main: real Node's require carries these too, but
+	// nothing found so far reads them beyond copying them onto jiti's own
+	// wrapper object (see the #254 follow-up investigation in
+	// docs/real-node-plan.md) - present so that copy doesn't read
+	// undefined, not a real cache/extension-loader implementation.
+	props.Properties.SetOwn("cache", vm.NewObject(l.p.GetVM().ObjectPrototype))
+	props.Properties.SetOwn("extensions", vm.NewObject(l.p.GetVM().ObjectPrototype))
+	props.Properties.SetOwn("main", vm.Undefined)
+	return reqFn
+}
+
+// resolveSpecifier is require.resolve()'s logic: like require(), but
+// returns the resolved location instead of loading it. Native/builtin
+// modules resolve to their own bare name, matching real Node.
+func (l *cjsLoader) resolveSpecifier(specifier, fromFile string) (string, error) {
+	spec := strings.TrimPrefix(specifier, "node:")
+	if nativeRequireNames[spec] {
+		// Real Node's require.resolve("node:fs") returns "node:fs" verbatim,
+		// not the stripped "fs" - the prefix round-trips. Return the
+		// original specifier, not the trimmed lookup key.
+		return specifier, nil
+	}
+	return l.resolveFile(specifier, fromFile)
+}
+
+// nodeModulePaths mirrors Module._nodeModulePaths(from): every ancestor
+// directory's "node_modules" subdirectory, closest first, up to the
+// filesystem root. Pure path arithmetic (no package.json/exports-field
+// handling), unlike Phase 4's still-pending real resolution algorithm -
+// this is the same well-defined utility real Node ships under this name.
+func nodeModulePaths(from string) []string {
+	dir := filepath.Clean(from)
+	var paths []string
+	for {
+		paths = append(paths, filepath.Join(dir, "node_modules"))
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return paths
 }
 
 func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.PaseratiError) {

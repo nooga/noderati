@@ -4880,6 +4880,105 @@ isn't deletable. Re-ran the scoreboard post-deletion: `baseline`'s
 - expected, since pi-ai is unconditionally real now and nothing is
 listening at the scoreboard's stub target; not a regression.
 
+**Forty-ninth round (2026-09-05, same day) — `#254` merged upstream,
+verified; scoreboard shows `fake-off:jiti`/`all-fakes-off` clean for
+the first time ever, but that's a scoreboard-blind-spot, not a green
+light - found and fixed four real noderati gaps chasing jiti's actual
+runtime path, four deep with an unknown number still ahead.** User
+reported `#254`'s fix merged. Pulled paserati main (`8599a674`): one
+commit fixes both repros together (`Object.assign` onto a function
+target, and a bound function's enumerability), confirming advisor's
+earlier guess that they shared a root cause. Re-verified both original
+repros standalone (3/3 each) and the exact `@babel/template`
+construction shape (`Object.assign(fn.bind(...), {...})`) - all clean.
+
+Re-ran the full `fake-off:jiti` pipeline: `--version` and `--help` both
+now succeed with **no error at all** - past `debug`, past all of
+`babel.cjs`'s config-chain loading, past the decorators plugin,
+straight through to real output. Ran the scoreboard: `fake-off:jiti`
+and `all-fakes-off` both match `baseline` on all three invocations -
+**the first time in this entire project `all-fakes-off` has ever gone
+clean.**
+
+Did not treat that as license to delete jiti's fake. Per this doc's
+own established rule (first stated for pi-tui's deletion, restated for
+pi-ai/pi-agent-core last round): CLI-invocation matching is necessary
+but not sufficient, and here it's less sufficient than usual - none of
+the scoreboard's three invocations (`--version`/`--help`/`-p`) ever
+actually call `createJiti()`. `loader.js` only *imports* `jiti/static`
+(which is why babel.cjs's whole graph loads and why `#242`/`#244`/
+`#252`/`#254` all surfaced) - `loadExtensionModule` only invokes
+`createJiti` when there's an actual extension file to load, which none
+of pi's own three scoreboard invocations do. So the clean scoreboard
+proves jiti's *import graph* is now fully clean, and says nothing
+about whether jiti's actual job (transforming and loading a real
+TypeScript extension file) works at all.
+
+Tested that directly: a real `.ts` extension file (interface, enum,
+default-typed values - genuine TS syntax needing real transformation,
+not just syntax jiti could pass through untouched) loaded via jiti's
+own real API, exactly as `loader.js:302`'s `createJiti(...)` /
+`jiti.import(...)` call shape (confirmed via both `jiti/lib/jiti.mjs`
+and, to be sure it's not entry-point-specific, `jiti/static`'s real
+`jiti-static.mjs` - identical crash shape either way). Found and fixed
+four real noderati gaps in sequence, each only visible once the
+previous one stopped blocking:
+
+1. `require.resolve` didn't exist at all (`require.resolve`,
+   `Module.createRequire(...)`'s returned require - neither had it),
+   traced to `createJiti`'s `N.resolve.paths` access
+   (`N = Module.createRequire(...)`) throwing "Cannot read property
+   'paths' of undefined" because `N.resolve` itself was undefined.
+   Implemented `require.resolve(specifier[, options])` in
+   `internal/host/cjs.go`, delegating to the exact same resolution
+   logic `require()` itself already uses (not a new algorithm - stays
+   inside Phase 4's boundary deliberately), honoring
+   `options.paths` by anchoring at its first entry (the one real
+   caller found so far). Also added `.resolve.paths()`, `.cache`,
+   `.extensions`, `.main` as presence-only placeholders (nothing found
+   so far reads them beyond copying them onto jiti's own wrapper
+   object) and `Module._nodeModulePaths` - a genuinely well-defined,
+   self-contained utility (every ancestor's `node_modules`
+   subdirectory, closest first, pure path arithmetic, no
+   package.json/exports handling), not the real resolution algorithm
+   Phase 4 is still about.
+2. `Module.builtinModules` didn't exist, hit as
+   `Be.builtinModules.includes(name)` ("Cannot read property
+   'includes' of undefined") in jiti's own native-vs-transform
+   bundling check. Implemented as a sorted array derived directly from
+   `nativeRequireNames` (the same hand-maintained list `require()`
+   itself already checks) rather than a separately-maintained list -
+   noted in that list's own comment that it now has a second
+   consequence (a name missing there is now a *wrong* answer to "is
+   this a builtin", not just an unreachable `require()`).
+3. `crypto.createHash("md5")` wasn't supported (only `sha256` was) -
+   hit via jiti's own filesystem cache-key hashing
+   (`getCache`/`utils_hash`), an entirely ordinary non-cryptographic
+   use. Added `md5`/`sha1`/`sha384`/`sha512` alongside the existing
+   `sha256` in `internal/host/crypto.go`.
+4. Past all three, hit a new failure inside `eval_evalModule` itself -
+   `TypeError: undefined is not a constructor` - genuinely inside
+   jiti's module-evaluation core, not a shallow host-builtin gap like
+   the three above. Did not chase this one down this round.
+
+Caught one correctness issue on `require.resolve` before committing
+(advisor): real Node's `require.resolve("node:fs")` returns
+`"node:fs"` verbatim (prefix round-trips), but the implementation was
+returning the stripped `"fs"` - fixed to return the original
+specifier for builtins, verified against both prefixed and bare forms.
+Full `go build`/`go vet`/`go test ./...` clean; re-ran the scoreboard
+after these fixes too - unchanged (still clean on all three
+invocations, as expected, since none of them exercise this code path
+either).
+
+**Honest status, not an estimate**: jiti's real transform path is
+untested past `eval_evalModule`'s own `undefined is not a constructor`
+failure. Four host gaps fixed getting this far into it in one sitting,
+each one revealed only by fixing the last - deliberately stopping here
+rather than guessing how many more remain. jiti's fake stays exactly
+where it was: not deletable, and the scoreboard's all-clean row is a
+known, documented blind spot, not evidence to the contrary.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete

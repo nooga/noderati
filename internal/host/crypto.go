@@ -1,8 +1,11 @@
 package host
 
 import (
+	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -58,8 +61,20 @@ func declareCrypto(p *driver.Paserati) {
 		})
 		m.Function("createHash", func(algo string) (*hashHasher, error) {
 			switch strings.ToLower(algo) {
+			case "md5":
+				// Found via jiti's own filesystem cache-key hashing
+				// (getCache -> utils_hash) - a completely ordinary
+				// non-cryptographic use; md5 is still real Node's
+				// default fast hash for this kind of thing.
+				return &hashHasher{h: md5.New()}, nil
+			case "sha1":
+				return &hashHasher{h: sha1.New()}, nil
 			case "sha256":
 				return &hashHasher{h: sha256.New()}, nil
+			case "sha384":
+				return &hashHasher{h: sha512.New384()}, nil
+			case "sha512":
+				return &hashHasher{h: sha512.New()}, nil
 			default:
 				return nil, fmt.Errorf("Digest algorithm %q is not supported", algo)
 			}
