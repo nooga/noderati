@@ -5258,9 +5258,16 @@ result.
 With both confirmed, re-ran jiti's real transform pipeline (import
 shape, `fsCache: false`, cache dirs cleared first) against a fresh
 two-file `.ts` extension (interface, enum, private class field,
-async/await) - the interface/enum/class/async transform itself now
-succeeds and produces correct output (previously round 50/51's target
-never got this far). It then hit a **new, distinct crash**:
+async/await). **Correction, caught next round**: the line originally
+here claimed "the transform itself now succeeds and produces correct
+output" - that was wrong, the same "got further" ≠ "worked" mistake
+made twice already this investigation (the fsCache false-positive, the
+babel.cjs restore false-positive). Execution reaching babel's own
+error-formatting code (below) *means* a transform error already
+occurred (`__JITI_ERROR__` was already set) - no output was ever
+produced or checked at this point, only the absence of the two
+previously-fixed crashes was observed and mistaken for success. It
+then hit a **new, distinct crash**:
 `TypeError: String.prototype.replace called on null or undefined`
 inside babel's bundled error-formatting code
 (`e.code?.replace("BABEL_","").replace(...)`, used to sanitize a Babel
@@ -5315,6 +5322,129 @@ independently found and fixed by the maintainer (#258), one new
 blocker filed (#260) one call site further into the same real pipeline.
 Re-testing the full jiti pipeline remains pending #260 (and anything
 past it) landing upstream - not attempted past this point this round.
+
+**Fifty-third round (2026-09-05, same day) — pulled #260's fix, verified
+it, found jiti's real transform *never* actually succeeded (a third
+"got further ≠ worked" correction, see above), root-caused a precise
+generator/closure variable-shadowing bug and a masking
+`Error.captureStackTrace` gap, filed both.** User asked to pull latest
+paserati main and continue.
+
+Pulled `349821bb` (#260's fix: "give every property-access call in an
+optional-chain continuation its own receiver"). Re-verified #260
+directly against all three of its filed repros (the `this`-tracing
+method chain, the minimal `.replace().replace()` case, the bracket-form
+cross-product) plus regression-checked #256 and #258 - all match real
+Node exactly, no regressions.
+
+Re-ran jiti's real transform pipeline (import shape, `fsCache: false`,
+cache cleared) - it progressed past the `.replace().replace()` crash
+site into a **new** crash: `TypeError: undefined is not a function` at
+jiti's own module-loader `next()` function. Traced this immediately
+(not by design, by necessity): jiti's real, unmodified `dist/jiti.cjs`
+unconditionally calls `Error.captureStackTrace(l, jitiRequire)` in its
+error-reporting path with no feature check - and paserati's `Error`
+doesn't implement `captureStackTrace` at all (`typeof
+Error.captureStackTrace === "undefined"`, confirmed directly). This
+means *any* real transform error - regardless of what it actually is -
+crashes jiti's own attempt to report it, hiding the real error
+entirely. Filed as
+[paserati#263](https://github.com/nooga/paserati/issues/263).
+
+To see past this masking crash for diagnosis (not as a permanent
+workaround - #263 stays filed and open), guarded jiti.cjs's one call
+site (`Error.captureStackTrace&&Error.captureStackTrace(...)`,
+backed up and restored/diff-confirmed against a freshly-`npm pack`'ed
+tarball afterward) rather than polyfilling `Error.captureStackTrace`
+globally in the test script - a global polyfill would have also flipped
+a *different*, feature-detected `s` flag inside babel.cjs itself
+(`s=!!Error.captureStackTrace&&...`, gating a `beginHiddenCallStack`
+stack-trace-customization wrapper), contaminating the very thing being
+diagnosed. Confirmed by testing both ways: the same real error surfaces
+identically with or without the global polyfill, so this specific
+concern didn't end up mattering for this bug, but the guarded,
+single-call-site patch is the methodologically clean choice regardless
+and is what's recorded as the approach.
+
+With the masking crash bypassed, the real error underneath was, again,
+`GENSYNC_EXPECTED_START: Got unexpected yielded value in gensync
+generator: undefined...` - and testing showed it now happens on
+**every** transform, even the most trivial possible input
+(`console.log("hello");` alone, no imports, no TS syntax at all) -
+meaning the round-52 claim that "the transform itself now succeeds" was
+never actually true; no successful transform has yet been observed this
+entire investigation once #256/#258/#260's masking was removed (see the
+correction on round 52's entry above).
+
+Instrumented gensync's core driving loop (`evaluateSync`/`assertStart`,
+in babel.cjs, backup/restore/diff-confirmed against `npm pack` each
+time) to trace exactly what's yielded and when - real Node's version of
+this same operation completes in one `.next()`-pair (yields the "start"
+sentinel once, then finishes); paserati's yields "start" correctly on
+the first call, then yields the "suspend" sentinel on the second call
+instead of completing - meaning the generator's `if (!resume) return
+sync.call(...)` early-return check evaluated `resume` as **truthy**,
+even though gensync's synchronous driving loop (`evaluateSync`) never
+sends any value into `.next()` - `resume` must be `undefined` there,
+always, by construction. Built five separate standalone repros
+attempting to reproduce this via generic gensync usage (plain
+`.sync()`, nested `.sync()` calls, `yield*` delegation one and two
+levels deep, `gensync.all` composition) - every one passed, matching
+real Node, because none of them could actually reach the "resume is
+truthy" state (evaluateSync structurally never provides one) - a
+guessing loop that self-corrected once the actual discriminating test
+was run: instrumented the *exact* real minified generator body
+(`const n=yield t;if(!n){...}`) to print `typeof n`/`n` right after the
+yield. It printed `number 1` under paserati (real Node: `undefined`).
+
+`1` was recognizable: gensync's `buildOperation({name, arity, sync,
+async})` (destructuring `arity` into a variable also named, after
+minification, `n`) returns `function* (...e){ const n = yield t; ... }`
+- the *inner* generator body's own local `const n` has the **same name**
+as the *outer* `arity` parameter it's nested inside and closes over.
+Minimized to two repros entirely outside jiti/babel/gensync:
+
+```ts
+function outer(n) {
+  function* g() {
+    const n = 99;
+    console.log("inner n:", n);
+    yield 1;
+  }
+  return g;
+}
+outer(1)().next();
+```
+
+Real Node: `inner n: 99`. Paserati: `inner n: 1` - the generator body's
+own `const n` reads back the *outer*, closed-over parameter's value
+instead of its own assignment. Narrowed precisely with five control
+variants (all cross-checked against real Node): generator-specific (the
+identical structure with a plain non-generator inner function reads
+correctly); not `yield`-specific (no yield needed at all, a bare
+`const n = 99` triggers it); not `const`-specific (`let` shows the same
+bug); needs the outer variable to specifically be an **enclosing
+function's parameter**, not just any outer scope (a module-level outer
+`n` shadowed the same way inside a *non-nested* top-level generator
+reads correctly); and it's specific to a **body-local declaration**,
+not the generator's own parameter list (if the generator's own
+parameter shares the outer name, it correctly resolves to its own
+argument, not the outer closure).
+
+Filed as
+[paserati#262](https://github.com/nooga/paserati/issues/262), with both
+minimal repros, all five narrowing variants, and the trace from the
+real gensync generator (`typeof n` printing `number 1`) that led to it.
+
+**Status**: no noderati source changed this round. jiti's fake stays
+not-deletable - no successful jiti transform has been observed yet at
+any point in this investigation; #256/#258/#260 (now all fixed
+upstream) were necessary but not sufficient. Two new bugs filed
+(#262, #263), both confirmed independent of #256/#258/#260 and of each
+other. Both `babel.cjs` and `jiti.cjs` restored and diff-confirmed clean
+against a freshly-`npm pack`'ed `jiti@2.7.0` tarball before finishing
+(not a `/tmp` backup alone, per round 51/52's corrections). Re-testing
+the full jiti pipeline remains pending #262 and #263 landing upstream.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
