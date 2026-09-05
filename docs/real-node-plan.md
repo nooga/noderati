@@ -5902,6 +5902,116 @@ stays not-deletable, now blocked on #274 - though the pipeline crossed
 a real boundary this round, advancing from plugin-descriptor
 construction into actual plugin execution for the first time.
 
+**Fifty-ninth round (2026-09-05, same day) — pulled #274's fix
+(`5b3abc8e`), verified it against both getter and setter sides,
+confirmed the regression suite, and pushed the real jiti pipeline past
+plugin execution into babel's own bootstrap - where it hit a ninth
+bug, this time a raw Go VM panic rather than a JS-level divergence,
+filed after five negative isolation attempts and one hypothesis ruled
+out by reading the engine's own source.** User asked to pull latest
+paserati main and continue.
+
+Pulled paserati main to `5b3abc8e` (fixes #274 - `Object.assign`'s own
+Go-native implementation used `plainObj.GetOwn(key)` and a plain
+`SetOwn(key, value)` with no accessor awareness at all, unlike
+`OpObjectSpread` which already checked `GetOwnAccessor`; fixed by
+mirroring that check on both the read side - call the source's getter
+via `vmInstance.Call` when present - and the write side - call the
+target's setter when present, matching `vm.SetProperty`'s existing
+own-accessor check). `go build`/`go test -count=1 ./...` clean on both
+repos.
+
+Verified #274 directly: the original getter repro
+(`getter_assign.ts`) now prints `getter invoked` / `typeof
+target.types: object` / `{"real":true}`, matching real Node exactly;
+the setter repro (`setter_assign.ts`, added on advisor's suggestion
+last round to check the write side too) now prints `42`, also
+matching. Re-ran the standing six-bug regression suite
+(#256/#258/#260/#262/#263/#265): all still pass.
+
+Re-ran jiti's real transform pipeline: the `Cannot read property
+'importExpression' of undefined` crash from round 58 is gone. New
+failure, and a different *kind* entirely - not a JS `TypeError` but a
+raw Go panic surfacing through noderati's own VM-panic recovery
+wrapper: `index out of range [19] with length 18` at `vm.go:1999`
+(`OpMove: registers[regDest] = registers[regSrc]`), reached through
+`resumeGenerator`, three levels of nested generator resumption deep,
+under `executeAsyncFunctionBody` - gensync's `evaluateSync`-over-
+`yield*` machinery loading babel's config/plugins. `vm.runtimeError()`
+still attaches a source position from whatever chunk was current at
+panic time, pointing into `@babel/core`'s bundled
+`build-external-helpers.js` module (`buildVar`'s enclosing scope, a
+19-way object destructuring from `@babel/types`). Confirmed
+deterministic and content-independent: reproduces on the two-file
+`ext3/` extension test and on the most trivial possible input
+(`console.log("hello")` alone) identically - this fires during babel's
+own bootstrap, before any input file is examined.
+
+Five isolation attempts, all negative (all four synthetic probes ran
+correctly, matching real Node; only the real pipeline diverges):
+extracting the exact panicking module's source standalone (stubbing
+its four dependencies) and calling it the same way the real pipeline
+does - passes, including the 19-way destructuring in isolation on its
+own; the same standalone body driven through 3 levels of nested,
+gensync-shaped `yield*` delegation - passes; three nested generators
+with deliberately different live-local counts (3/25/8), chained with
+an intervening plain call before and after the delegation point, to
+force a real (non-tail-call) register window to persist across
+suspend/resume - passes; a 400-property object literal (mimicking the
+enclosing webpack module map) with one 19-local method - passes; and
+[#244](https://github.com/nooga/paserati/issues/244)'s own original
+repro (bare `require(jiti/dist/jiti.cjs)`, no transform) - still
+passes cleanly, confirming this is not a resurgence of that bug's
+exact trigger (a comma-chain register-count wraparound, fixed by
+`157a2161`), though it's the identical *symptom* (an undersized
+register window causing a raw index-out-of-range panic).
+
+Read the source directly to check one concrete mechanical hypothesis:
+that a generator/async frame's register window gets expanded past its
+declared `RegisterSize` via TCO at some point, gets saved in that
+expanded state, and `resumeGenerator` silently re-slices it back down
+on the next resume - which would produce exactly this panic with no
+repro needed. Ruled out by the code itself, not just by testing: both
+TCO call sites (`OpTailCall`/`OpTailCallMethod`) unconditionally
+disable TCO the moment `frame.generatorObj != nil` or the callee
+`IsGenerator`/`IsAsync`, and `relocateOpenUpvalues`'s own comment
+already documents this as a deliberate invariant elsewhere in the same
+file. Noted for the maintainer, independent of whether that invariant
+holds here: `resumeGenerator`'s restore is a plain Go `copy()`, which
+silently truncates on any future length mismatch with no signal at the
+copy site - a length assertion there would turn any recurrence of this
+exact panic shape into an immediate diagnostic. Also flagged one real,
+still-open asymmetry found by reading `resumeGenerator`'s four exit
+paths: its error-path register-reclaim is guarded by `vm.frameCount >
+0` where the matching increment has no such guard - a genuine
+inconsistency, though not confirmed to be what fires in this specific
+crash.
+
+Called `advisor` twice this round before filing (once mid-investigation,
+which redirected the TCO-window-mismatch read that ended up ruling out
+that hypothesis cleanly; once on the finished draft, which caught an
+unverified "fixed by" commit attribution for #244 - confirmed via `git
+log --grep` before use - and an overselling closing paragraph, both
+corrected before filing). Filed
+[paserati#276](https://github.com/nooga/paserati/issues/276) - the
+ninth distinct bug found on this one pipeline
+(#256/#258/#260/#262/#263/#265/#267/#271/#274 all already fixed),
+explicitly framed as a Go-level engine panic rather than a JS semantic
+divergence, with the full negative-probe ledger, the ruled-out TCO
+hypothesis, the open asymmetry, and a pointer to `debugGeneratorStates`
+as the fastest next step for whoever picks it up (not flipped here -
+this is a shared, actively-developed repo, never left in an edited
+state).
+
+**Status**: no noderati source changed this round. Both `babel.cjs`
+and `jiti.cjs` confirmed clean against a freshly-`npm pack`'ed tarball
+before finishing. No successful jiti transform has been observed at
+any point across this entire multi-round investigation; jiti's fake
+stays not-deletable, now blocked on #276 - a VM-internals bug rather
+than a JS-semantics one, the first of that kind hit directly by this
+investigation (as opposed to #244, hit and fixed earlier in paserati's
+own history before this investigation reached it).
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
