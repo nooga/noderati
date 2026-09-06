@@ -6485,36 +6485,81 @@ context* the class is compiled/instantiated within, not in the class's
 own text or its compiled method bytecode.
 
 `advisor` named three concrete candidates for that context, in
-priority order, none yet tested when this round ended: (a) the class
-expression is a **nested closure with upvalues** inside babel.cjs's
-own module-wrapper function (`Z`, `TypeScriptScopeHandler`, etc. are
-free variables captured from that enclosing scope, not undefined
-globals as in the isolated extraction) - untested; (b) the real
-`new Parser(...)` constructor path (this round's isolated test used
-`Object.create` to skip the constructor entirely) - untested; (c) the
-real `getParser` fold combining roughly a dozen enabled plugin mixins
-(the `parserOpts.plugins` array from round 61's #283 investigation had
-12 entries), versus this round's single `mixin(Base)` application -
-untested. Explicitly not yet asserted as the mechanism per this
-session's standing rule against unverified root-cause claims.
+priority order: (a) the class expression is a **nested closure with
+upvalues** inside babel.cjs's own module-wrapper function (`Z`,
+`TypeScriptScopeHandler`, etc. are free variables captured from that
+enclosing scope, not undefined globals as in the isolated extraction);
+(b) the real `new Parser(...)` constructor path (this round's isolated
+test used `Object.create` to skip the constructor entirely); (c) the
+real `getParser` fold combining multiple enabled plugin mixins. All
+three were built and run and **all three also passed correctly** on
+both engines - eleventh through thirteenth falsified probes. (c) was
+tested precisely rather than guessed: patched a private copy of
+`babel.cjs` to log the fold's actual enabled-plugin list right after
+it's computed (`for(const r of se)e.has(r)&&t.push(r)`), and it came
+back identical on both engines - `["typescript"] 1 cacheHit false` -
+a single mixin applied once, exactly matching every synthetic repro
+already tried; multi-plugin folding was never the discriminator.
+
+With all context-level hypotheses exhausted, `advisor` pointed at the
+one thing no repro had varied: **how `parse()` itself gets called**.
+Every repro so far called it as `inst.parse()` - an ordinary method
+call. `grep`ping the real `babel.cjs` for the actual call site
+(`getParser(t,e).parse()`, found verbatim, three occurrences) showed
+it's a **tail call** - and the disassembly gathered earlier this round
+was already dense with `OpTailCallMethod` for exactly this reason
+(`return ..., super.parse()` is itself in tail position). Read
+`pkg/vm/vm.go`'s `OpTailCallMethod` handler directly (starting at line
+4013): its frame-reuse step reassigns `frame.closure`, `frame.ip`,
+`frame.thisValue`, `frame.isConstructorCall`, `frame.isDirectCall`,
+`frame.isSentinelFrame`, `frame.generatorObj`, `frame.promiseObj`,
+`frame.argCount`, `frame.args`, and `frame.spillSlots` for the new
+callee - but never `frame.homeObject`, the exact field `OpGetSuper`
+reads for non-arrow closures. Built the first repro all round to
+finally reproduce standalone:
+
+```js
+class Base { parse() { return "base-parse"; } }
+const mixin = (e) => class extends e { parse() { return super.parse(); } };
+const Sub = mixin(Base);
+function run(p) { return p.parse(); }   // tail call position, NOT itself a method
+console.log(run(new Sub()));
+```
+
+Fails on paserati (both the bare `paserati` CLI and via noderati),
+succeeds on real Node. A control removing only the tail position
+(`return p.parse() + ""`) passes on both engines, isolating tail-call
+frame reuse as the exact differentiating ingredient after eleven other
+shapes failed to isolate it. A second case (`super.toString` read,
+not called, same tail-position shape) fails identically, showing the
+defect isn't specific to `super.x()` calls - a bare `super.x` property
+read reached the same way fails too.
+
+Filed as [paserati#285](https://github.com/nooga/paserati/issues/285),
+scoped to the observed facts per `advisor`'s review: which frame
+fields the reuse step does and doesn't reassign, and that behavior
+flips exactly on tail-vs-non-tail position - without asserting the
+unverified specifics of what stale value ends up read (never printed
+it) or whether the arrow-function branch is equally affected (untested,
+noted as an open question rather than implied coverage).
 
 Confirmed `babel.cjs` restored clean (`diff -q` against the
-`npm pack` reference) after both patch cycles this round.
+`npm pack` reference) after every patch cycle this round.
 
 **Status**: #283 verified fixed (with the corrected parser-vs-
-compiler framing above); ten-bug regression suite still holds; all six
-TS-syntax-family variants now advance past #283 into a single, not-
-yet-root-caused `OpGetSuper` failure. Marker-bisection narrowed it to
-one exact call site (`super.parse()` in the TypeScript parser mixin,
-`babel.cjs` byte offset 773859) out of 244 `super` usages in the
-bundle; a second marker confirmed the dispatch target is never
-reached, not merely something downstream of it. Ten distinct
-synthetic-repro shapes falsified in total this round, including the
-real class's own text run verbatim in isolation - ruling out syntax
-shape entirely as the discriminator. Three untested context-level
-candidates remain (upvalues, real constructor, real multi-plugin
-fold). Not yet filed - no verified mechanism to write up yet, per this
-session's standing rule against asserting an unverified root cause.
+compiler framing above); ten-bug regression suite still holds. The new
+blocker - a method invoked in tail position losing `[[HomeObject]]`,
+so any `super` usage inside it throws - is root-caused to
+`OpTailCallMethod`'s frame-reuse step in `pkg/vm/vm.go` and filed as
+paserati#285, with a four-line standalone repro and a flipping control.
+Thirteen synthetic-repro shapes were built and falsified before the
+fourteenth (varying the *call site*, not the *callee*) finally
+reproduced it - the marker-bisection technique that narrowed the
+search space, and the fold-list instrumentation that closed off the
+multi-plugin hypothesis, were both necessary to get there. This is the
+same TCO-adjacent subsystem flagged, then dropped without testing, in
+an earlier round of this session - this time verified against source
+and a working repro before being named.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
