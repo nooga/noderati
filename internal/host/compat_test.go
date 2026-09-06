@@ -240,7 +240,18 @@ func TestNodeMissingResolver(t *testing.T) {
 	if len(errs) == 0 {
 		t.Fatal("expected error for missing node:net")
 	}
-	if !strings.Contains(errs[0].Error(), "Cannot find module 'node:net'") {
+	// This asserts noderati's own message shape, not a byte-exact match
+	// to real Node: node:net is a real Node builtin (just not one
+	// noderati implements, tracked as a Phase 5 gap), so real Node
+	// doesn't error on this import at all. NodeMissingResolver's doc
+	// comment (nodemissing.go) explains why "No such built-in module"
+	// is still the more honest of the two message shapes available -
+	// it's real Node's actual ERR_UNKNOWN_BUILTIN_MODULE wording (for a
+	// name that genuinely isn't a Node builtin), not ERR_MODULE_NOT_FOUND's
+	// "Cannot find module" (Node's message for a missing bare/relative
+	// specifier instead - confirmed directly against real Node when this
+	// was fixed, round 64, docs/real-node-plan.md's Phase 4 section).
+	if !strings.Contains(errs[0].Error(), "No such built-in module: node:net") {
 		t.Errorf("error = %q", errs[0].Error())
 	}
 }
@@ -253,8 +264,21 @@ func TestMissingNodeBuiltinNamedError(t *testing.T) {
 		t.Fatal("expected error for missing node:net")
 	}
 	msg := errs[0].Error()
-	if !strings.Contains(msg, "Cannot find module 'node:net'") {
-		t.Errorf("error = %q, want named cannot-find-module", msg)
+	if !strings.Contains(msg, "No such built-in module: node:net") {
+		t.Errorf("error = %q, want named no-such-built-in-module", msg)
+	}
+}
+
+func TestMissingBarePackageNamedError(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	_, errs := p.RunCode(`import "some-totally-nonexistent-npm-package-xyz"`, driver.RunOptions{})
+	if len(errs) == 0 {
+		t.Fatal("expected error for missing bare package")
+	}
+	msg := errs[0].Error()
+	if !strings.Contains(msg, "Cannot find package 'some-totally-nonexistent-npm-package-xyz'") {
+		t.Errorf("error = %q, want named cannot-find-package", msg)
 	}
 }
 

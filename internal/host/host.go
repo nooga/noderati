@@ -3,7 +3,6 @@ package host
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/nooga/paserati/pkg/builtins"
 	"github.com/nooga/paserati/pkg/driver"
@@ -23,28 +22,12 @@ func New(argv []string) *driver.Paserati {
 	installBufferGlobal(p)
 	installAssertGlobal(p)
 	installWorkerThreadsExports(p)
-	dirs := append(entryScriptDirs(argv), findPiCodingAgentNodeModulesRoots()...)
-	p.AddResolver(NewNodeModulesResolver(dirs...))
+	p.AddResolver(NewNodeModulesResolver())
 	p.AddResolver(NewPackageImportsResolver())
 	p.AddResolver(NewJSShimResolver())
 	p.AddResolver(NewOSPathResolver())
 	p.AddResolver(NewNodeMissingResolver())
 	return p
-}
-
-func entryScriptDirs(argv []string) []string {
-	if len(argv) < 2 {
-		return nil
-	}
-	script := argv[1]
-	if script == "-e" || script == "-p" {
-		return nil
-	}
-	abs, err := filepath.Abs(script)
-	if err != nil {
-		return nil
-	}
-	return []string{filepath.Dir(abs)}
 }
 
 func installModules(p *driver.Paserati) {
@@ -103,9 +86,23 @@ func installModules(p *driver.Paserati) {
 	// that surface stays unverified by this deletion. node_modules
 	// resolution now always loads the real pi-tui package.
 	// @earendil-works/pi-ai and @earendil-works/pi-agent-core's fakes were
-	// deleted 2026-09-05 (round 47/48) — see the deletion note atop
-	// piai.go for the verification and the Bedrock-provider caveat.
-	// node_modules resolution now always loads both real packages.
+	// deleted 2026-09-05 (round 47/48): a real Fireworks end-to-end test
+	// via `--provider fireworks -p "..."` with both fakes off returned
+	// correct completions 3/3 runs, across both a single-word and a
+	// multi-line reply — the first time this pair worked against a live
+	// backend. Not verified by that deletion: the Bedrock provider path
+	// specifically, which pulls in http-proxy-agent/https-proxy-agent
+	// (and through them `debug`) — blocked on noderati having no `net`
+	// module at all (Phase 5) and, once `net` exists, on paserati#252 (a
+	// native-module reflection bug unrelated to this fake). Every other
+	// provider path (openai-completions, anthropic-messages,
+	// google-generative-ai, azure, mistral, openrouter, cloudflare)
+	// doesn't touch either dependency. node_modules resolution now always
+	// loads both real packages; the resolver helper that used to live in
+	// piai.go (findPiCodingAgentNodeModulesRoots, hardcoded homebrew
+	// global-install paths) was deleted 2026-09-06 (round 64, Phase 4) —
+	// findPackageDir's own real-Node-style walk-up already reaches these
+	// packages from wherever the importing file actually lives.
 	declarePerfHooks()
 	declareStringDecoder()
 	// typebox's own top-level entry (Type.Object etc.) was deleted

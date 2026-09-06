@@ -95,17 +95,24 @@ the full verification history, including why individual verification isn't
 sufficient on its own (it happened twice in a row here, before this final
 patch).
 
-**D. Resolver-side dirty tricks, independent of the above:**
-- `findPiCodingAgentNodeModulesRoots()` (`piai.go`) hardcodes
-  `/opt/homebrew/lib/node_modules/...` and `/usr/local/lib/...` and splices
-  them into every program's resolver roots, unconditionally. Real Node walks
-  up from the entry file's directory through `node_modules` at each level.
-  There is no walk-up implementation to fall back on right now — this hack
-  isn't a shortcut alongside real resolution, it's standing in for it.
-- `NodeMissingResolver` turns an unresolvable `node:*` specifier into
-  a module whose *body* throws at runtime, instead of failing resolution
-  immediately with a clear "no resolver for X" error and a spot to enumerate
-  what got asked for. Fine as a last-resort fallback; wrong as silent policy.
+**D. Resolver-side dirty tricks, independent of the above — closed 2026-09-06
+(round 64, Phase 4).** Both fixed; see the Phase 4 section and the round-64
+entry for the verification. Kept here, struck through in spirit rather than
+deleted outright, so this section's own history stays legible:
+- ~~`findPiCodingAgentNodeModulesRoots()` (`piai.go`) hardcodes
+  `/opt/homebrew/lib/node_modules/...` and `/usr/local/lib/...`...~~ — turned
+  out `NodeModulesResolver`'s own `findPackageDir` already implements the
+  real walk-up this note assumed didn't exist; deleted the hardcoded
+  fallback (and `piai.go` itself) once testing confirmed the walk-up alone
+  reaches everything a real invocation needs.
+- ~~`NodeMissingResolver` turns an unresolvable `node:*` specifier into
+  a module whose body throws at runtime...~~ — that part turned out to
+  already match how ES module linking actually fails in both engines
+  (eagerly, before the importing module's own code runs); what was
+  genuinely wrong was the *message*, a paserati-internal string instead of
+  Node's own `ERR_MODULE_NOT_FOUND`/`ERR_UNKNOWN_BUILTIN_MODULE` shapes.
+  Fixed, and extended to cover every specifier shape nothing else could
+  resolve (bare packages, relative/absolute paths), not just `node:*`.
 
 ## What's already fixed upstream (verified, not assumed)
 
@@ -6767,6 +6774,127 @@ exercise of pi-coding-agent's TUI/interactive mode (per the standing
 pi-tui deletion note, that surface needs an attached terminal/pty to
 test meaningfully on any engine and stays deliberately unverified
 here). Neither was attempted or claimed this round.
+
+**Sixty-fourth round (2026-09-06, same day) — committed and fast-
+forward-merged all 93 commits of the phase1-close-phase2-scoreboard
+branch into main, then did Phase 4 (resolver honesty) end to end: both
+of ledger group D's items turned out smaller than the plan assumed,
+verified by testing rather than trusted from the plan text, and both
+are now closed.** User asked to commit, merge to main, then prep for
+the next phase.
+
+Merged cleanly (main hadn't diverged, straight fast-forward,
+91ef991→860b9ec). Recon before committing to a plan: `NodeModulesResolver`'s
+`findPackageDir` already implements a real Node-style walk-up (climbs
+parent directories checking `node_modules/<pkg>` at each level) - the
+plan's own "there is no walk-up implementation to fall back on" note
+(this document's ledger group D) was stale. Tested with both
+`findPiCodingAgentNodeModulesRoots()`'s hardcoded homebrew paths *and*
+`entryScriptDirs()`'s entry-script fallback completely removed: `pi
+--version`/`--help`/`-p` (real Fireworks backend), the full scoreboard,
+and pi-coding-agent's own real extension-loader call pattern (run from
+`loader.js`'s own real path, matching how it's actually invoked) all
+still passed. Asked the user before committing to implementing (recon
+this cheap and this validated didn't need to stay just a plan) -
+confirmed, proceeded.
+
+Deleted the `extraDirs` mechanism from `NodeModulesResolver` entirely
+(not just called with empty args - the parameter, the field, and the
+fallback loop are gone), `entryScriptDirs()`, and
+`findPiCodingAgentNodeModulesRoots()` along with the now-fully-dead
+`piai.go` that held it. Moved that file's Bedrock-provider-unverified
+caveat into `host.go`'s own comment rather than letting it vanish with
+the file (`advisor` caught the dangling "see piai.go" reference before
+commit).
+
+Fixed `NodeMissingResolver` next, after directly testing (not
+assuming) what it currently does wrong. Real Node's actual behavior
+for an unresolvable import: a static `import` of a genuinely-missing
+specifier throws *before* any of the importing module's own top-level
+code runs (confirmed: a script that prints something before such an
+import never gets to print it, in both engines) - so the existing
+"module whose body throws" approach was already behaviorally correct
+for the common case, contrary to the plan's framing. What was
+genuinely wrong: the *message* - a paserati-internal "no resolver
+could handle specifier: X" instead of any of Node's own three shapes,
+confirmed directly against real Node for each:
+
+- `node:xxx` naming an unrecognized builtin → `ERR_UNKNOWN_BUILTIN_MODULE`,
+  `"No such built-in module: node:xxx"` (not `ERR_MODULE_NOT_FOUND`'s
+  "Cannot find module", which the previous implementation used and
+  which is real Node's message for a *different* case).
+- a relative/absolute path specifier → `ERR_MODULE_NOT_FOUND`,
+  `"Cannot find module '<absolute path>' imported from <fromPath>"` -
+  the path in the message is the *resolved* absolute path, not the raw
+  specifier as written (confirmed: `./does-not-exist.mjs` becomes
+  `/private/tmp/does-not-exist.mjs` in real Node's own message).
+- an ordinary bare package specifier → `ERR_MODULE_NOT_FOUND`,
+  `"Cannot find package 'xxx' imported from <fromPath>"`.
+
+`NodeMissingResolver`'s `CanResolve` was `node:`-prefix-only before;
+widened to unconditionally `true` so it also catches the second and
+third cases (previously falling through to the same generic loader
+message with no specifier-shape awareness at all). Verified this
+doesn't shadow any real resolver: grepped every resolver's own
+`Priority()` across both repos - `NodeMissingResolver` sits at 200,
+every resolver host.go registers sits at -50/-10/0/50, and paserati's
+own unregistered-by-default `FileSystemResolver`/`MemoryResolver` sit
+at 100/50 - all below 200, so nothing this resolver could shadow was
+ever going to be tried after it regardless. Confirmed with a positive
+case rather than trusting the priority numbers alone: a real relative
+import (`import { v } from "./dep.mjs"`) still resolves and prints `42`
+correctly with the widened `CanResolve` in place (`advisor` asked for
+this specifically - the earlier "relative import fails with the new
+message" test couldn't distinguish "message improved" from "resolution
+silently broke," since both look identical from that one test alone).
+
+One honest caveat, worth stating plainly rather than glossing over:
+`node:net` (the specifier this ledger's own pre-existing test asserts
+against) is a *real* Node builtin - just one noderati doesn't
+implement (a tracked Phase 5 gap) - so real Node doesn't error on it
+at all. `"No such built-in module: node:net"` is therefore not a
+byte-exact match to what real Node would actually do here (nothing);
+it's the more honest of the two message shapes available given
+noderati has no registry of real-builtin-names-not-yet-implemented to
+consult, and it does correctly describe *this* runtime's own gap.
+Updated the two existing tests asserting the old, wrong message to
+assert the new one, with this caveat recorded in both the test and
+`NodeMissingResolver`'s own doc comment so a future round doesn't
+have to re-derive it or mistake it for an exact-match claim.
+
+Re-verified everything end to end after both changes: `go build`/`go
+test` clean; `pi --version`/`--help`/`-p` (Fireworks) all still
+succeed; the scoreboard still matches baseline with nothing left to
+disable; all six TS-syntax-family variants and the multi-file `ext3/`
+test from round 61 all still pass, run from a real anchor point inside
+pi-coding-agent's own tree (a `dist/core/extensions/` scratch
+directory, matching how `loader.js` itself is actually invoked) rather
+than from `/tmp`, since the `/tmp`-anchored version of that same
+harness no longer resolves `jiti` at all without the deleted fallback
+- correctly so, matching what real Node also does for a script that
+was never really part of any package's node_modules tree (confirmed
+this distinction directly, not assumed). The `ext3/` re-run's own
+relative `./helper.ts` import was rewritten to an absolute path for
+this scratch relocation, so that specific re-run no longer exercises
+relative-import resolution through this resolver chain (jiti resolves
+that internally); the separate `/tmp/relcheck` positive test above is
+what actually covers the `CanResolve` widening's safety, not this one -
+worth being precise about rather than implying broader coverage than
+was actually run.
+
+**Status**: ledger group D (resolver-side dirty tricks) is closed -
+both items were real, but smaller and differently-shaped than the plan
+described, confirmed by testing rather than trusted from the plan
+text. `internal/host` no longer contains any hardcoded install-path
+fallback or entry-script-directory special-casing; resolution is
+real-Node-shaped walk-up, unconditionally. Missing-module errors now
+match real Node's own three message shapes (unknown builtin, missing
+relative/absolute path, missing bare package), each confirmed directly
+against real Node, with the one honest caveat above recorded rather
+than glossed over. Not yet attempted: Phase 5 (the `net`/`tls` gap that
+blocks Bedrock, a real `stream` beyond the current EventEmitter base,
+verifying `undici` against the real npm package) and Phase 6 (real
+`tsc`) - both still open, neither started this round.
 
 ## Definition of done for this push
 

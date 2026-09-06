@@ -13,16 +13,31 @@ import (
 	"github.com/nooga/paserati/pkg/modules"
 )
 
-// NodeModulesResolver resolves bare npm package specifiers from node_modules.
+// NodeModulesResolver resolves bare npm package specifiers from node_modules,
+// by walking up from the importing file's own directory the way Node's real
+// resolution algorithm does (see findPackageDir) - never from any extra,
+// hardcoded root. It used to also accept a variadic list of "extra
+// directories" (the entry script's own directory, plus - until round 63 -
+// a couple of hardcoded homebrew global-install paths so pi-coding-agent's
+// own dependencies could be found regardless of where noderati happened to
+// be invoked from). Deleted 2026-09-06 (round 64, docs/real-node-plan.md's
+// Phase 4 section): confirmed, by testing with both removed entirely, that
+// findPackageDir's own walk-up already reaches every real dependency a real
+// invocation needs - pi --version/--help/-p (real Fireworks backend), the
+// full scoreboard, and pi-coding-agent's own real extension-loader call
+// pattern (createJiti(import.meta.url,...) from loader.js's own real path)
+// all still pass with zero extra directories. The one thing that stops
+// working is resolving a bare specifier from a script that was never
+// actually part of any package's own node_modules tree in the first place -
+// which is exactly what real Node also fails at, not a noderati gap.
 type NodeModulesResolver struct {
-	priority  int
-	extraDirs []string
+	priority int
 }
 
-// NewNodeModulesResolver returns a resolver that loads packages from node_modules.
-// extraDirs are additional roots to search (e.g. the entry script's directory).
-func NewNodeModulesResolver(extraDirs ...string) *NodeModulesResolver {
-	return &NodeModulesResolver{priority: 0, extraDirs: extraDirs}
+// NewNodeModulesResolver returns a resolver that loads packages from
+// node_modules by walking up from the importing file's own directory.
+func NewNodeModulesResolver() *NodeModulesResolver {
+	return &NodeModulesResolver{priority: 0}
 }
 
 func (r *NodeModulesResolver) Name() string {
@@ -57,17 +72,6 @@ func (r *NodeModulesResolver) Resolve(specifier string, fromPath string) (*modul
 
 	pkgName, subpath := splitPackageSpecifier(specifier)
 	pkgDir, err := findPackageDir(startDir, pkgName)
-	if err != nil {
-		for _, extra := range r.extraDirs {
-			if extra == "" {
-				continue
-			}
-			pkgDir, err = findPackageDir(extra, pkgName)
-			if err == nil {
-				break
-			}
-		}
-	}
 	if err != nil {
 		return nil, fmt.Errorf("package %q not found: %w", pkgName, err)
 	}
