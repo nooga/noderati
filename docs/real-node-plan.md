@@ -6300,13 +6300,17 @@ a real-pipeline-only reproduction.
 **Sixty-second round (2026-09-06, same day) — verified #283's fix,
 confirmed the ten-bug regression suite still holds, watched all six
 TS-syntax-family variants advance past #283 into a new, single
-`OpLoadSuper` runtime failure, and - via a from-scratch marker-
+`OpGetSuper` runtime failure, and - via a from-scratch marker-
 bisection technique rather than guessed repro shapes - pinned the
 exact failing call site inside `@babel/parser`'s bundled TypeScript
-mixin. Root cause not yet found: seven increasingly faithful synthetic
-repros of that site's own shape all pass correctly, so the mechanism
-remains open at round end.** User reported "FIXES ON MAIN local,"
-instructing continuation.
+mixin, then confirmed the base class it should dispatch to is never
+entered. Root cause still not found: ten increasingly faithful
+synthetic repros - up to and including the real 56KB mixin class body
+extracted **verbatim** from `babel.cjs` - all pass correctly, so the
+discriminator is somewhere in the surrounding context (closure/upvalue
+wiring, the real constructor, or the real multi-plugin fold), not in
+any syntactic shape tried so far.** User reported "FIXES ON MAIN
+local," instructing continuation.
 
 Pulled paserati main (no-op fetch/checkout - already current). `git
 log -1 --format=%B b3c76792` confirms #283's fix and, importantly,
@@ -6354,9 +6358,14 @@ itself. Re-confirmed `babel.cjs`/`jiti.cjs` clean against the
 instrumentation from a prior round.
 
 Grepped for the error text and found it is **not** a parser-time
-error at all - it's a VM runtime check, `OpLoadSuper` at
-`pkg/vm/vm.go:12263`, which throws whenever the executing frame's (or,
-for an arrow, its `closure.CapturedHomeObject`'s) home object is
+error at all - it's a VM runtime check. `pkg/vm/vm.go` has five
+opcodes that each carry their own identical "super keyword is only
+valid inside methods" check (`OpLoadSuper`, `OpGetSuper`, and three
+others); the one actually hit here is `OpGetSuper`, at
+`pkg/vm/vm.go:12342` (an earlier read of this investigation misnamed
+it `OpLoadSuper` at line 12263, a different opcode's identical check -
+corrected here). It throws whenever the executing frame's (or, for an
+arrow, its `closure.CapturedHomeObject`'s) home object is
 undefined/null. This reframed the investigation: the failure is a
 runtime home-object-capture defect, not a parse-time gap, and the
 natural first hypothesis (an arrow function nested in a class/object
@@ -6429,29 +6438,83 @@ never going to find it (a mistake this round made rather than
 avoided, despite catching two similar mistakes in earlier rounds).
 Second, that `SITE_HIT 205` printing only proves the marker executed
 before `super.parse()` was evaluated - it does **not** prove that
-`OpLoadSuper` itself is what fails, since real Node's own tail
+`OpGetSuper` itself is what fails, since real Node's own tail
 (`163, 195, 144, 146`) shows site 205 is reached mid-parse, well
 before the file finishes, so there is real, unexamined execution
 between the marker and the crash (specifically: whatever `super.parse()`
 itself dispatches into, most directly the base-class `parse()` method
-its `[[HomeObject]]`'s prototype should resolve to). That "does
-`super.parse()`'s target ever get reached" check is the concrete next
-step, not yet run when this round ended.
+its `[[HomeObject]]`'s prototype should resolve to).
+
+Ran that check: patched a single `console.error("BASE_PARSE_ENTERED")`
+at the very first statement of the base (non-mixin) `Parser.parse()`
+method - the one at `babel.cjs` byte offset 861356, `parse(){this.
+enterInitialScopes();...}`, confirmed via the same acorn-based
+`MethodDefinition` search to be the only candidate `parse()` with no
+`super` call of its own (the other two - the TypeScript mixin's, at
+773775, and an `estree` mixin's, at 660486, both call `super.parse()`
+themselves and were already covered by the marker-bisection's 235
+sites, neither of which fired). Verified transparent on real Node
+first (prints `BASE_PARSE_ENTERED` then the correct output). On
+noderati: **the marker never printed** - confirming the TypeScript
+mixin's own `super.parse()` dispatch is the failure itself, not
+something downstream of it. Restored `babel.cjs` clean immediately
+after.
+
+With the failing site now doubly confirmed, tried a decisive new
+angle instead of another guessed shape: extracted the TypeScript
+mixin's class body **verbatim** from `babel.cjs` (acorn located the
+enclosing `ClassExpression`, bytes 722512-778866, 56KB, `superClass`
+a bare identifier `e` matching `class extends e{...}`), wrapped it as
+`const mixin = (e) => <verbatim class text>;`, applied it to a small
+stub `Base` with matching method names, and constructed an instance
+via `Object.create(mixin(Base).prototype)` (skipping the real
+constructor, which reads several undeclared free variables - `Z`,
+`TypeScriptScopeHandler`, etc. - that only exist as upvalues inside
+babel.cjs's own module closure). **This passed correctly on both
+engines** - the exact, byte-for-byte real class, calling `.parse()`,
+works fine standalone. Confirmed via a disassembly comparison first
+that the compiled bytecode for the *method itself* is not the
+differentiator: `paserati`'s own `--bytecode --disasm-filter=parse`
+flag (an existing, uncommitted-to feature, used read-only via a
+locally-built `paserati` CLI binary) shows the real TypeScript mixin's
+`parse()` compiles to the identical `OpGetSuper`+`OpTailCallMethod`
+instruction pair as a minimal working repro's `parse()` - so the two
+endpoints (verbatim class in isolation: works; same class inside the
+full bundle: fails) mean the discriminator is in the *surrounding
+context* the class is compiled/instantiated within, not in the class's
+own text or its compiled method bytecode.
+
+`advisor` named three concrete candidates for that context, in
+priority order, none yet tested when this round ended: (a) the class
+expression is a **nested closure with upvalues** inside babel.cjs's
+own module-wrapper function (`Z`, `TypeScriptScopeHandler`, etc. are
+free variables captured from that enclosing scope, not undefined
+globals as in the isolated extraction) - untested; (b) the real
+`new Parser(...)` constructor path (this round's isolated test used
+`Object.create` to skip the constructor entirely) - untested; (c) the
+real `getParser` fold combining roughly a dozen enabled plugin mixins
+(the `parserOpts.plugins` array from round 61's #283 investigation had
+12 entries), versus this round's single `mixin(Base)` application -
+untested. Explicitly not yet asserted as the mechanism per this
+session's standing rule against unverified root-cause claims.
 
 Confirmed `babel.cjs` restored clean (`diff -q` against the
-`npm pack` reference) after the bisection patch cycle.
+`npm pack` reference) after both patch cycles this round.
 
 **Status**: #283 verified fixed (with the corrected parser-vs-
 compiler framing above); ten-bug regression suite still holds; all six
 TS-syntax-family variants now advance past #283 into a single, not-
-yet-root-caused `OpLoadSuper` failure. Marker-bisection narrowed it to
+yet-root-caused `OpGetSuper` failure. Marker-bisection narrowed it to
 one exact call site (`super.parse()` in the TypeScript parser mixin,
 `babel.cjs` byte offset 773859) out of 244 `super` usages in the
-bundle, ruling out seven distinct synthetic-repro shapes along the
-way. Not yet known: whether the failure is in dispatching `super.parse()`
-itself or somewhere in what it calls into. Not yet filed - no
-verified mechanism to write up yet, per this session's standing rule
-against asserting an unverified root cause.
+bundle; a second marker confirmed the dispatch target is never
+reached, not merely something downstream of it. Ten distinct
+synthetic-repro shapes falsified in total this round, including the
+real class's own text run verbatim in isolation - ruling out syntax
+shape entirely as the discriminator. Three untested context-level
+candidates remain (upvalues, real constructor, real multi-plugin
+fold). Not yet filed - no verified mechanism to write up yet, per this
+session's standing rule against asserting an unverified root cause.
 
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
