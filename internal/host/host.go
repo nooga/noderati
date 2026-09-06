@@ -21,6 +21,7 @@ func New(argv []string) *driver.Paserati {
 		fmt.Fprintf(os.Stderr, "noderati: preload native modules: %v\n", err)
 	}
 	installBufferGlobal(p)
+	installAssertGlobal(p)
 	installWorkerThreadsExports(p)
 	dirs := append(entryScriptDirs(argv), findPiCodingAgentNodeModulesRoots()...)
 	p.AddResolver(NewNodeModulesResolver(dirs...))
