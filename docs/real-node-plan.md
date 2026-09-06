@@ -6896,6 +6896,147 @@ blocks Bedrock, a real `stream` beyond the current EventEmitter base,
 verifying `undici` against the real npm package) and Phase 6 (real
 `tsc`) - both still open, neither started this round.
 
+**Sixty-fifth round (2026-09-06, same day) — user asked for a runnable
+command to launch pi's TUI with Fireworks, then reported it back
+broken ("nothing happens, no tui renders, no input accepted"). Found
+and fixed three real, compounding engine/host gaps that had made
+noderati's entire interactive-mode surface inert: `process.prependListener`/
+`addListener` missing, `process.kill` missing (with zero OS-signal-to-JS
+bridging at all), and `process.stdin.setRawMode` being a no-op combined
+with `resume()` never starting a reader for TTY stdin in the first
+place.** Unplanned work (this document had no Phase 5 TUI item yet),
+driven directly by the user's own bug report rather than by the ledger.
+
+The command given was `pi --provider fireworks --model
+accounts/fireworks/models/glm-5p2` (no `-p`, so pi's default interactive
+TUI mode). It hung: no render, no error, no input echo - the same
+"silently swallowed exception inside an async chain" failure shape this
+document has hit before (`assert` in round 60, the tail-call
+`[[HomeObject]]` bug before that), so the same methodology applied:
+patch a **scratch copy** of the real, unmodified pi-coding-agent
+install (`dist/` + `node_modules/`, copied to `/tmp/pi_scratch/`, never
+the real npm install) with `appendFileSync`-based `TRACE()` markers in
+`main.js` and `interactive-mode.js`, then re-run under a real pty to
+see exactly where execution stops. A bare Bash tool call has no real
+tty at all (so `stdin.isTTY` reads false and masks the actual bug path -
+confirmed by first trying `timeout 8 ... < /dev/null`, which returned
+instantly with zero output and no repro), so reproducing this at all
+required macOS `script -q <file> <cmd> < /dev/null` to allocate a
+genuine pty, and later `expect` to inject real keystrokes into a live
+one.
+
+**Gap 1 - `process.prependListener`/`addListener` missing entirely.**
+pi-coding-agent's `registerSignalHandlers()` calls
+`process.prependListener`, which didn't exist on noderati's `process`
+object (`typeof` → `undefined`) - a synchronous `TypeError` thrown
+inside an async `init()` that nothing ever surfaced, hanging the whole
+process with zero output instead of a visible error. Fixed in
+[emitter.go](../internal/host/emitter.go): `newEventEmitterObject`
+(the shared helper backing `process`, streams, etc.) gained
+`addListener` (a plain alias for `on` - real Node's EventEmitter
+exposes both), `prependListener`, `prependOnceListener`,
+`removeAllListeners`, `listenerCount`, and `listeners`.
+`addListener`/`once`/`prependListener`/`prependOnceListener` all now
+route through one `addListener(vmInst, obj, event, listener, once,
+prepend)` helper, with `prepend` inserting at index 0 (shifting
+everything else up) instead of appending.
+
+**Gap 2 - `process.kill` missing, and zero OS-signal-to-JS bridging at
+all.** With gap 1 fixed, the same silent-hang shape recurred one layer
+in: `@earendil-works/pi-tui`'s `ProcessTerminal.start()` self-signals
+via `process.kill(process.pid, "SIGWINCH")` to force a terminal-size
+refresh, and `process.kill` didn't exist either. Beyond just adding
+that one function, actually supporting it exposed that noderati had
+**no OS-signal-to-JS-event bridge whatsoever** - even a correctly-sent
+signal (self-sent or a real external `kill -TERM <pid>`) would arrive
+at the OS level and go nowhere, since nothing translated it into a JS
+`process.emit("SIGxxx")` call. Both fixed in the new
+[signals.go](../internal/host/signals.go): `installProcessKill` adds
+`process.kill(pid, signal)` (default `SIGTERM`, signal `0` as Node's
+existence-probe, real `ESRCH`/`ERR_UNKNOWN_SIGNAL` errors via a new
+generic `simpleException`/`simpleNodeError` pair mirroring
+`fs_errors.go`'s existing `vm.ExceptionError` pattern); `startSignalBridge`
+calls `signal.Notify` on every signal name Node recognizes that's
+actually catchable, and re-emits each as a same-named event on
+`process` via `rt.ScheduleNextTick` (never touching VM state directly
+from the OS-signal-delivery goroutine). `SIGKILL`/`SIGSTOP` stay in
+`nodeSignals` (so `process.kill` can still *send* them - that part is
+real everywhere) but are explicitly skipped by the bridge, since no
+process on any OS can catch either one - a deliberate asymmetry between
+the two tables, called out in the code so a future pass doesn't "fix"
+it by symmetrizing them.
+
+**Gap 3 - `process.stdin.setRawMode` was a complete no-op, and
+`resume()` never read TTY stdin at all.** The last and biggest gap:
+`setRawMode(true)` only ever flipped a JS-visible `isRaw` flag - it
+never touched the real terminal, so the OS driver stayed line-buffered
+and echoing regardless of what the app asked for. Independently,
+`resume()` explicitly skipped starting its stdin-reading goroutine
+whenever stdin was a TTY. Together these meant **real interactive
+keyboard input was never read by noderati at all**, TTY or not - the
+most direct possible confirmation of the user's own "no input accepted"
+report. Fixed in [process.go](../internal/host/process.go):
+`setRawMode` now calls `golang.org/x/term`'s `MakeRaw`/`Restore`
+(already imported in this file for TTY size detection), tracking the
+returned `*term.State` in a closure so it can be restored later; the
+TTY special-case was deleted from `resume()` entirely, since
+`os.Stdin.Read` blocks correctly either way (line-buffered without raw
+mode, byte-at-a-time with it) - there was never a real reason to
+special-case TTY stdin out of reading at all.
+
+Noted directly in `setRawMode`'s own comment rather than left implicit:
+`term.MakeRaw` mutates the *real* controlling terminal, and nothing
+restores it automatically if the process dies without calling
+`setRawMode(false)` first - a panic, a skip-cleanup `os.Exit`, or a hard
+kill all leave the user's shell stuck in raw mode after this process
+exits. Real Node has the identical footgun. Checked pi-tui's own
+source rather than assuming: its `Terminal.stop()` (called from pi's
+`shutdown()`, which its `SIGTERM`/`SIGINT` handlers call, which now
+actually fire thanks to gap 2's fix) does call
+`process.stdin.setRawMode(this.wasRaw)` as part of normal cleanup - so
+the common paths are covered by the app itself, not by noderati. A
+`SIGKILL` or an unhandled crash still has no recovery; that's inherent
+to raw mode on any platform, not a gap this host can close.
+
+**Verification.** Each gap confirmed independently before moving to the
+next (isolated one-liner tests reproducing just that `TypeError`/no-op,
+then re-tracing the full TUI startup after the fix). After all three:
+a full pty capture (`script`) of the TUI now renders identically to
+real Node's own render of the same command; a fresh `expect` script
+that types `"hello world"` shows the text landing correctly inside the
+TUI's own styled editor box (three occurrences, properly ANSI-wrapped,
+surviving an intervening "Update Available" re-render) rather than as
+raw OS-level echo, which is what happened before this round. Honest
+caveat, not glossed over: that same test's Enter keypress did not
+visibly submit the message before the test's own timeout killed the
+process - most likely because an `expect`-driven synthetic pty doesn't
+answer the terminal capability queries (e.g. pi-tui's
+`queryAndEnableKittyProtocol()`) a real terminal emulator would, not a
+remaining noderati bug, but **not independently confirmed either way** -
+this needs a real terminal, which none of this session's tools can
+fully provide. The user is the authoritative test for this specific
+question: re-running the original TUI command in their own terminal
+now that rendering and keystroke-capture are confirmed fixed.
+
+Also checked, since these three changes touch shared, high-traffic
+surface (`process`, its EventEmitter base, and stdin's resume path) and
+not just TUI-specific code: a plain non-TUI script that calls
+`process.stdin.resume()` then exits on its own timer still exits
+cleanly (no hang from the now-always-started stdin-reader goroutine);
+`pi --version`, `pi --help`, and `pi -p "..." --provider fireworks
+--model accounts/fireworks/models/glm-5p2` (a real, live, credentialed
+round trip) all still succeed against the real, unmodified npm install;
+`go build ./...` and `go test -count=1 ./...` both clean; the scoreboard
+still matches baseline with nothing left to disable.
+
+**Status**: all three TUI-blocking gaps are fixed and independently
+verified up through "keystrokes render correctly inside the app's own
+UI." Not yet confirmed: Enter-key message submission, arrow-key
+navigation, and any ctrl-key handling in the TUI - none of this
+session's tools can drive a genuine interactive terminal session, so
+these remain open questions for the user to confirm directly rather
+than claims this document asserts as verified.
+
 ## Definition of done for this push
 
 `pi --help`, `pi --version`, and a scripted single-turn `pi -p "..."` print-mode

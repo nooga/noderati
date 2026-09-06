@@ -10,16 +10,49 @@ func newEventEmitterObject(vmInst *vm.VM) *vm.PlainObject {
 	obj.SetOwn("_events", vm.NewValueFromPlainObject(eventsTable))
 
 	obj.SetOwn("on", vm.NewNativeFunction(2, false, "on", func(args []vm.Value) (vm.Value, error) {
-		return addListener(vmInst, obj, args[0].ToString(), args[1], false), nil
+		return addListener(vmInst, obj, args[0].ToString(), args[1], false, false), nil
+	}))
+	// addListener is a plain alias for on - real Node's EventEmitter (which
+	// process, streams, etc. all really are) exposes both under the same
+	// behavior; only the name differs. Missing this specifically broke
+	// pi-coding-agent's TUI startup (round 65, docs/real-node-plan.md's
+	// Phase 5 section): registerSignalHandlers() calls
+	// process.prependListener, which - like this one, before this fix -
+	// didn't exist, throwing a TypeError inside an async init() that never
+	// surfaced as a visible error, hanging the whole process with zero
+	// output instead.
+	obj.SetOwn("addListener", vm.NewNativeFunction(2, false, "addListener", func(args []vm.Value) (vm.Value, error) {
+		return addListener(vmInst, obj, args[0].ToString(), args[1], false, false), nil
 	}))
 	obj.SetOwn("once", vm.NewNativeFunction(2, false, "once", func(args []vm.Value) (vm.Value, error) {
-		return addListener(vmInst, obj, args[0].ToString(), args[1], true), nil
+		return addListener(vmInst, obj, args[0].ToString(), args[1], true, false), nil
+	}))
+	obj.SetOwn("prependListener", vm.NewNativeFunction(2, false, "prependListener", func(args []vm.Value) (vm.Value, error) {
+		return addListener(vmInst, obj, args[0].ToString(), args[1], false, true), nil
+	}))
+	obj.SetOwn("prependOnceListener", vm.NewNativeFunction(2, false, "prependOnceListener", func(args []vm.Value) (vm.Value, error) {
+		return addListener(vmInst, obj, args[0].ToString(), args[1], true, true), nil
 	}))
 	obj.SetOwn("off", vm.NewNativeFunction(2, false, "off", func(args []vm.Value) (vm.Value, error) {
 		return removeListener(obj, args[0].ToString(), args[1]), nil
 	}))
 	obj.SetOwn("removeListener", vm.NewNativeFunction(2, false, "removeListener", func(args []vm.Value) (vm.Value, error) {
 		return removeListener(obj, args[0].ToString(), args[1]), nil
+	}))
+	obj.SetOwn("removeAllListeners", vm.NewNativeFunction(1, false, "removeAllListeners", func(args []vm.Value) (vm.Value, error) {
+		return removeAllListeners(obj, args), nil
+	}))
+	obj.SetOwn("listenerCount", vm.NewNativeFunction(1, false, "listenerCount", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vm.NumberValue(0), nil
+		}
+		return vm.NumberValue(float64(listenerCount(obj, args[0].ToString()))), nil
+	}))
+	obj.SetOwn("listeners", vm.NewNativeFunction(1, false, "listeners", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vm.NewArray(), nil
+		}
+		return listenersOf(obj, args[0].ToString()), nil
 	}))
 	obj.SetOwn("emit", vm.NewNativeFunction(1, true, "emit", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
@@ -51,7 +84,7 @@ func newReadableStream(vmInst *vm.VM) *vm.PlainObject {
 				}
 			}
 			return vm.Undefined, nil
-		}), false)
+		}), false, false)
 		addListener(vmInst, obj, "end", vm.NewNativeFunction(0, false, "pipeEnd", func(_ []vm.Value) (vm.Value, error) {
 			if destObj := dest.AsPlainObject(); destObj != nil {
 				if endFn, ok := destObj.GetOwn("end"); ok && endFn.IsCallable() {
@@ -59,7 +92,7 @@ func newReadableStream(vmInst *vm.VM) *vm.PlainObject {
 				}
 			}
 			return vm.Undefined, nil
-		}), false)
+		}), false, false)
 		return dest, nil
 	}))
 	return obj
@@ -86,7 +119,13 @@ func getListenerArray(eventsTable *vm.PlainObject, event string) *vm.ArrayObject
 	return arr.AsArray()
 }
 
-func addListener(vmInst *vm.VM, obj *vm.PlainObject, event string, listener vm.Value, once bool) vm.Value {
+// addListener registers listener for event, appending it (Node's on/once/
+// addListener) or, when prepend is true, inserting it at index 0 instead
+// (Node's prependListener/prependOnceListener - used by e.g. real Node's
+// process.prependListener, which registerSignalHandlers-shaped code in
+// real-world npm packages calls for signal/uncaughtException handlers so
+// they run before any listener the packages themselves add later).
+func addListener(vmInst *vm.VM, obj *vm.PlainObject, event string, listener vm.Value, once bool, prepend bool) vm.Value {
 	if !listener.IsCallable() {
 		return vm.NewValueFromPlainObject(obj)
 	}
@@ -107,8 +146,87 @@ func addListener(vmInst *vm.VM, obj *vm.PlainObject, event string, listener vm.V
 		})
 	}
 	arr := getListenerArray(eventsTable, event)
-	arr.Append(fn)
+	if prepend {
+		n := arr.Length()
+		arr.SetLength(n + 1)
+		for i := n; i > 0; i-- {
+			arr.Set(i, arr.Get(i-1))
+		}
+		arr.Set(0, fn)
+	} else {
+		arr.Append(fn)
+	}
 	return vm.NewValueFromPlainObject(obj)
+}
+
+// removeAllListeners removes every listener for the given event, or every
+// listener for every event when called with no arguments (matching real
+// Node's EventEmitter.removeAllListeners()).
+func removeAllListeners(obj *vm.PlainObject, args []vm.Value) vm.Value {
+	eventsVal, ok := obj.GetOwn("_events")
+	if !ok {
+		return vm.NewValueFromPlainObject(obj)
+	}
+	eventsTable := eventsVal.AsPlainObject()
+	if eventsTable == nil {
+		return vm.NewValueFromPlainObject(obj)
+	}
+	if len(args) == 0 {
+		obj.SetOwn("_events", vm.NewValueFromPlainObject(vm.NewObject(vm.Undefined).AsPlainObject()))
+		return vm.NewValueFromPlainObject(obj)
+	}
+	event := args[0].ToString()
+	if existing, ok := eventsTable.GetOwn(event); ok {
+		if arr := existing.AsArray(); arr != nil {
+			arr.SetLength(0)
+		}
+	}
+	return vm.NewValueFromPlainObject(obj)
+}
+
+func listenerCount(obj *vm.PlainObject, event string) int {
+	eventsVal, ok := obj.GetOwn("_events")
+	if !ok {
+		return 0
+	}
+	eventsTable := eventsVal.AsPlainObject()
+	if eventsTable == nil {
+		return 0
+	}
+	existing, ok := eventsTable.GetOwn(event)
+	if !ok {
+		return 0
+	}
+	arr := existing.AsArray()
+	if arr == nil {
+		return 0
+	}
+	return arr.Length()
+}
+
+func listenersOf(obj *vm.PlainObject, event string) vm.Value {
+	out := vm.NewArray()
+	eventsVal, ok := obj.GetOwn("_events")
+	if !ok {
+		return out
+	}
+	eventsTable := eventsVal.AsPlainObject()
+	if eventsTable == nil {
+		return out
+	}
+	existing, ok := eventsTable.GetOwn(event)
+	if !ok {
+		return out
+	}
+	arr := existing.AsArray()
+	if arr == nil {
+		return out
+	}
+	outArr := out.AsArray()
+	for i := 0; i < arr.Length(); i++ {
+		outArr.Append(arr.Get(i))
+	}
+	return out
 }
 
 func removeListener(obj *vm.PlainObject, event string, listener vm.Value) vm.Value {

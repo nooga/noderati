@@ -153,6 +153,8 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 	processObj.SetOwn("hrtime", vm.NewNativeFunction(1, false, "hrtime", func(args []vm.Value) (vm.Value, error) {
 		return hrtimeValue(args), nil
 	}))
+	installProcessKill(vmInstance, processObj)
+	startSignalBridge(vmInstance, processObj)
 
 	if err := ctx.DefineGlobal("process", vm.NewValueFromPlainObject(processObj)); err != nil {
 		return err
@@ -281,10 +283,47 @@ func newStdinObject(vmInstance *vm.VM) *vm.PlainObject {
 	}
 	obj.SetOwn("setEncoding", vm.NewNativeFunction(1, false, "setEncoding", noopSelf))
 	obj.SetOwn("pause", vm.NewNativeFunction(0, false, "pause", noopSelf))
+	// setRawMode used to only flip a JS-visible "isRaw" flag without ever
+	// touching the real terminal - process.stdin.setRawMode(true) is what
+	// every real TUI framework (Ink, pi-tui, etc.) calls before reading
+	// keystrokes, and without term.MakeRaw actually being invoked, the OS
+	// terminal driver stayed in cooked mode: line-buffered (so individual
+	// keystrokes/arrow-key escape sequences never reach the process until
+	// Enter is pressed) and echoing (so typed characters show up twice -
+	// once from the raw OS echo, once from whatever the app itself tries
+	// to render). Combined with resume() never starting a reader for TTY
+	// stdin at all (see below), this meant a real interactive TUI's input
+	// path was completely inert - confirmed directly (round 65,
+	// docs/real-node-plan.md's Phase 5 section) via `expect`, which showed
+	// typed text echoed raw by the pty itself and never reflected in the
+	// TUI's own rendered editor box.
+	//
+	// Caveat (not a bug, but worth being explicit about): term.MakeRaw
+	// mutates the *real* controlling terminal, and nothing here restores it
+	// automatically if the process dies without calling setRawMode(false) -
+	// a panic, an os.Exit from somewhere that skips cleanup, or a hard kill
+	// all leave the user's shell stuck in raw mode (no echo, no line
+	// editing) after this process exits. Real Node has the identical
+	// footgun; well-behaved TUIs (pi-tui included, see its Terminal.stop())
+	// restore raw mode themselves from their normal shutdown path and from
+	// SIGTERM/SIGINT handlers, which now actually fire thanks to
+	// startSignalBridge (signals.go) - so the common paths are covered by
+	// the app itself, not by noderati. There's still no recovery for a
+	// SIGKILL or an unhandled crash; that gap is inherent to raw mode on
+	// any platform, not something this host can close.
+	var rawState *term.State
 	obj.SetOwn("setRawMode", vm.NewNativeFunction(1, false, "setRawMode", func(args []vm.Value) (vm.Value, error) {
-		if len(args) > 0 {
-			obj.SetOwn("isRaw", args[0])
+		want := len(args) > 0 && args[0].IsTruthy()
+		fd := int(os.Stdin.Fd())
+		if want && rawState == nil {
+			if st, err := term.MakeRaw(fd); err == nil {
+				rawState = st
+			}
+		} else if !want && rawState != nil {
+			_ = term.Restore(fd, rawState)
+			rawState = nil
 		}
+		obj.SetOwn("isRaw", vm.BooleanValue(want))
 		return self, nil
 	}))
 	obj.SetOwn("read", vm.NewNativeFunction(0, false, "read", func(_ []vm.Value) (vm.Value, error) {
@@ -294,7 +333,13 @@ func newStdinObject(vmInstance *vm.VM) *vm.PlainObject {
 	var started atomic.Bool
 	rt := vmInstance.GetAsyncRuntime()
 	obj.SetOwn("resume", vm.NewNativeFunction(0, false, "resume", func(_ []vm.Value) (vm.Value, error) {
-		if isTTY.IsTruthy() || !started.CompareAndSwap(false, true) {
+		// Previously skipped starting the reader entirely when stdin is a
+		// TTY - meaning interactive keyboard input was never read at all,
+		// TTY or not (see setRawMode's comment above for how this was
+		// found and confirmed). os.Stdin.Read blocks correctly either way
+		// (line-buffered without raw mode, byte-at-a-time with it), so
+		// there's no TTY-specific reason to special-case this.
+		if !started.CompareAndSwap(false, true) {
 			return self, nil
 		}
 		rt.BeginExternalOp()
