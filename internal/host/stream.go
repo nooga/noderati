@@ -67,11 +67,75 @@ class Writable extends EventEmitter {
   }
 }
 
-export { Readable, Writable };
-export default { Readable, Writable };
+// pipelineStreams was previously a silent no-op (both node:stream and
+// node:stream/promises exported 'async function pipeline(..._streams) {}')
+// - it resolved immediately without piping a single byte between any of
+// the streams passed to it, a real Node stream.pipeline() call that
+// appeared to succeed while silently discarding all data. Zero direct call
+// sites for it exist anywhere in the real pi dependency tree (checked
+// before writing this, not assumed), so it wasn't reachable today - but a
+// lying no-op is worse than an honest gap precisely because it's *not*
+// reachable yet: the first real caller to exercise it would get silent
+// data loss instead of a clear signal something's missing. Given this
+// file's own Readable/Writable already implement real pipe(), a correct
+// minimal pipeline is straightforward to build on top of them: chain
+// .pipe() calls between consecutive streams, resolve when the last one
+// finishes, reject on the first "error" from any stream in the chain.
+function pipelineStreams(streams) {
+  return new Promise((resolve, reject) => {
+    if (streams.length < 2) {
+      reject(new TypeError("pipeline requires at least 2 streams"));
+      return;
+    }
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    for (const s of streams) {
+      if (s && typeof s.on === "function") s.on("error", fail);
+    }
+    for (let i = 0; i < streams.length - 1; i++) {
+      streams[i].pipe(streams[i + 1]);
+    }
+    const last = streams[streams.length - 1];
+    const succeed = () => {
+      if (settled) return;
+      settled = true;
+      resolve(last);
+    };
+    if (last && typeof last.on === "function") {
+      last.on("finish", succeed);
+      last.on("end", succeed);
+    } else {
+      succeed();
+    }
+  });
+}
+
+// Real Node's node:stream.pipeline() takes an optional trailing callback
+// instead of always returning a promise (that form is stream/promises'
+// job); support both call shapes here since real code uses either.
+function pipeline(...args) {
+  const callback = typeof args[args.length - 1] === "function" ? args.pop() : undefined;
+  const promise = pipelineStreams(args);
+  if (callback) {
+    promise.then((result) => callback(undefined, result), (err) => callback(err));
+    return undefined;
+  }
+  return promise;
+}
+
+export { Readable, Writable, pipeline, pipelineStreams as _pipelineStreams };
+export default { Readable, Writable, pipeline };
 `
 
-const streamPromisesShim = `export async function pipeline(..._streams) {}
+const streamPromisesShim = `import { _pipelineStreams } from "stream";
+
+export async function pipeline(...streams) {
+  return _pipelineStreams(streams);
+}
 export default { pipeline };
 `
 

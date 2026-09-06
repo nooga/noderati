@@ -7165,6 +7165,153 @@ was all through `-p` print mode and direct dist-file reproduction, not
 a live interactive TUI session with a real terminal. The user's own
 terminal remains the authoritative test for that, same as round 65.
 
+**Sixty-seventh round (2026-09-06, same day) — user confirmed the TUI now
+works end to end in their own real terminal, asked to survey and start
+closing missing-Node-API gaps.** Surveyed before touching anything, per
+this whole investigation's own discipline: extracted every real
+`node:`/bare-specifier `import`/`require` across the *entire* real,
+unmodified pi dependency tree (144 packages, all of `dist/` +
+`node_modules/`) and diffed it against noderati's own declared module
+list, rather than guessing from Node's own module list what "should" be
+missing.
+
+**Headline finding: every top-level Node builtin module the real pi
+tree directly imports is already declared in noderati** - `fs`, `path`,
+`os`, `child_process`, `crypto`, `readline`, `url`, `module`,
+`worker_threads`, `events`, `string_decoder`, `perf_hooks` account for
+100% of the real import sites found (`fs`/`path`/`os` alone: 30/26/12
+files). This reframes "implement missing Node APIs" from breadth (new
+modules) to depth (make already-declared ones real) - the first time
+this document's own Phase 5 speculation has been checked directly
+against evidence rather than assumed, in contrast to Phase 4's stale
+"no walk-up" claim two rounds ago.
+
+**`net`/`tls`/`http`/`https`/`dgram`/`dns`/`zlib`/`cluster`/`repl`/
+`domain`/`punycode`/`inspector`/`trace_events`/`async_hooks`/`timers`
+are genuinely absent, and genuinely unreachable by anything currently
+in use.** A second pass specifically inside `@aws-sdk`'s own bundled
+tree found the one real exception: `@smithy/node-http-handler` (AWS
+Bedrock's actual HTTP transport) imports `https` directly, not via
+`fetch` - so this gap is real, but scoped precisely to `--provider
+bedrock`, which nothing tested so far has exercised. Real undici (the
+one remaining ledger-group-B fake, `undici@8.5.0` in the tree) also
+imports `net`/`tls`/`dns` in its own internals - so de-shimming
+`undici` and implementing `net`/`tls` turn out to be **the same
+decision**, not two independent ones. Deferred, deliberately, not
+forgotten: recorded here so the next round that touches either one
+finds this note first.
+
+**Two real fixes made this round, `worker_threads.Worker` and
+`stream.pipeline()`, both chosen for the same reason: a lying no-op is
+worse than an honest gap.** Both were unreachable by any real,
+currently-exercised pi code path (confirmed, not assumed) - but a
+silent no-op invites exactly the failure class this whole
+investigation keeps finding: something that looks like it worked while
+quietly doing nothing.
+
+- **`worker_threads.Worker`**: investigated via pi's own real
+  `dist/utils/image-resize.js` (the one real call site for `Worker` in
+  the whole dependency tree - offloads Photon/WASM image resizing off
+  the TUI's event loop, with a deliberate, documented in-process
+  fallback if the worker can't be used). First checked whether real
+  concurrent `worker_threads` is even buildable on paserati today,
+  before writing any host code for it: two `driver.Paserati` instances
+  running concurrently in separate goroutines race under `go test
+  -race`, inside `Paserati.PreloadAllNativeModules`'s own module-loader
+  path, before any user code even runs. That's a paserati engine
+  capability gap (module loading isn't thread-safe across VM
+  instances), not something this host layer can build around - noted
+  here rather than filed as a bug, since it isn't a behavioral defect
+  in single-VM semantics, just a missing capability.
+
+  With real concurrency ruled out for now, traced what the *existing*
+  fake actually did, expecting (per the fallback's own doc comment) a
+  clean reject into `resizeImageInProcess`. Reproduced directly against
+  the real `resizeImage()` first (a 4x4 PNG, no hang, fast `null`
+  result) before touching any code - and found the true reason was
+  simpler than the first theory: `buildWorkerConstructor` used
+  `vm.NewNativeFunction`, which defaults `IsConstructor` to `false`, so
+  `new Worker(...)` never reached this file's own code at all - it hit
+  paserati's own generic `"Worker is not a constructor"` guard first.
+  The postMessage/terminate no-ops were unreachable dead code; a first
+  hypothesis (that `worker.once` being undefined, compounded by
+  `worker.terminate().catch()` failing on a non-Promise return, was
+  producing an accidental-but-correct fast reject) was written down,
+  then disproven by testing `new Worker(...)` in isolation before
+  trusting it - recorded here as a caught overclaim, not silently
+  corrected. Fixed properly: switched to `vm.NewNativeConstructor` and
+  throw one honest, specific `ERR_WORKER_NOT_SUPPORTED` error instead
+  of leaving paserati's generic message live. Re-verified: `resizeImage()`
+  still reaches the same fallback, same speed, for the actual real
+  reason this time. `resizeImageInProcess` itself returns `null` here
+  regardless (Photon needs real WASM - see below) - unrelated to this
+  fix, not silently masked by it.
+
+- **`stream.pipeline()`** (both `node:stream` and `node:stream/promises`)
+  was a literal `async function pipeline(...) {}` - resolves
+  immediately, pipes zero bytes, looks like success. Zero direct call
+  sites anywhere in the real pi tree (checked, not assumed) - but the
+  existing `Readable`/`Writable` shim classes already implement real
+  `pipe()`, so a correct minimal implementation was cheap: chain
+  `.pipe()` calls between consecutive streams, reject on the first
+  `"error"` from any stream in the chain, resolve when the last one
+  fires `"finish"`/`"end"`. `node:stream`'s own `pipeline` additionally
+  supports Node's real callback form (`pipeline(s1, s2, cb)`), not just
+  the promise-only form `stream/promises` exposes - both share one
+  implementation via a cross-shim import (the same pattern `module.go`
+  already established importing from `path`). Three new tests added
+  (`stream_test.go`): real data transfer through both call shapes, and
+  error propagation.
+
+**Separately found, real, explicitly deferred (not attempted this
+round):**
+
+- **`WebAssembly` is completely absent** (`typeof WebAssembly` ===
+  `"undefined"`) - confirmed directly, not assumed, while tracing why
+  `resizeImageInProcess` (the fallback `Worker`'s fix now correctly
+  reaches) still returns `null`: Photon's real image processing is
+  WASM-backed (`@silvia-odwyer/photon-node`), and `loadPhoton()`
+  gracefully returns `null` when it can't load - by design, per its own
+  code, not a crash. This is the actual remaining blocker for real
+  image resizing to work end to end, and it's a large, separate engine
+  project (a WASM runtime, or shelling out to one), not a
+  `worker_threads` question at all - recorded here precisely so it
+  isn't conflated with the fix just made.
+- **Native `.node` addon loading appears entirely unaddressed** - found
+  in passing while scanning for dynamic `import()`/`require()` calls
+  with non-literal specifiers (per a review note, since the earlier
+  static-specifier scan alone could miss real usage): `@mariozechner/
+  clipboard`, a real N-API native addon pi bundles for OS clipboard
+  access, resolves its platform-specific binary dynamically. Whether
+  noderati's `require()` can load and execute a compiled native
+  addon at all is a real, open, unexplored question - not investigated
+  further this round, flagged for whoever picks up clipboard support
+  next.
+- **The recurring stray `1` file, attributed to pi's own behavior in
+  earlier rounds, checked properly this time rather than re-asserted**:
+  reproduced with an explicit, correct `> out.txt 2>&1` redirect (no
+  shell-quoting mistake on this session's own side) and the file still
+  appeared, containing a real pi session-log JSONL record. Genuinely
+  pi's own write, confirmed; the exact mechanism (why literally named
+  `"1"`, rather than a real session-log path) is still unconfirmed and
+  worth a closer look if it keeps surfacing.
+
+**Verification.** `go build ./...`/`go vet ./...` clean; full test
+suite (three new `stream` tests, one new `worker_threads` test) run 3x
+with no flakes; `pi --version`/`--help`/`-p` (Fireworks) all still
+succeed; scoreboard matches baseline.
+
+**Status**: no new top-level Node module gaps found reachable by real
+pi usage - the survey's own conclusion is now the tracked fact, not a
+guess. Two real lying-no-op gaps closed (`Worker`, `stream.pipeline`).
+Three real, larger gaps found and deliberately deferred with reasons
+recorded: `net`/`tls`/`http`/`https` (Bedrock-only, tied to the
+`undici` de-shimming decision), `WebAssembly` (blocks real image
+resizing; a genuine engine-scale project), and native `.node` addon
+loading (blocks clipboard; unexplored). Concurrent-VM thread-safety in
+paserati confirmed absent via `-race`, noted as an engine capability
+gap rather than filed as a behavioral bug.
+
 ## Definition of done for this push
 
 `pi --help`, `pi --version`, and a scripted single-turn `pi -p "..."` print-mode
