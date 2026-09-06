@@ -53,9 +53,18 @@ const perRunTimeout = 20 * time.Second
 // tool used to also run, back when the pair had to be tested together to
 // mean anything) are gone along with them — there's no toggle left to
 // flip; node_modules resolution always loads both real packages now.
-var fakeNames = []string{
-	"jiti",
-}
+//
+// jiti/static — the last entry — was deleted 2026-09-06 (round 63),
+// once paserati#285 (tail calls losing [[HomeObject]], the final link
+// in the #274→#276→#278→#283→#285 chain this pipeline investigation
+// surfaced) merged upstream and a real extension-loader functional
+// exercise (not just this scoreboard) matched real Node exactly — see
+// docs/real-node-plan.md's Phase 3 section. Left empty rather than
+// deleted outright: unlike esmpatch.go's patchNames, this list is the
+// one piece of ledger-group-B plumbing cmd/scoreboard still owns
+// directly, and an empty slice costs nothing to keep around for the
+// next fake this ledger needs to toggle.
+var fakeNames = []string{}
 
 // esmpatch.go held per-rewrite knobs here (patchNames) until 2026-09-01,
 // when its last patch (sdk-reexports) went the way of the ten before it —

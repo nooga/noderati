@@ -6589,6 +6589,149 @@ no TUI/network — a deliberately disjoint surface from pi, so fixes here catch
 gaps that a single-target effort would over-fit around. Not before Phase 4;
 there's a live pi failure to finish first.
 
+**Sixty-third round (2026-09-06, same day) — pulled paserati#285's fix,
+verified it, then watched all six TS-syntax-family jiti-pipeline
+variants and a real multi-file import chain succeed end-to-end for the
+first time this whole investigation. Ran the real, unmodified
+`pi-coding-agent@0.80.2` CLI against the built noderati binary:
+`--version` and `--help` both succeed (exit 0, correct real output);
+`-p "hello"` fails on `"Connection error."`, verified (not just
+inferred from the message) to be a real, timed-out network attempt
+rather than an immediate stub rejection. Deleted the jiti/static fake,
+ledger group B's last third-party-package fake - one third-party shim
+(`undici`'s, real-Node-vendored but still a package, not a builtin)
+remains as the outstanding item.** User reported "fixes on main,"
+asked to pull and check for progress.
+
+Pulled paserati main (`f9569ee4..67d90d68`, two commits): `26a3bd68`
+("fix(vm): preserve [[HomeObject]] across tail calls (fixes #285)")
+and a follow-on `67d90d68` (an unrelated compiler register-allocation
+fix for emitted error throws). The #285 fix matches exactly what this
+investigation found by reading source: `OpTailCall`/`OpTailCallMethod`
+reused the current frame for the callee without updating
+`frame.homeObject`, mirrored from the assignment `prepareCall` already
+did for regular calls - the maintainer's commit message independently
+describes the identical mechanism this round's write-up landed on
+without asserting.
+
+`go build ./...` clean on both repos; `go test -count=1 ./...` clean
+on noderati. Verified #285 fixed three ways: the filed issue's own
+4-line repro (tail-called method losing `super`), the plain
+`super.toString` property-read variant (no call), and the maintainer's
+own filed regression test (`tco_tail_call_super_homeobject.ts`) - all
+three now match real Node. Ran an eleven-bug combined regression sweep
+(#256/#258/#260/#262/#271/#263/#265/#274/#276/#278/#283/#285) - all
+pass.
+
+Re-ran all six TS-syntax-family jiti-pipeline variants that have
+anchored every round since the fifty-ninth: typed function parameters,
+`let x: T`, arrow-function parameter types, `interface`, `type` alias,
+`enum`, typed class field. **All six now transform and execute
+correctly**, matching real Node's output exactly, for the first time
+in this entire investigation. Re-ran the multi-file `ext3/` test from
+round 61 (an importing `main.ts` plus an imported `helper.ts` with its
+own `interface`/function/const exports) - **also passes end-to-end**,
+matching real Node's three lines of output exactly.
+
+With the pipeline itself unblocked, ran the real target: built
+noderati, pointed `cmd/scoreboard` at the real, unmodified
+`/opt/homebrew/.../pi-coding-agent/dist/cli.js`. `pi --version` and
+`pi --help` both succeed (exit 0; version prints `0.80.2`; help prints
+the real, full command listing). `pi -p "hello"` exits 1 with
+`"Connection error."` - per `advisor`'s pushback, checked this rather
+than inferring it from the message string alone (a message match isn't
+proof the code path that produces it was actually reached). Traced
+`"Connection error."` to `@anthropic-ai/sdk`'s own `APIConnectionError`
+class (`node_modules/@anthropic-ai/sdk/core/error.js`), thrown only
+after `client.js`'s request path awaits a real `fetchWithTimeout(...)`
+call that rejects - not a generic top-level catch. Confirmed paserati's
+own `fetch` builtin (`pkg/builtins/fetch_init.go`) is backed by Go's
+real `net/http`, not a stub, and that noderati's `undici` shim (see
+below) only reuses whatever `globalThis.fetch` already is rather than
+replacing it - so no fake sits between the SDK and a real socket.
+Timed the run: **~19 seconds wall-clock** before failing, consistent
+with a real DNS/TCP connection attempt plus the SDK's retry-with-
+backoff logic, not an immediate synchronous rejection (which would
+return in milliseconds). `ANTHROPIC_BASE_URL` is set in this sandbox
+to the real `https://api.anthropic.com`, and no API key is present -
+so the standing "no network access in this sandbox" explanation is
+consistent with a real connection attempt failing at the network
+layer specifically (as opposed to getting a real HTTP 401 back, which
+the SDK would surface as a different error class entirely). Not
+independently confirmed via a packet capture or proxy - the timing and
+code-path evidence together are strong but circumstantial. This is the
+exact three-invocation set named in this document's own "Definition of
+done" section; two of three succeed outright, the third fails at a
+boundary outside this project's control rather than inside it.
+
+Checked whether the jiti/static fake (`internal/host/jiti.go`,
+ledger group B's last remaining entry) was now safe to delete, per
+this ledger's established measure-then-delete pattern. The
+CLI-invocation scoreboard alone couldn't settle it: `fake-off:jiti`
+already matched baseline on every invocation, but none of
+`--version`/`--help`/`-p` actually exercise pi-coding-agent's extension
+loader (the only real consumer of `jiti/static`) without a configured
+extension - the same "match is necessary but not sufficient" gap this
+ledger hit before deleting pi-tui's fake. Did the real functional
+exercise instead: lifted the exact call pattern from pi-coding-agent's
+own `dist/core/extensions/loader.js` (`createJiti(import.meta.url,
+{moduleCache:false, alias})` then `jiti.import(path,{default:true})`)
+and ran it against an actual TypeScript extension-shaped module -
+matched real Node exactly, both with the fake on (returns the fake's
+stub `{}`, confirming the fake was still live and would have masked a
+regression) and with it disabled (returns the real, working module).
+Deleted `internal/host/jiti.go`, its `installModules()` call site, and
+emptied `cmd/scoreboard/main.go`'s now-zero-length `fakeNames` list
+(kept as an empty slice rather than removed outright, since
+`cmd/scoreboard` still owns the toggle mechanism directly - unlike
+`disabledSet`/`isDisabled` in `scoreboard_config.go`, now genuinely
+dead code but left in place per this ledger's own established
+"harmless plumbing for a future fake" precedent, the same call already
+made for `NODERATI_DISABLE_PATCHES`). Rebuilt clean, re-ran every test
+above against the new binary - all still pass, and the scoreboard's
+own `all-fakes-off` row still matches baseline (there being nothing
+left to disable).
+
+Audited every remaining `registerJSShim` call in the tree
+(`child_process`, `module`, `diagnostics_channel`, `events`,
+`string_decoder`, `perf_hooks`, `readline`, `undici`, `stream`,
+`stream/promises`) against this document's "Definition of done"
+criterion. Caught an overclaim before writing it down as fact: `undici`
+is **not** a Node builtin - it's a third-party npm package Node
+vendors internally to implement `fetch`, but `import "undici"` from
+user/dependency code resolves through node_modules like any other
+package, not through Node's builtin-module registry. Every other name
+in that list is a genuine Node builtin. `undici`'s own shim
+(`internal/host/undici.go`) is small (`setGlobalDispatcher`/
+`EnvHttpProxyAgent`/`install`, the last delegating to whatever
+`globalThis.fetch` already is rather than replacing it) and untested
+against the real npm package this round - named here as the one
+outstanding ledger-group-B-shaped item, not deleted.
+
+**Status**: the jiti-pipeline blocker this investigation has chased
+since round 57 is closed - #285 was the last link in a six-bug chain
+(#274→#276→#278→#283→#285) surfaced one at a time by getting real
+`@babel/core`/`@babel/parser` further through its own real transform
+pipeline each round. All six TS-syntax-family variants and a real
+multi-file import chain now succeed end-to-end. `pi --version`/
+`pi --help` succeed against the real, unmodified npm install; `pi -p`
+exits 1, and the available evidence (a real `net/http`-backed `fetch`,
+no fake sitting in front of it, and a ~19s timed failure rather than an
+instant one) points at a genuine network-layer failure rather than an
+engine or host gap, though this was not confirmed via packet capture.
+`internal/host` is down to one remaining third-party-package shim
+(`undici`'s), not zero - this document's own "definition of done"
+wording needs `undici` named explicitly rather than assumed covered by
+"zero package-specific shims," and that shim is untested against the
+real package as of this round. Not yet attempted: verifying `undici`
+against the real npm package, a real credentialed `-p` run against a
+live backend (this sandbox has neither confirmed network access nor an
+API key), and any exercise of pi-coding-agent's TUI/interactive mode
+(per the standing pi-tui deletion note, that surface needs an attached
+terminal/pty to test meaningfully on any engine and stays deliberately
+unverified here). None of these three were attempted or claimed this
+round.
+
 ## Definition of done for this push
 
 `pi --help`, `pi --version`, and a scripted single-turn `pi -p "..."` print-mode

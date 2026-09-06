@@ -73,8 +73,13 @@ func installModules(p *driver.Paserati) {
 	declareVM(p)
 
 	// Ledger group B (docs/real-node-plan.md): third-party npm package
-	// fakes, individually toggleable for the Phase 2 scoreboard.
-	disabledFakes := disabledSet("NODERATI_DISABLE_FAKES")
+	// fakes, individually toggleable for the Phase 2 scoreboard. jiti/
+	// static was the last one standing (see the note further down where
+	// it used to live) - deleted 2026-09-06, leaving no fake left to
+	// disable. disabledSet/isDisabled (scoreboard_config.go) are dead
+	// code as of this round, kept rather than deleted in case a future
+	// package quirk needs the toggle mechanism back - the same call this
+	// ledger already made for NODERATI_DISABLE_PATCHES in cmd/scoreboard.
 	// pi-tui's fake was deleted 2026-09-03 — paserati#195/#196 (v flag and
 	// \p{Default_Ignorable_Code_Point}), #218 (new RegExp() backreference
 	// fallback), and #222–#225 (arrow function `this` lost as an
@@ -129,9 +134,21 @@ func installModules(p *driver.Paserati) {
 	// edit-diff.js and the interactive diff.js) matching real Node's
 	// output exactly — see docs/real-node-plan.md's Phase 3 section.
 	// node_modules resolution now always loads the real diff package.
-	if !isDisabled(disabledFakes, "jiti") {
-		declareJiti()
-	}
+	// jiti/static's fake was deleted 2026-09-06 (round 63), the last
+	// link in the #274->#276->#278->#283->#285 chain of engine bugs
+	// this jiti pipeline investigation surfaced - real package
+	// verified via the exact real call pattern lifted from
+	// pi-coding-agent's own dist/core/extensions/loader.js
+	// (createJiti(import.meta.url, {moduleCache:false, alias}) then
+	// jiti.import(path,{default:true}) on an actual TypeScript
+	// extension module), matching real Node exactly - see
+	// docs/real-node-plan.md's Phase 3 section. The CLI-invocation
+	// scoreboard alone couldn't tell the fake and the real package
+	// apart here (none of --version/--help/-p exercise the extension
+	// loader without a configured extension), the same "match is
+	// necessary but not sufficient" caveat this ledger has hit before.
+	// node_modules resolution now always loads the real jiti package
+	// for both "jiti" and "jiti/static".
 	// minimatch's fake was deleted 2026-08-31 (paserati#144 fixed, real
 	// package verified working via actual functional exercise — see
 	// docs/real-node-plan.md's Phase 3 section) — node_modules resolution
