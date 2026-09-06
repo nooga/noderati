@@ -1,6 +1,7 @@
 package host
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -36,9 +37,49 @@ func declareOS(p *driver.Paserati) {
 			}
 			return h
 		})
+		m.Function("cpus", cpuInfos)
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:os", "os")
+}
+
+// osCPUTimes mirrors real Node's os.cpus()[n].times shape. Noderati has no
+// way to read real per-core tick counts, so every field is zero - callers
+// that only care about the shape (model/speed/times with the five numeric
+// fields) get what they expect; callers that sum real ticks to compute load
+// won't get a meaningful answer, but that's true of the "fake but
+// shaped-correctly" builtins elsewhere in this package too.
+type osCPUTimes struct {
+	User int64 `json:"user"`
+	Nice int64 `json:"nice"`
+	Sys  int64 `json:"sys"`
+	Idle int64 `json:"idle"`
+	Irq  int64 `json:"irq"`
+}
+
+// osCPUInfo mirrors one entry of real Node's os.cpus() array.
+type osCPUInfo struct {
+	Model string      `json:"model"`
+	Speed float64     `json:"speed"`
+	Times *osCPUTimes `json:"times"`
+}
+
+// cpuInfos synthesizes an os.cpus()-shaped array from runtime.NumCPU() -
+// there's no portable way to read real model/speed/tick-count info without a
+// platform-specific syscall, and nothing in noderati needs the numbers to be
+// real, just correctly shaped (found bisecting against the Node-builtin
+// shim - see docs/real-node-plan.md's Sixtieth round entry).
+func cpuInfos() []*osCPUInfo {
+	n := max(runtime.NumCPU(), 1)
+	infos := make([]*osCPUInfo, n)
+	for i := range infos {
+		infos[i] = &osCPUInfo{
+			Model: fmt.Sprintf("%s (%s)", runtime.GOARCH, runtime.GOOS),
+			Speed: 2400,
+			Times: &osCPUTimes{},
+		}
+	}
+	return infos
 }
 
 func releaseVersion() string {

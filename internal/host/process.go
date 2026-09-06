@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"sync/atomic"
+	"time"
 
 	"github.com/nooga/paserati/pkg/builtins"
 	"github.com/nooga/paserati/pkg/driver"
@@ -13,6 +14,12 @@ import (
 	"github.com/nooga/paserati/pkg/vm"
 	"golang.org/x/term"
 )
+
+// processStartTime anchors process.hrtime()'s monotonic clock. Real Node
+// measures from an arbitrary fixed point too (not the Unix epoch) - only the
+// deltas are meaningful. time.Since uses Go's monotonic clock reading, so
+// this stays correct across NTP/wall-clock adjustments during the run.
+var processStartTime = time.Now()
 
 // ProcessInitializer is noderati’s process global. Do not grow Paserati’s stub.
 type ProcessInitializer struct {
@@ -39,7 +46,12 @@ func (p *ProcessInitializer) InitTypes(ctx *builtins.TypeContext) error {
 		WithProperty("execArgv", &types.ArrayType{ElementType: types.String}).
 		WithProperty("cwd", types.NewSimpleFunction([]types.Type{}, types.String)).
 		WithProperty("nextTick", types.NewSimpleFunction([]types.Type{types.Any}, types.Undefined)).
-		WithProperty("exit", types.NewSimpleFunction([]types.Type{types.Number}, types.Undefined))
+		WithProperty("exit", types.NewSimpleFunction([]types.Type{types.Number}, types.Undefined)).
+		WithProperty("hrtime", types.NewOptionalFunction(
+			[]types.Type{types.Any},
+			&types.ArrayType{ElementType: types.Number},
+			[]bool{true},
+		))
 	if err := ctx.DefineGlobal("process", processType); err != nil {
 		return err
 	}
@@ -138,6 +150,9 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		os.Exit(code)
 		return vm.Undefined, nil
 	}))
+	processObj.SetOwn("hrtime", vm.NewNativeFunction(1, false, "hrtime", func(args []vm.Value) (vm.Value, error) {
+		return hrtimeValue(args), nil
+	}))
 
 	if err := ctx.DefineGlobal("process", vm.NewValueFromPlainObject(processObj)); err != nil {
 		return err
@@ -152,6 +167,32 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		return err
 	}
 	return ctx.DefineGlobal("global", vm.NewValueFromPlainObject(vmInstance.GlobalObject))
+}
+
+// hrtimeValue implements process.hrtime()'s [seconds, nanoseconds] tuple.
+// With no argument it returns the elapsed time since processStartTime; with
+// a previous hrtime() result as args[0], it returns the delta since that
+// reading, matching real Node's process.hrtime(time) API.
+func hrtimeValue(args []vm.Value) vm.Value {
+	elapsed := time.Since(processStartTime)
+	if len(args) > 0 && args[0].IsArray() {
+		if prev := args[0].AsArray(); prev != nil && prev.Length() >= 2 {
+			prevSec := int64(prev.Get(0).ToFloat())
+			prevNsec := int64(prev.Get(1).ToFloat())
+			elapsed -= time.Duration(prevSec)*time.Second + time.Duration(prevNsec)*time.Nanosecond
+			if elapsed < 0 {
+				elapsed = 0
+			}
+		}
+	}
+	sec := elapsed / time.Second
+	nsec := elapsed % time.Second
+
+	result := vm.NewArray()
+	arr := result.AsArray()
+	arr.Append(vm.NumberValue(float64(sec)))
+	arr.Append(vm.NumberValue(float64(nsec)))
+	return result
 }
 
 func stdoutColumnsAndTTY() (columns vm.Value, isTTY vm.Value) {
