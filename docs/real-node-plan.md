@@ -7037,6 +7037,134 @@ session's tools can drive a genuine interactive terminal session, so
 these remain open questions for the user to confirm directly rather
 than claims this document asserts as verified.
 
+**Sixty-sixth round (2026-09-06, same day) — user reported "works until the
+agent makes some tool calls"; traced the real call chain instead of
+guessing, found the actual gap was three layers deeper than the first
+plausible-looking candidate, fixed all three real bugs uncovered along
+the way.** Direct continuation of round 65's TUI work - same session,
+same reported command now confirmed rendering and accepting plain
+messages in the user's own real terminal.
+
+**First candidate, real but not the cause: `child_process.spawn`
+silently dropped its whole options argument.** Read pi-agent-core's own
+real shell-exec harness
+([`nodejs.js`](file:///opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/harness/env/nodejs.js))
+side by side with noderati's `child_process.go`: the JS-level
+`spawn(command, args, options)` shim already forwarded `options`
+correctly across the JS-to-Go boundary, but `__noderatiSpawn`'s native
+handler only ever read `args[0]`/`args[1]` - `cwd`, `env`, and
+`detached` all crossed intact and were then dropped. Fixed by threading
+a real `spawnOptions` (parsed via a new `parseSpawnOptions`) through to
+`exec.Cmd.Dir`/`.Env`, and by adding `setDetached` (new
+`child_process_unix.go`/`child_process_windows.go`, POSIX
+`SysProcAttr.Setpgid`) so a detached child gets its own process group -
+which is what makes `process.kill(-pid, sig)` (already correct since
+round 65's signal work, since it forwards whatever pid JS passes,
+negative included, straight to `syscall.Kill`) actually reach the whole
+subprocess tree the way pi-agent-core's own `killProcessTree` (used for
+both its per-call timeout and Escape-key cancellation) expects. Added
+`TestSpawnCwdOption`/`TestSpawnEnvOption`/`TestSpawnDetachedGetsOwnProcessGroup`
+to `child_process_test.go`, all passing, all against the real,
+documented Node contract (an `env` option *replaces* the child's
+environment, it never merges with the parent's - confirmed against
+Node's own docs before writing the test, not assumed).
+
+**Found in passing while adding those tests: `TestSpawnEcho` was
+already flaky before this round, unrelated to the options-forwarding
+fix** - reproduced independently on the pre-fix code via `git stash`,
+so this was a **pre-existing** bug, not introduced this round. Root
+cause: `spawnProcess` ran `waitSpawnProcess` (which calls `cmd.Wait()`)
+concurrently with the two `pumpSpawnStream` goroutines (which read
+`cmd.StdoutPipe()`/`StderrPipe()`), racing to schedule "close" against
+"data"/"end" onto the VM's event-loop queue with no ordering guarantee
+between them - a direct violation of Go's own documented contract for
+`StdoutPipe`/`StderrPipe` ("it is incorrect to call Wait before all
+reads from the pipe have completed"), and exactly the shape that made a
+fast-exiting command like `echo hello` intermittently report empty
+stdout. Fixed with a `sync.WaitGroup` (`pumpDone`): both pump goroutines
+signal it on completion, and `waitSpawnProcess` now waits on it before
+calling `cmd.Wait()` - so "close"/"exit" can only be scheduled after
+every "data"/"end" event that logically precedes them, not just usually
+after. 50 back-to-back runs of the spawn test suite (previously flaky
+within single digits) came back clean.
+
+**Real root cause, found by tracing the actual "bash" tool's real call
+chain end to end rather than trusting the first plausible bug found:**
+built the fix above, verified it standalone against pi-agent-core's own
+`NodeExecutionEnv.exec()` (worked), then re-ran the real, unmodified
+`pi -p "... using the ls tool ..." --provider fireworks` CLI end to end
+- and it still failed, with the real session log
+(`~/.pi/agent/sessions/`, real fireworks tool-call IDs, real
+usage/cost metadata - a genuinely fresh LLM turn each time, not stale
+history) showing the bash tool returning `"undefined is not a
+function"` on every attempt. `NodeExecutionEnv.exec()` turned out to be
+a red herring: the real "bash" tool wired into pi's own tool list is
+`createBashToolDefinition`/`createLocalBashOperations`
+(`pi-coding-agent`'s own `dist/core/tools/bash.js`, a separate,
+independent implementation from pi-agent-core's harness class) - a
+different call shape entirely (`ops.exec(command, cwd, {onData,
+signal, timeout, env})`, no `setEncoding` call anywhere in it). Traced
+by reproducing each layer of the real call chain directly against real
+dist files, narrowest to widest, until the exact throw site showed up
+in a stack trace: `createBashToolDefinition(...).execute()` ->
+`OutputAccumulator.snapshot()` (`core/tools/output-accumulator.js`) ->
+`truncateTail()` (`core/tools/truncate.js:126`) -> `Buffer.byteLength(content,
+"utf-8")`.
+
+**`Buffer.byteLength` was missing from noderati's `Buffer` shim
+entirely** ([`buffer.go`](../internal/host/buffer.go)) - only
+`from`/`alloc`/`isBuffer` existed as statics. A repo-wide count across
+the real, unmodified pi install (`grep -c 'Buffer\.byteLength('`) found
+**36 separate call sites** - by far the most common `Buffer` static
+after `Buffer.from` itself, because every real bash-tool call's output
+goes through `truncateTail()`'s truncation-decision logic, which needs
+a byte length before it can decide whether to truncate. This is why
+plain conversation worked (no `Buffer` involved at all) but *every*
+tool call failed on its very first output line, regardless of what the
+command even was - matching the user's report exactly, and explaining
+why round 65's raw-stdin fix alone wasn't enough to make the TUI fully
+usable. Fixed: `Buffer.byteLength(input, encoding)` returns a Buffer
+argument's own already-byte-counted `.length` unchanged, or a plain
+JS string argument's real UTF-8 byte length (`len()` of the Go string
+`ToString()` produces - Go strings are UTF-8 natively, so this matches
+Node's own default `'utf8'` encoding without needing to actually parse
+the encoding argument).
+
+**Verification.** Re-ran the exact failing repro
+(`createBashToolDefinition(...).execute()` against a real cwd) after
+the `Buffer.byteLength` fix: succeeds, returns the real file listing.
+Re-ran the full, real `pi -p "run ls ... using the ls tool ..."
+--provider fireworks` CLI end to end: the agent now genuinely calls the
+bash tool, gets real output, and reports the real files present in the
+real directory - the first time in this entire investigation a real
+LLM-driven tool call has completed successfully against noderati.
+`go build ./...`/`go vet ./...` clean; full test suite (including the
+three new spawn-options tests) clean across three repeated runs, no
+flakes; `pi --version`/`--help`/`-p` (Fireworks) all still succeed; the
+scoreboard still matches baseline.
+
+**Also produced this round, at the user's request before the fix: a
+full transitive dependency count for the real, unmodified pi install**
+- 144 distinct npm packages (one, `retry`, present at two hoisted
+versions), walked directly from the real `node_modules` tree rather
+than via `npm ls` (which errors on this global-install layout with no
+lockfile to resolve against). Not recorded in detail here since it's a
+point-in-time count, not a tracked gap - see the chat transcript if it
+needs regenerating.
+
+**Status**: the three real host-layer gaps found this round
+(`child_process.spawn` options-dropping, the `pumpSpawnStream`/
+`waitSpawnProcess` ordering race, and `Buffer.byteLength` missing) are
+all fixed and verified against the real, unmodified pi install,
+including a genuine end-to-end LLM tool call. Not yet confirmed:
+whether the TUI's interactive rendering of a running/completed tool
+call (the `renderCall`/`renderResult` methods on the same bash tool
+definition, which use `@earendil-works/pi-tui`'s `Container`/`Text`
+components) has any further gaps of its own - this round's verification
+was all through `-p` print mode and direct dist-file reproduction, not
+a live interactive TUI session with a real terminal. The user's own
+terminal remains the authoritative test for that, same as round 65.
+
 ## Definition of done for this push
 
 `pi --help`, `pi --version`, and a scripted single-turn `pi -p "..."` print-mode

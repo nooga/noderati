@@ -85,6 +85,41 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 		return vm.BooleanValue(isBufferValue(args[0])), nil
 	})
 
+	// Buffer.byteLength was missing entirely - real Node's static method,
+	// used (36 separate call sites, by far the most common Buffer static
+	// after Buffer.from itself) throughout pi-coding-agent's own real
+	// tool-output-truncation code (core/tools/truncate.js's truncateTail,
+	// on the path every single real bash-tool call result goes through) to
+	// measure a string's byte length before deciding whether to truncate
+	// it. Missing this meant `Buffer.byteLength(...)` was `undefined(...)`,
+	// throwing a synchronous TypeError on every real tool call's very
+	// first output line - the actual, final cause behind "works until the
+	// agent makes tool calls," found by tracing the exact real call chain
+	// (createBashToolDefinition's execute() -> OutputAccumulator.snapshot()
+	// -> truncateTail() -> Buffer.byteLength()) rather than assumed from
+	// the child_process-level gaps found earlier in this investigation,
+	// which were real too but turned out not to be what was actually
+	// still breaking this. A Buffer argument's own .length is already a
+	// byte count under this shim's model (wrapBuffer stores content as a
+	// raw byte-aliased Go string); a plain string argument's UTF-8 byte
+	// count is exactly len() of the Go string ToString() produces, since
+	// Go strings are UTF-8 natively - matching Node's own default 'utf8'
+	// encoding without needing to actually consult the encoding argument.
+	byteLengthFn := vm.NewNativeFunction(2, false, "byteLength", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vm.NumberValue(0), nil
+		}
+		if isBufferValue(args[0]) {
+			if obj := args[0].AsPlainObject(); obj != nil {
+				if lengthVal, ok := obj.GetOwn("length"); ok {
+					return lengthVal, nil
+				}
+			}
+			return vm.NumberValue(0), nil
+		}
+		return vm.NumberValue(float64(len(args[0].ToString()))), nil
+	})
+
 	bufferFn := vm.NewNativeFunctionWithProps(1, true, "Buffer", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
 			return wrapBuffer(vmInst, ""), nil
@@ -98,6 +133,7 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 		props.Properties.SetOwn("from", fromFn)
 		props.Properties.SetOwn("alloc", allocFn)
 		props.Properties.SetOwn("isBuffer", isBufferFn)
+		props.Properties.SetOwn("byteLength", byteLengthFn)
 	}
 	return bufferFn
 }

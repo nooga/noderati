@@ -69,6 +69,37 @@ func newEventEmitterObject(vmInst *vm.VM) *vm.PlainObject {
 func newReadableStream(vmInst *vm.VM) *vm.PlainObject {
 	obj := newEventEmitterObject(vmInst)
 	obj.SetOwn("readable", vm.True)
+	self := vm.NewValueFromPlainObject(obj)
+	// setEncoding was missing entirely - real Node's Readable always has it,
+	// and pi-agent-core's own real tool-call harness (nodejs.js's
+	// AgentEnvironment.exec(), the code path behind every bash-tool
+	// invocation) calls child.stdout.setEncoding("utf8")/
+	// child.stderr?.setEncoding("utf8") unconditionally, immediately after
+	// spawn, with no guarding `?.` before the call itself - so this being
+	// undefined threw a synchronous TypeError inside every single real tool
+	// call's Promise executor, rejecting exec()'s whole promise before a
+	// single byte of output was ever read. There's no actual encoding
+	// switch to perform: this stream's own "data" events already always
+	// carry JS strings (pumpSpawnStream in child_process.go decodes with
+	// vm.NewString, never emits a Buffer), so this is a real no-op that
+	// exists to not be missing, not a stub standing in for unbuilt
+	// behavior - matches Node's own fluent `return this`.
+	obj.SetOwn("setEncoding", vm.NewNativeFunction(1, false, "setEncoding", func(_ []vm.Value) (vm.Value, error) {
+		return self, nil
+	}))
+	// destroy was also missing - called on child.stdout/stderr elsewhere in
+	// this same real install (cleanup paths, not the crash above) whenever
+	// a tool call is aborted or its output stream needs to be torn down
+	// early. A real Node destroy() emits "close" (and "error" first, if
+	// given one) rather than doing nothing, so listeners relying on that
+	// event to know a stream is done still fire.
+	obj.SetOwn("destroy", vm.NewNativeFunction(0, true, "destroy", func(args []vm.Value) (vm.Value, error) {
+		if len(args) > 0 && !args[0].IsUndefined() {
+			scheduleEmit(vmInst, obj, "error", args[0])
+		}
+		scheduleEmit(vmInst, obj, "close")
+		return self, nil
+	}))
 	obj.SetOwn("pipe", vm.NewNativeFunction(1, false, "pipe", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
 			return vm.Undefined, nil
