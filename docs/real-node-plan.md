@@ -6297,6 +6297,162 @@ different, narrower kind of blocker than every prior round hit, and,
 for the first time, one with a three-line standalone repro rather than
 a real-pipeline-only reproduction.
 
+**Sixty-second round (2026-09-06, same day) — verified #283's fix,
+confirmed the ten-bug regression suite still holds, watched all six
+TS-syntax-family variants advance past #283 into a new, single
+`OpLoadSuper` runtime failure, and - via a from-scratch marker-
+bisection technique rather than guessed repro shapes - pinned the
+exact failing call site inside `@babel/parser`'s bundled TypeScript
+mixin. Root cause not yet found: seven increasingly faithful synthetic
+repros of that site's own shape all pass correctly, so the mechanism
+remains open at round end.** User reported "FIXES ON MAIN local,"
+instructing continuation.
+
+Pulled paserati main (no-op fetch/checkout - already current). `git
+log -1 --format=%B b3c76792` confirms #283's fix and, importantly,
+corrects last round's own framing: b3c76792 is explicit that #283 is a
+**pure parser/precedence bug** (`parseArrayDestructuringAssignment`/
+`parseObjectDestructuringAssignment` parsed their RHS at the lowest
+precedence instead of `ARG_SEPARATOR`, the precedence the plain
+`x = value` path already used correctly) - **not** a structural sibling
+of #276 (a compiler/codegen defect, an `OpMove` into a foreign
+register) as round 61's issue text claimed. Recorded here plainly
+rather than glossed over, per the maintainer's own correction. The
+same pull also brought in `f9569ee4` (#50, block-scope register-reclaim
+determinism) - unrelated to this investigation, but it means one
+paserati binary now compiles a given input identically on every run,
+which retroactively firms up every "passed on this run" result logged
+in this whole session.
+
+`go build ./...` clean on both repos; `go test -count=1 ./...` clean on
+noderati. Verified #283 fixed three ways: the maintainer's own filed
+test (`issue283_ternary_comma_destructure.ts`, all five cases -
+`ALL_CHECKS: true`) and both of round 61's own minimal repros
+(`shadow_repro7.ts`, `shadow_repro10.ts`), both now matching real Node
+exactly (previously one crashed with `undefined is not a function`,
+the other silently produced `[null,{}]`). Ran a combined ten-bug
+regression script (#256, #258, #260, #262/#271, #263, #265, #274,
+#276, #278) - all still pass.
+
+Re-ran all six TS-syntax-family jiti-pipeline variants from round 61
+(typed function parameters, `let x: T`, arrow-function parameter
+types, `interface`, `type` alias, `enum`, typed class field) - all six
+now fail **identically** with a *different* error than #283's:
+
+```
+PS4001 [ERROR]: super keyword is only valid inside methods
+  191:       `}},x=Object.assign({},b,{prop(e){const{property:t}=e.node...
+       ^
+    at .../jiti/dist/babel.cjs:191:1
+```
+
+Confirmed genuinely divergent (real Node succeeds completely, prints
+the expected value for each variant) and confirmed a single root cause
+producing six identical symptoms, matching the same pattern as #283
+itself. Re-confirmed `babel.cjs`/`jiti.cjs` clean against the
+`npm pack` reference before investigating further, ruling out leftover
+instrumentation from a prior round.
+
+Grepped for the error text and found it is **not** a parser-time
+error at all - it's a VM runtime check, `OpLoadSuper` at
+`pkg/vm/vm.go:12263`, which throws whenever the executing frame's (or,
+for an arrow, its `closure.CapturedHomeObject`'s) home object is
+undefined/null. This reframed the investigation: the failure is a
+runtime home-object-capture defect, not a parse-time gap, and the
+natural first hypothesis (an arrow function nested in a class/object
+method losing its captured `[[HomeObject]]`) needed a *tested*
+mechanism, not an asserted one.
+
+Four synthetic repros of that arrow-capture hypothesis were built and
+**all four passed correctly** on noderati (falsified, in order):
+`super.foo()` inside an arrow inside a real `class X extends Base`
+method; the same inside an arrow inside an object-literal method with
+an explicit `__proto__:` base; the same inside a `mixin = e => class
+extends e {...}` factory (matching `@babel/parser`'s own
+`getParser`-style plugin-mixin architecture, previously described in
+round 61's writeup); the same again with a **four-level-deep** mixin
+chain (`mixinD(mixinC(mixinB(mixinA(Base))))`), to rule out a dynamic-
+prototype-chain-depth miscomputation of home object. None reproduced.
+
+Rather than keep guessing shapes, built a **marker-bisection** tool
+instead: used `acorn` (via `npm install --no-save acorn`, a read-only
+analysis dependency, never added to either repo) to parse the real,
+unmodified `babel.cjs` and enumerate every literal `Super` AST node
+(244 total across the bundle) with each one's enclosing call
+expression's exact byte range. Wrote a script that patches a byte-
+precise copy of `babel.cjs`, wrapping 235 of the 244 sites (skipping 9
+unsafe to wrap - assignment targets, update-expression targets, `for-
+in`/`for-of` left-hand sides) as `((console.error("SITE_HIT",N),0)||
+super.foo(...))` - a construct that preserves the exact call semantics
+of `super.foo(...)` (unlike wrapping the callee alone, which would
+extract the method and lose its special `this`-binding) while logging
+its own site id immediately beforehand. Verified the patch is
+behaviorally transparent first: real Node, run against the *real npm-
+installed* `babel.cjs` (backed up first, restored and diff-confirmed
+clean immediately after each patch cycle, per the established real-
+file-patching discipline), still printed the correct transformed
+output and fired 41 markers naturally during legitimate `super` calls.
+
+Ran the patched pipeline on noderati: **exactly one marker fired -
+`SITE_HIT 205` - before the crash.** Site 205 is:
+
+```js
+parse(){return this.shouldParseAsAmbientContext()&&(this.state.isAmbientContext=!0),super.parse()}
+```
+
+- a method named `parse`, inside the same `typescript:e=>class extends
+e{...}` mixin already identified in round 61's #283 investigation,
+whose body is a `return` of a comma expression ending in
+`super.parse()`. This is the TypeScript mixin's override of the
+Parser's own top-level `parse()` entry point.
+
+Three more synthetic repros followed, each built to match this exact
+site more faithfully than the last, and **all three also passed
+correctly** (falsified): a minimal `class Sub extends Base { parse()
+{ return cond && (assign), super.parse(); } }`; the same embedded
+alongside five structurally-similar sibling methods (a `try/finally`-
+wrapped `super.parseClass(...)` call, a rest-args-plus-`.bind()`-heavy
+constructor calling `super(...args)`, several other comma-expression-
+shaped `super.foo()` callers) to test whether a *neighboring* method's
+compilation corrupts shared compiler state (the same register-reuse
+family of bug as #276) before `parse()` is compiled - still correct.
+
+Called `advisor` between each instrumentation layer, per this
+session's established discipline. Its review of the marker-bisection
+result made two corrections worth recording plainly: first, that
+wrapping site 205 as `((console.error(...),0)||super.parse())`
+*already* moves `super.parse()` out of comma-expression-tail position
+and into the RHS of a parenthesized `||` - so the fact that it *still*
+failed already exonerates the comma-expression framing entirely,
+meaning the three post-bisection repros built around that framing were
+never going to find it (a mistake this round made rather than
+avoided, despite catching two similar mistakes in earlier rounds).
+Second, that `SITE_HIT 205` printing only proves the marker executed
+before `super.parse()` was evaluated - it does **not** prove that
+`OpLoadSuper` itself is what fails, since real Node's own tail
+(`163, 195, 144, 146`) shows site 205 is reached mid-parse, well
+before the file finishes, so there is real, unexamined execution
+between the marker and the crash (specifically: whatever `super.parse()`
+itself dispatches into, most directly the base-class `parse()` method
+its `[[HomeObject]]`'s prototype should resolve to). That "does
+`super.parse()`'s target ever get reached" check is the concrete next
+step, not yet run when this round ended.
+
+Confirmed `babel.cjs` restored clean (`diff -q` against the
+`npm pack` reference) after the bisection patch cycle.
+
+**Status**: #283 verified fixed (with the corrected parser-vs-
+compiler framing above); ten-bug regression suite still holds; all six
+TS-syntax-family variants now advance past #283 into a single, not-
+yet-root-caused `OpLoadSuper` failure. Marker-bisection narrowed it to
+one exact call site (`super.parse()` in the TypeScript parser mixin,
+`babel.cjs` byte offset 773859) out of 244 `super` usages in the
+bundle, ruling out seven distinct synthetic-repro shapes along the
+way. Not yet known: whether the failure is in dispatching `super.parse()`
+itself or somewhere in what it calls into. Not yet filed - no
+verified mechanism to write up yet, per this session's standing rule
+against asserting an unverified root cause.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
