@@ -6160,6 +6160,143 @@ than on anything specific to this pipeline. For the first time across
 this entire multi-round investigation, the active blocker sits on
 noderati's own side of the fence rather than paserati's.
 
+**Sixty-first round (2026-09-06, same day) — verified #278's fix and
+the background-spawned `os.cpus`/`process.hrtime` implementation, then
+pushed the multi-file pipeline past every remaining VM-level crash into
+ordinary parse behavior - and found the actual reason TypeScript syntax
+has never once worked through this pipeline: a three-line
+comma/ternary/destructuring miscompilation, unrelated to anything this
+investigation had touched before, that silently empties
+`@babel/parser`'s own enabled-plugin set.** User reported paserati
+PR #279 merged and the spawned `os.cpus`/`process.hrtime` task done;
+asked to continue.
+
+Pulled paserati main to `33c00d2d` (merges #279, fixing #278: `goArgs`
+in `goFunctionToVM`'s non-variadic branch now bounds itself to
+`fnType.NumIn()` instead of `len(args)`, matching the variadic branch's
+existing correct behavior; the same fix was additionally applied to
+three sibling reflection sites - `createClassConstructor`,
+`createBoundMethod`, `ValueConverter.wrapGoFunction` - found by
+grepping for the identical `make([]reflect.Value, len(args))` pattern).
+Found the background-spawned task's own commit already on this branch
+(`5cfcad2`: `os.cpus()` synthesizing a `runtime.NumCPU()`-sized array
+shaped like real Node's, `process.hrtime()` as a real monotonic
+`[seconds, nanoseconds]` tuple with the relative-delta form). `go
+build`/`go test -count=1 ./...` clean on both repos.
+
+Verified #278 directly: `["a.ts","b.ts"].forEach(path.extname)` (and
+`.basename`/`fs.existsSync`) - all three previously-panicking bare
+callback shapes - now run without error. Verified `os.cpus()`/
+`process.hrtime()` against real Node directly: shapes match
+(`cpus()[0]` keys `model`/`speed`/`times`; `hrtime()` returns a
+`[seconds,nanoseconds]` tuple; the relative-delta form works).
+
+Re-ran the full multi-file `ext3/` pipeline test: no crash of any
+kind, for the first time - a legitimate `ParseError` instead
+(`Support for the experimental syntax 'flow' isn't currently enabled`,
+on the *imported* `helper.ts`'s `export interface Greeting {...}`).
+Confirmed real Node succeeds completely on the exact same two files
+(prints `Hello, World! fast` / `1 2` / `done`), ruling out a test-setup
+mistake. Narrowed via a minimal same-shape second file
+(`export function greet(name: string): string {...}`, no interface, no
+imports of its own) - still fails, at the `:` of the parameter's type
+annotation. Ran `helper.ts` **alone**, as the sole entry file (no
+import chain at all) - still fails, ruling out "second sequential
+transform in one process" as the mechanism. Tested six independent
+TypeScript syntax families as standalone entry files - typed function
+parameters, `let x: T`, arrow-function parameter types, `interface`,
+`type` aliases, `enum`, a typed class field - **all six fail**,
+confirming TypeScript-specific syntax has never actually been exercised
+successfully through this real pipeline; last round's "hello" success
+contained no TS grammar at all, so it never tested this.
+
+Reproduced independently of jiti and of every noderati host module:
+built a direct driver (`shim.js` + real `babel.cjs`, no `createJiti`
+involved at all - the same technique from round 59/60) calling
+`transform()` with `ts:true` on a bare typed function - identical
+`BABEL_PARSE_ERROR`/`UnexpectedToken` at the exact same position.
+Instrumented a **private copy** of `babel.cjs` (`/tmp/verify279/
+babel_copy.cjs`, never the real npm-installed file) at three
+successively deeper points, each ruling out one subsystem before
+moving to the next, per `advisor`'s explicit redirection each time away
+from naming a region and toward finding the mechanism (the same
+discipline that had been skipped, then caught, on the TCO and pipe-key
+hypotheses two rounds ago):
+
+- `removePlugin`'s own array-splice logic (`@babel/plugin-syntax-
+  typescript`'s `manipulateOptions`, which removes conflicting `flow`/
+  `jsx` parser-plugin entries before pushing `["typescript",{}]`) -
+  isolated and run standalone: byte-identical output on both engines.
+- `parserOpts.plugins` itself, logged right after `@babel/core`'s own
+  `manipulateOptions` aggregation loop: byte-identical 12-entry array
+  on both engines, `["typescript",{}]` present in both, same order,
+  same pass/plugin counts.
+- The plugin-name-to-options `Map` construction pattern
+  (`Array.isArray(p)?p[0]:p` / `new Set(...)`/`new Map(...)`) tested in
+  isolation with the same shape: correct on both engines.
+
+Found the actual divergence one level deeper, in `@babel/parser`'s own
+bundled `getParser` (the function building a `Map<pluginName,options>`
+from that same, confirmed-identical `parserOpts.plugins` array, then
+folding plugin-mixin subclasses over the base `Parser` class for every
+*enabled* name) - logged its own intermediate `enabledOrdered` list and
+the built class's `tsParseTypeAnnotation` method: `["typescript"]` /
+`"function"` on real Node, **`[]` / `"undefined"`** on paserati - the
+TypeScript parser mixin is silently never applied, despite the input
+plugin list being provably identical. Traced to the exact three-line
+shape responsible, read directly from the bundle's own source:
+
+```js
+for(const t of e.plugins){
+  let e,r;
+  "string"==typeof t?e=t:[e,r]=t,
+  n.has(e)||n.set(e,r||{})
+}
+```
+
+- a ternary whose **alternate branch is a destructuring assignment**
+  (`[e,r]=t`), itself the **first operand of a comma expression**
+  (continuing into `n.has(e)||n.set(...)`). Minimized to a fresh,
+  shadowing-free 3-line standalone repro reproducing the identical
+  divergence with no jiti, no babel, no host modules at all; narrowed
+  with three separate controls (each removing exactly one ingredient,
+  each passing correctly on both engines): the ternary alone with no
+  comma-continuation; the equivalent `if/else` *statement* form instead
+  of a ternary *expression*; the destructuring-assignment alone in a
+  comma expression with no ternary. All three necessary; remove any one
+  and it's correct. Two distinct corruption modes depending on what
+  follows the comma (a bare `1` panics with `undefined is not a
+  function`; a boolean-returning expression instead silently produces
+  wrong values - the destructured variable receiving `[null,{}]`
+  instead of the correct scalar, its source array left unmutated).
+
+Called `advisor` three times across this narrowing (once per
+instrumentation layer, matching the "one mechanism-settling probe per
+call, not a guess" discipline established two rounds ago) plus once
+more on the finished draft, which caught an unverified mechanism guess
+in the write-up (softened to the observed values only, per the same
+correction pattern as #271's root-cause overclaim) and suggested the
+title name the shape rather than the symptom. Filed
+[paserati#283](https://github.com/nooga/paserati/issues/283) - noted
+as a structural sibling of #276 (both destructuring-assignment
+compilation defects, in different expression positions), with the full
+negative-probe ledger (six falsified hypotheses in order: `removePlugin`
+isolated correct, `parserOpts.plugins` byte-identical, Set/Map
+extraction correct, ternary-without-comma correct, `if/else`-statement-
+form correct, destructuring-without-ternary correct), the exact
+real-world consequence (`enabledOrdered` empty, TS parser mixin never
+applied, all six TS syntax families fail identically), and the minimal
+repro.
+
+**Status**: `babel.cjs` and `jiti.cjs` confirmed clean against a
+freshly-`npm pack`'ed tarball (only a private scratch copy was ever
+patched this round). #278 and the `os.cpus`/`process.hrtime` gap are
+both closed. The pipeline now reaches ordinary, catchable parse errors
+on any TypeScript-specific syntax rather than any VM-level crash - a
+different, narrower kind of blocker than every prior round hit, and,
+for the first time, one with a three-line standalone repro rather than
+a real-pipeline-only reproduction.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
