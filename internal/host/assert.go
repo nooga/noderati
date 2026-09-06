@@ -7,39 +7,57 @@ import (
 	"github.com/nooga/paserati/pkg/vm"
 )
 
+// Every function below takes its real, documented Node parameters plus a
+// trailing `extra ...string` catch-all - not because the extra arguments
+// are used, but because paserati's non-variadic Go-function bridge
+// (pkg/driver/native_module.go's goFunctionToVM) sizes its reflect.Value
+// argument slice to the number of arguments the JS *caller* passed, not
+// the Go function's own arity, and passes that oversized slice straight
+// to reflect.Value.Call - which panics ("reflect: Call with too many
+// input arguments") instead of raising a catchable JS error. Real code
+// calls assert.equal/strictEqual/notEqual/notStrictEqual with an optional
+// trailing message argument far more often than not (hit for real while
+// running jiti's babel.cjs pipeline, filed as
+// https://github.com/nooga/paserati/issues/278), so a bare 2-arg Go
+// signature crashed the whole VM on the very first such call.
+// The variadic branch of that same bridge function correctly slices
+// extra arguments into the variadic parameter instead of overflowing a
+// fixed-size Go arg list, so making the trailing parameter variadic
+// (rather than fixed-arity) sidesteps the bug entirely without touching
+// paserati's own code.
 func declareAssert(p *driver.Paserati) {
 	p.DeclareModule("assert", func(m *driver.ModuleBuilder) {
-		m.Function("ok", func(v bool) (interface{}, error) {
+		m.Function("ok", func(v bool, extra ...string) (interface{}, error) {
 			if !v {
 				return nil, fmt.Errorf("AssertionError [ERR_ASSERTION]: false == true")
 			}
 			return nil, nil
 		})
-		m.Function("equal", func(actual, expected string) (interface{}, error) {
+		m.Function("equal", func(actual, expected string, extra ...string) (interface{}, error) {
 			if actual != expected {
 				return nil, fmt.Errorf("AssertionError [ERR_ASSERTION]: %s != %s", actual, expected)
 			}
 			return nil, nil
 		})
-		m.Function("strictEqual", func(actual, expected string) (interface{}, error) {
+		m.Function("strictEqual", func(actual, expected string, extra ...string) (interface{}, error) {
 			if actual != expected {
 				return nil, fmt.Errorf("AssertionError [ERR_ASSERTION]: %s !== %s", actual, expected)
 			}
 			return nil, nil
 		})
-		m.Function("notEqual", func(actual, expected string) (interface{}, error) {
+		m.Function("notEqual", func(actual, expected string, extra ...string) (interface{}, error) {
 			if actual == expected {
 				return nil, fmt.Errorf("AssertionError [ERR_ASSERTION]: %s == %s", actual, expected)
 			}
 			return nil, nil
 		})
-		m.Function("notStrictEqual", func(actual, expected string) (interface{}, error) {
+		m.Function("notStrictEqual", func(actual, expected string, extra ...string) (interface{}, error) {
 			if actual == expected {
 				return nil, fmt.Errorf("AssertionError [ERR_ASSERTION]: %s === %s", actual, expected)
 			}
 			return nil, nil
 		})
-		m.Function("fail", func(message string) (interface{}, error) {
+		m.Function("fail", func(message string, extra ...string) (interface{}, error) {
 			if message == "" {
 				return nil, fmt.Errorf("AssertionError [ERR_ASSERTION]: Failed")
 			}
