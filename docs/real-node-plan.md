@@ -6595,13 +6595,21 @@ variants and a real multi-file import chain succeed end-to-end for the
 first time this whole investigation. Ran the real, unmodified
 `pi-coding-agent@0.80.2` CLI against the built noderati binary:
 `--version` and `--help` both succeed (exit 0, correct real output);
-`-p "hello"` fails on `"Connection error."`, verified (not just
-inferred from the message) to be a real, timed-out network attempt
-rather than an immediate stub rejection. Deleted the jiti/static fake,
-ledger group B's last third-party-package fake - one third-party shim
-(`undici`'s, real-Node-vendored but still a package, not a builtin)
-remains as the outstanding item.** User reported "fixes on main,"
-asked to pull and check for progress.
+bare `-p "hello"` fails on `"Connection error."` against this
+environment's default (unreachable local) provider, but with an
+explicit `--provider fireworks` flag and the real key already
+configured on this machine, `-p` returns correct completions on 4/4
+runs - a real, live, credentialed LLM round trip through the whole
+stack, and the actual case this document's "Definition of done"
+asks for. Deleted the jiti/static fake, ledger group B's last
+third-party-package fake - one third-party shim (`undici`'s,
+real-Node-vendored but still a package, not a builtin) remains as the
+outstanding item.** User reported "fixes on main," asked to pull and
+check for progress; after the first pass reported `-p` failing on a
+generic connection error, user pointed out a real Fireworks provider
+is already configured locally and `pi -p` should work against it -
+correct, and recorded as a same-day correction below rather than a
+new round.
 
 Pulled paserati main (`f9569ee4..67d90d68`, two commits): `26a3bd68`
 ("fix(vm): preserve [[HomeObject]] across tail calls (fixes #285)")
@@ -6664,6 +6672,30 @@ exact three-invocation set named in this document's own "Definition of
 done" section; two of three succeed outright, the third fails at a
 boundary outside this project's control rather than inside it.
 
+**Correction, same day**: the above `-p "hello"` analysis tested
+whatever provider `~/.pi/agent/settings.json` names as
+`defaultProvider` - in this environment, `"local"` (LM Studio at
+`127.0.0.1:1234`), which simply isn't running here. The user pointed
+out a real, working Fireworks provider is already configured in
+`~/.pi/agent/models.json` (a live API key, stored in plaintext in that
+file - flagged to the user directly, not reproduced here) and that
+`pi -p` should work against it. It does: `pi --provider fireworks
+--model accounts/fireworks/models/glm-5p2 --no-session -p "..."`
+returned correct completions on **4/4 runs** (a single word, "4" to a
+"what is 2+2" prompt, and a 3-line numbered list), all exit 0, ~7-8s
+each - a real, live, credentialed LLM round trip through the entire
+stack (noderati, paserati, the real jiti/babel pipeline, the real
+`@anthropic-ai`-shaped OpenAI-completions client, real `net/http`).
+This is the actual real-key case the "Definition of done" section
+names ("...or with a real key if the user provides one"), and it's
+satisfied. What is *not* established is bare `pi -p "hello"` with no
+provider flags - that still fails, but for a local-config reason (no
+LM Studio server running) rather than an engine or host gap; the
+~19s-timing/`APIConnectionError`-tracing paragraph above still stands
+as an accurate account of *that* specific (default-provider) case, not
+of Fireworks. Both facts matter and neither should be read as
+superseding the other.
+
 Checked whether the jiti/static fake (`internal/host/jiti.go`,
 ledger group B's last remaining entry) was now safe to delete, per
 this ledger's established measure-then-delete pattern. The
@@ -6713,24 +6745,28 @@ since round 57 is closed - #285 was the last link in a six-bug chain
 (#274→#276→#278→#283→#285) surfaced one at a time by getting real
 `@babel/core`/`@babel/parser` further through its own real transform
 pipeline each round. All six TS-syntax-family variants and a real
-multi-file import chain now succeed end-to-end. `pi --version`/
-`pi --help` succeed against the real, unmodified npm install; `pi -p`
-exits 1, and the available evidence (a real `net/http`-backed `fetch`,
-no fake sitting in front of it, and a ~19s timed failure rather than an
-instant one) points at a genuine network-layer failure rather than an
-engine or host gap, though this was not confirmed via packet capture.
-`internal/host` is down to one remaining third-party-package shim
-(`undici`'s), not zero - this document's own "definition of done"
-wording needs `undici` named explicitly rather than assumed covered by
-"zero package-specific shims," and that shim is untested against the
-real package as of this round. Not yet attempted: verifying `undici`
-against the real npm package, a real credentialed `-p` run against a
-live backend (this sandbox has neither confirmed network access nor an
-API key), and any exercise of pi-coding-agent's TUI/interactive mode
-(per the standing pi-tui deletion note, that surface needs an attached
-terminal/pty to test meaningfully on any engine and stays deliberately
-unverified here). None of these three were attempted or claimed this
-round.
+multi-file import chain now succeed end-to-end. All three of this
+document's "Definition of done" invocations now succeed against the
+real, unmodified npm install: `pi --version`/`pi --help` unconditionally;
+`pi -p` with an explicit `--provider fireworks --model ...` flag and
+the real key already configured in `~/.pi/agent/models.json`, 4/4 runs
+correct. Bare `pi -p "hello"` (no provider flags) still exits 1 against
+this environment's *default* provider (`"local"`, LM Studio on
+`127.0.0.1:1234`, not running here) - a local-config gap, not an
+engine or host one, and distinct from the real-key case the
+definition-of-done wording actually asks for. `internal/host` is down
+to one remaining third-party-package shim (`undici`'s), not zero -
+this document's own "definition of done" wording needs `undici` named
+explicitly rather than assumed covered by "zero package-specific
+shims," and that shim is untested against the real package as of this
+round (this round's Fireworks run did exercise `fetch` through it
+without incident, which is evidence the shim isn't breaking anything,
+but not the same as a real-package functional exercise). Not yet
+attempted: verifying `undici` against the real npm package, and any
+exercise of pi-coding-agent's TUI/interactive mode (per the standing
+pi-tui deletion note, that surface needs an attached terminal/pty to
+test meaningfully on any engine and stays deliberately unverified
+here). Neither was attempted or claimed this round.
 
 ## Definition of done for this push
 
