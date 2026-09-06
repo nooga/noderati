@@ -6012,6 +6012,154 @@ than a JS-semantics one, the first of that kind hit directly by this
 investigation (as opposed to #244, hit and fixed earlier in paserati's
 own history before this investigation reached it).
 
+**Sixtieth round (2026-09-06) — pulled #276's fix, verified it and the
+full nine-bug regression suite, then found and fixed the *actual*
+real blocker: not a tenth paserati bug, but noderati's own `assert`
+module being non-callable. A trivial real `.ts` file transformed and
+executed end to end through jiti's real, unmodified pipeline for the
+first time in this entire investigation.** User asked to pull latest
+paserati main and continue.
+
+Pulled paserati main to `0af3487d` (fixes #276 via `c39ae9d7`:
+`compileDestructuringTargetRef`/`assignToDestructuringTargetRef` and
+three sibling destructuring-assignment paths resolved a captured
+(upvalue) identifier target with a plain `currentSymbolTable.Resolve()`
+and emitted a raw `OpMove` straight into its register number, with no
+check for whether that register belonged to the *current* function's
+own space or an *enclosing* one - writing a foreign register number
+either silently corrupted an unrelated local or crashed the VM outright
+once the number exceeded the current function's own `RegisterSize`;
+`0af3487d` itself added richer VM-panic diagnostics - dumping the
+panicking frame's function name/`RegisterSize`/`allocatedRegSize`/
+flags plus a chunk disassembly - which is what let the maintainer see
+past #276's misleadingly-generator-shaped Go stack trace to the real,
+ordinary-closure culprit). `go build`/`go test -count=1 ./...` clean on
+both repos.
+
+Verified #276 directly against the maintainer's own extracted repro
+(`tests/scripts/issue276_destructure_upvalue_target.ts`, five distinct
+destructuring-upvalue shapes) and the standing nine-bug regression
+suite (#256/#258/#260/#262/#263/#265/#267/#271/#274): all pass.
+
+Re-ran jiti's real transform pipeline: the previous `index out of range`
+Go panic is gone, replaced by a *different* raw panic -
+`reflect: Call with too many input arguments` - deep in `@babel/core`'s
+plugin-descriptor construction. Read the maintainer's own `c39ae9d7` fix
+commit message directly, which stated plainly: "the full babel.cjs
+pipeline now transforms input successfully end to end" - a claim worth
+reconciling against, not just trusting or dismissing.
+
+Found the maintainer's own scratch harness for #276
+(`paserati/scratch/i276/` - `shim.js`, `run.mjs`, `empty.ts`) - a
+hand-rolled Node-builtin shim driving `babel.cjs` directly (no jiti.cjs
+wrapper at all), confirming their "end to end" claim's actual shape: a
+different entry path than this investigation's `createJiti(url,
+{fsCache:false, moduleCache:false}).import(file)`. Running their own
+`run.mjs`/`empty.ts` against the current build reproduced the *same*
+`reflect` panic - not a contradiction once traced further: building an
+equivalent direct-`babel.cjs`-plus-shim driver by hand and running it
+confirmed **the shim succeeds and the jiti pipeline fails on identical
+input**, isolating the difference to noderati's own host module
+implementations (used for real by the jiti path; bypassed entirely by
+the shim). Bisected by selectively substituting the shim's stub for one
+real noderati builtin at a time (`fs`, `path`, `os`, `process`,
+`module`, `assert`, `url`, `util`, `tty`) while driving `babel.cjs`
+directly via noderati's own real `require()` - stubbing every module
+except `assert` still crashed; stubbing `assert` alone fixed it.
+
+Root cause, confirmed directly: real Node's `assert` module exports a
+*callable function* (`assert(value, message)`, shorthand for
+`assert.ok`) that also carries `.ok`/`.equal`/`.strictEqual`/etc. as
+properties - noderati's `declareAssert` (`internal/host/assert.go`)
+instead used a bare `m.Default(nil)`, building a plain, non-callable
+namespace object. `typeof assert` was `"object"` where real Node gives
+`"function"`, and calling it directly - `assert(cond)`, the form real
+code (including `@babel/helper-validator-option`'s `OptionValidator`,
+hit for real inside babel's plugin/option-loading chain) uses far more
+often than the equivalent `assert.ok(cond)` - threw a raw
+`TypeError: object is not a function`. This was the actual blocker
+behind every "jiti transform crashes deep in babel's own pipeline"
+investigation this whole session, all the way back through the dozen
+paserati engine bugs found and fixed along the way - each one real, but
+none of them the last blocker. The maintainer's own harness never hit
+this because `scratch/i276/shim.js` stubs `assert` as callable from the
+start.
+
+Fixed on noderati's own side (`internal/host/assert.go`, `host.go`):
+added `installAssertGlobal`, mirroring the existing
+`installBufferGlobal` pattern - builds the default export as a
+`vm.NewNativeFunctionWithProps` callable and copies the module's named
+exports onto it as properties. Verified: `typeof assert` is now
+`"function"`, `assert(true)` no longer throws, all eight `TestAssert*`
+still pass, and - the actual milestone - `console.log("hello")`
+through the real `createJiti(...).import()` pipeline against pi's
+real, unmodified jiti 2.7.0/babel.cjs **transformed and executed**,
+printing `hello`, with `babel.cjs` re-confirmed byte-for-byte clean
+against a fresh `npm pack` tarball first (ruling out the earlier
+options-logging instrumentation as the cause of the success). Committed
+separately from everything else in this round, since a first successful
+transform in a dozen-round investigation shouldn't sit uncommitted
+while chasing the next crash.
+
+Re-ran the full multi-file `ext3/` extension test (interface, enum,
+private class field, async/await, real cross-file import) and hit an
+eleventh bug, immediately: the same `reflect: Call with too many input
+arguments` panic, now inside `@babel/traverse`'s
+`Scope.prototype.generateUidIdentifier` chain. Traced via the new
+`0af3487d` panic diagnostic and the Go panic's own stack trace
+(`ArrayInitializer.InitRuntime.func19` → `CallArgs3` → ... →
+`goFunctionToVM.func1` → `reflect.Value.Call`) directly to
+`pkg/driver/native_module.go`'s non-variadic Go-function bridge:
+`Array.prototype.forEach` always invokes its callback with exactly 3
+arguments (element, index, array) per spec
+(`pkg/builtins/array_init.go:1248`'s `CallArgs3`), and `goFunctionToVM`
+sizes its `reflect.Value` argument slice to the *caller's* argument
+count rather than the Go function's own declared arity, then calls
+`reflect.Value.Call` with that oversized slice - which panics instead
+of clamping, unlike the adjacent variadic branch (which slices correctly)
+and the adjacent too-few-arguments branch (which pads correctly) in the
+very same function. Confirmed standalone and host-agnostic:
+`["a.ts","b.ts"].forEach(path.extname)` alone reproduces the identical
+panic through any embedder-declared `ModuleBuilder.Function` with fewer
+than 3 parameters - not specific to assert, path, or noderati at all.
+Called `advisor`, who correctly redirected away from patching every
+affected host function one at a time ("unbounded... you cannot
+enumerate the call sites in a 1.5MB bundle") toward filing the actual
+defect. Filed
+[paserati#278](https://github.com/nooga/paserati/issues/278) - a
+source-verified, one-line-shaped fix location (the non-variadic branch
+needs the same bound the variadic branch already has), with the
+standalone repro, the exact contrast with the correctly-behaving
+variadic branch, and the real-world path that reaches it. Applied the
+same variadic-trailing-parameter workaround used by the correct branch
+directly to `assert.equal`/`strictEqual`/`notEqual`/`notStrictEqual`/
+`ok`/`fail` (`extra ...string`) as a noderati-side mitigation, committed
+separately - not a fix to paserati's own bug, just enough to stop
+*this* module from tripping over it.
+
+Two real, measured (not guessed) host gaps surfaced along the way,
+neither on the current failure path: `os.cpus()` and
+`process.hrtime()` are both entirely missing from noderati's `os`/
+`process` modules (`typeof os.cpus === "undefined"` where real Node
+gives a function) - flagged as a background task rather than fixed
+inline this round. Also noted, not fixed: `Object.keys(assert)` returns
+`[]` against real Node's ~21 keys (the fix attaches properties to
+`NativeFunctionObjectWithProps.Properties`, which `.SetOwn` makes
+readable but not `Object.keys`-enumerable - matching `buffer.go`'s
+identical pre-existing shape, not a regression this round introduced)
+- a known fidelity gap for the ledger, not a blocker.
+
+**Status**: `assert` is now real and callable; the arity workaround is
+in place; both `babel.cjs` and `jiti.cjs` confirmed clean against a
+freshly-`npm pack`'ed tarball. Trivial single-file `.ts` input
+transforms and executes successfully end to end through jiti's real,
+unmodified pipeline - genuinely new territory for this investigation.
+Multi-file input with real imports/classes/enums still blocked, now on
+paserati#278 (a systemic, already-filed reflection-arity bug) rather
+than on anything specific to this pipeline. For the first time across
+this entire multi-round investigation, the active blocker sits on
+noderati's own side of the fence rather than paserati's.
+
 ### Phase 4 — resolver honesty (ledger group D)
 - Implement real Node `node_modules` walk-up resolution (parent-directory
   search from the importing file, not from argv[1] only) and delete
