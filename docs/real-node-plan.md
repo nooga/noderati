@@ -7455,3 +7455,51 @@ install, with `internal/host` containing zero package-specific shims or
 per-filename source rewrites — only real Node builtin modules and real
 resolution algorithms. Every remaining gap has either a real implementation or
 a linked paserati issue, never a silent fake.
+
+## Round 69: paserati#291 merged (fetch proxy/timeout), undici fake called out as debt
+
+paserati#290 (filed round 68) got fixed and merged upstream as
+[paserati#291](https://github.com/nooga/paserati/pull/291): `fetch()`'s
+`http.Transport` now reads two package-level vars instead of hardcoding
+them - `FetchProxy` (defaults to `http.ProxyFromEnvironment`) and
+`FetchResponseHeaderTimeout` (defaults to the same 30s, now mutable).
+Since `go.mod` has `replace github.com/nooga/paserati => ../paserati`,
+this landed for noderati automatically, zero code changes - confirmed,
+not assumed, with a real test (`t.Setenv("HTTP_PROXY", ...)` against an
+`httptest` proxy server, fetching a nonexistent host that's only
+reachable at all if actually routed through the proxy - passed). Full
+suite re-run clean against the new commit. paserati explicitly did
+*not* add a body/idle-timeout knob (undici's `bodyTimeout`/
+`headersTimeout`) - the `#205` fix already made the response body
+intentionally unbounded for real SSE streams, so there's nothing to
+plug pi's idle-timeout setting into on paserati's fetch side; flagged
+by paserati as a deliberate scope note, not an oversight.
+
+Separately, a fair challenge surfaced this round: `internal/host/
+undici.go` is a hand-rolled JS fake for a *third-party npm package*,
+which is exactly the pattern this project has otherwise always closed
+by making the *engine* capable of the real thing instead (jiti,
+typebox, diff, minimatch, glob, proper-lockfile all went that way).
+Checked why it's still a fake: real `undici` (a real dependency
+already present in pi's own `node_modules`, 2.1MB/109 files) doesn't
+use node's `http` module at all - it drives raw `net.connect`/
+`tls.connect` sockets itself (`lib/core/connect.js`: `setNoDelay`,
+`setKeepAlive`, TLS session-cache reuse, ALPN, `secureConnect`/
+`session` events, real backpressure). Noderati has no `net`/`tls` at
+all - `http.go` (round 68) deliberately stayed at the `net/http.Client`
+level rather than exposing raw sockets, since that's all Bedrock's
+actual call path needed. Real undici, once `net`/`tls` exist, replaces
+`globalThis.fetch` entirely for anything that calls
+`undici.install()` (which is exactly what pi's own
+`configureHttpDispatcher()` does at startup) - meaning once that
+lands, pi's idle-timeout setting would actually take effect for real,
+via real undici's own client, independent of paserati's fetch() at
+all.
+
+Spun off as its own task rather than done inline here, given the size
+(real socket-level Duplex streams + TLS handshake plumbing is a
+different, harder thing than an HTTP round-trip): build real
+`net.connect`/`tls.connect` on Go's `net.Dial`/`crypto/tls`, verify
+against real `httptest` TCP/TLS servers, then delete `undici.go` and
+its `installModules` registration and let real npm `undici` load and
+run - mirroring exactly how every other fake here got retired.
