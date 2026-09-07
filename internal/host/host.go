@@ -54,6 +54,8 @@ func installModules(p *driver.Paserati) {
 	declareDiagnosticsChannel()
 	declareV8(p)
 	declareVM(p)
+	declareHTTP()
+	installHTTPNatives(p)
 
 	// Ledger group B (docs/real-node-plan.md): third-party npm package
 	// fakes, individually toggleable for the Phase 2 scoreboard. jiti/

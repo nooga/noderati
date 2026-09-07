@@ -7312,6 +7312,140 @@ loading (blocks clipboard; unexplored). Concurrent-VM thread-safety in
 paserati confirmed absent via `-race`, noted as an engine capability
 gap rather than filed as a behavioral bug.
 
+**Sixty-eighth round (2026-09-06, same day) — user picked "finish Phase 5
+depth" then "net/tls + de-shim undici" as priority; recon reframed both
+halves of that choice before any code was written, then implemented real
+`node:http`/`node:https`.** Asked advisor before committing to an
+approach, twice, as the actual shape of the work kept changing under
+direct investigation rather than assumption.
+
+**Undici, reconsidered.** Grepped the real pi tree for `undici`'s only
+consumer: `core/http-dispatcher.js`, which calls exactly
+`undici.setGlobalDispatcher(new undici.EnvHttpProxyAgent({...}))` and
+`undici.install()` - configuration calls, zero raw socket work. Real
+undici's own internals do need `net`/`tls`/`dns`, but only if the real
+package is actually loaded to run its own HTTP/1.1 client - which pi
+itself never asks for. Replacing the shim with the real package would
+mean running undici's JS HTTP client on top of new `net`/`tls`, strictly
+worse than Go's own `net/http` for zero benefit pi can observe. **Not
+de-shimmed, deliberately** - the right call per this round's own
+evidence, not the ledger's usual delete-the-fake default; recorded here
+so it doesn't read as an unclosed item.
+
+**The actual gap undici's shim was covering for turned out to live in
+paserati, not noderati.** `pkg/builtins/fetch_init.go:1229` builds a
+fresh `http.Transport{ResponseHeaderTimeout: 30 * time.Second}` per
+fetch call - no `Proxy` field (so `HTTP_PROXY`/`HTTPS_PROXY` are
+silently ignored) and no way to reach the timeout from outside the
+function (so pi's own `configureHttpDispatcher(timeoutMs)` has nowhere
+to plug in). No exported setter or package-level variable exists to
+configure this from a host. Filed as
+[paserati#290](https://github.com/nooga/paserati/issues/290) rather than
+patched, per the standing rule about the shared, actively-developed
+paserati checkout - noderati's own shim staying an honest no-op is a
+correct stand-in until that has a real home.
+
+**Bedrock's actual blocker, verified precisely rather than assumed from
+the plan text: `net`/`tls`/`http`/`https` genuinely absent, needed by
+`@smithy/node-http-handler` (`import { Agent, request } from
+"node:https"`), not by undici at all.** Read that file and its four
+timeout/keep-alive helper siblings before writing anything (per advisor's
+explicit steer) to scope exactly what `request.socket` needs to look
+like: `.connecting`, `.on("connect")`, `.setTimeout(ms, cb)`,
+`.setKeepAlive(on, ms)` - not a real socket.
+
+**Deliberate architecture decision, labeled as such rather than left to
+read as an incomplete socket implementation:** `node:http`/`node:https`
+(new [`http.go`](../internal/host/http.go)/[`http_shim.go`](../internal/host/http_shim.go))
+are built directly on Go's `net/http.Client`, not on raw `net`/`tls`
+sockets. Real Node builds `http` on sockets it manages itself; nothing
+reachable in the whole pi tree needs a raw `net.Socket` directly (survey
+confirmed, not assumed), so building sockets first would be foundational
+work with no consumer, and hand-rolling HTTP/1.1 framing on top of them
+would just reinvent protocol-parsing bugs Go's stdlib already gets
+right. `node:net`/`node:tls` stay unimplemented.
+
+Implemented: `http.request`/`https.request`/`.get()`, a real `Agent`
+(owns a real, shared `*http.Transport` per instance - genuine Go-level
+keep-alive/connection pooling, not a per-request throwaway, keyed via
+the same handle-registry pattern `child_process.go` already uses for
+`*exec.Cmd`), `ClientRequest` (writable, real `write()`/`end()` via an
+`io.Pipe` fed from a buffered channel so a synchronous native call never
+blocks the VM's own single execution thread on an unbuffered pipe
+write), and `IncomingMessage` (built on `newReadableStream` -
+`setEncoding`/`destroy`/`pipe` come for free, the same fixes round 67
+already made). Both this Transport and the Agent's each default to
+`http.ProxyFromEnvironment` - since these are ours to build, there's no
+reason to leave the same real-world proxy gap paserati#290 describes
+for fetch unfixed here too.
+
+**A real, encountered-not-hypothetical bug, caught by testing before
+trusting the design:** the first version gave each `ClientRequest` a
+bespoke `socket` object with a hand-rolled `.on("connect", cb)` that
+only fired `cb` immediately if already connected, silently dropping the
+listener otherwise. Against a real endpoint, this lost the event nearly
+every time - listeners are normally registered *before* the connection
+completes, which is the common case, not an edge one. Fixed by building
+the socket on `newEventEmitterObject` like everything else in this
+codebase, so `.on()`/`.emit()` genuinely queue and deliver regardless of
+registration order.
+
+**A second real bug, found on this same read-through rather than left
+for someone else to hit:** the body-pipe goroutine every request starts
+runs unconditionally, but a request-construction failure (e.g. an
+invalid HTTP method) replaced `write()`/`end()` with no-ops that never
+touch the channel feeding it - leaking that goroutine forever on every
+malformed request. Fixed by closing the channel on that path too; a new
+test (`TestHTTPRequestConstructionErrorEmitsError`) guards it.
+
+**Verification**, in order: a real `https.request` against `example.com`
+by hand first; then a fully deterministic local Go test server (exact
+byte counts, multi-write streaming, POST bodies, a deliberately-refused
+port for error handling) once a public test service's own flakiness
+(a truncated response from `httpbin.org`, confirmed as *their*
+variance and not a bug here by reproducing byte-exact against the local
+server instead) made it clear a third-party endpoint wasn't a reliable
+oracle; then, per advisor's explicit instruction, driving
+`@smithy/node-http-handler`'s own real `NodeHttpHandler` class directly
+- this is what actually distinguishes "the http shim works" from
+"Bedrock's transport works," not a synthetic smoke test. Six new Go
+tests (`http_test.go`) cover GET, POST-with-body, genuinely incremental
+streaming (guarding the exact class of bug rounds 65/66 already found
+elsewhere: a response that looks done before its data arrived), both
+request-time and construction-time error paths, and the `"connect"`
+event fix. `go build`/`go vet` clean; full suite (four new
+`worker_threads`/`stream` tests from round 67 plus six new `http` tests)
+run 3x with no flakes, and once more under `-race` given this file's new
+concurrency - clean. `pi --version`/`--help`/`-p` (Fireworks) all still
+succeed; scoreboard matches baseline.
+
+**A separate, real blocker found and explicitly not chased further this
+round**: driving `NodeHttpHandler.handle()` against the real
+`@smithy/core/protocols` subpath import threw `ReferenceError: require
+is not defined`. Traced far enough to rule out the first, wrong
+hypothesis (a conditions-priority bug in noderati's own
+`exportsCondition.candidates()`, `nodemodules.go` - checked directly:
+its hardcoded `["node", "import", "default"]` ordering actually
+happens to match what real Node's own key-order-dependent algorithm
+would also pick for this specific package, since `"node"` appears
+before `"import"` in `@smithy/core`'s own `package.json` - so this
+isn't the bug, and saying so plainly here rather than leaving the wrong
+theory standing). The real cause is more likely a CJS-file-reached-via-
+ESM-import interop gap once the correct target file is selected, not
+mis-selection of the file itself - not isolated further, flagged for
+whoever picks up Bedrock next rather than guessed at.
+
+**Status**: `net`/`tls`/`http`/`https` genuinely absent is closed for
+the part that's reachable (`http`/`https`, real and verified); `net`/
+`tls` stay unimplemented, deliberately, with no current consumer.
+Undici's shim stays exactly as it was, now with a clear reason recorded
+rather than an open question. The proxy/timeout gap in paserati's own
+fetch is filed upstream, not patched. Bedrock has one more real,
+distinct blocker beyond transport (the `@smithy/core/protocols`
+resolution/interop failure above) before an actual end-to-end call
+could be attempted - not yet reached, no AWS credentials available in
+this environment to test past it regardless.
+
 ## Definition of done for this push
 
 `pi --help`, `pi --version`, and a scripted single-turn `pi -p "..."` print-mode
