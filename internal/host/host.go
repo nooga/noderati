@@ -24,6 +24,7 @@ func New(argv []string) *driver.Paserati {
 	installFileGlobal(p)
 	installMessagePortGlobal(p)
 	installEventGlobals(p)
+	installWebAssemblyGlobal(p)
 	installDOMExceptionGlobal(p)
 	installPromiseWithResolvers(p)
 	installQueueMicrotask(p)

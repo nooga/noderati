@@ -8459,12 +8459,14 @@ onto `Buffer.prototype` - not a paserati bug, just a real behavioral gap
 this file has to close itself since the fix belongs entirely in
 noderati's own control.
 
-**A second, genuine paserati bug found in passing, filed nowhere yet**:
-`new Uint8Array(4).buffer instanceof ArrayBuffer` is `false` - confirmed
-with a minimal repro with zero noderati or Buffer involvement at all
+**A second, genuine paserati bug found in passing**: `new
+Uint8Array(4).buffer instanceof ArrayBuffer` is `false` - confirmed with
+a minimal repro with zero noderati or Buffer involvement at all
 (`constructor.name` correctly reports `"ArrayBuffer"`, but `instanceof`
-itself fails). Not this round's to fix or file without asking; flagged to
-the user, not yet filed.
+itself fails; a second repro narrowed it further - `DataView` has the
+same bug, `Uint8Array`/`Object`/`Array`/`Map` don't). Flagged to the
+user, filed as
+[paserati#377](https://github.com/nooga/paserati/issues/377).
 
 Only three other files touched `wrapBuffer`/the old string-carrier
 model - `crypto.go` (`randomBytes`), `net.go` (socket `data` chunks,
@@ -8489,3 +8491,122 @@ this round's work.
 **Status**: Phase 0 (real `Buffer`) done. Phase 1 (the actual
 `WebAssembly.Module`/`Instance`/`Memory` bridge, wazero-backed) not
 started yet this round.
+
+## Round 76 (cont.): Phase 1 - the real WebAssembly.Module/Instance/Memory bridge, wazero-backed
+
+Added `github.com/tetratelabs/wazero` (pure Go, no cgo, MIT) and built
+`internal/host/webassembly_global.go`: `WebAssembly.Module`/`Instance`/
+`Memory` plus real `CompileError`/`LinkError`/`RuntimeError` subclasses,
+scoped exactly to what paserati#375's own investigation found real
+undici's `lazyllhttp()` needs (plain-number i32/i64/f32/f64 function
+imports, `instance.exports`, `.memory.buffer` reflecting current wasm
+memory including after growth) - no `Table`, no `Global`, no streaming/
+async instantiate, no multi-value returns.
+
+Before writing any bridge code, validated every load-bearing assumption
+empirically rather than trusting docs or the issue's own summary of
+them, per this project's standing discipline:
+
+1. **wazero's dynamic host-function API** (`WithGoFunction` +
+   `[]api.ValueType`, no compile-time Go signature needed) - confirmed
+   against a real, hand-built `.wasm` fixture (checked in as
+   `internal/host/testdata/wasm_fixture.wasm`/`.wat`: one env import,
+   four exported functions, one exported growable memory).
+2. **`api.Memory.Read` is a genuine bidirectional alias**, not a copy -
+   confirmed by writing through wasm and reading via the Go slice, then
+   writing via the Go slice and reading back through wasm. Also
+   confirmed the docs' "disconnects on grow" note empirically: after
+   `memory.grow`, the old slice keeps its last value rather than
+   panicking or auto-updating - it just silently stops reflecting
+   further changes, which is exactly why the bridge never caches a Go
+   slice across a boundary crossing.
+3. **A `wazero.CompiledModule` cannot cross runtimes** - a two-runtime
+   repro (compile on runtime A, try to instantiate on runtime B) fails
+   outright ("source module must be compiled before instantiation").
+   This directly shaped the architecture: `WebAssembly.Module` cannot
+   own one persistent runtime that every `Instance` shares (two
+   Instances of the same Module, each wanting its *own* `"env"` pointing
+   at different JS import functions, would collide on one shared
+   runtime's import namespace anyway) - so `Module` only validates
+   bytes at construction (compiled once against a scratch runtime,
+   purely to surface a real `CompileError`, then discarded) and stores
+   the raw validated bytes; each `Instance` gets its own fresh
+   `wazero.Runtime` and recompiles from those bytes. One avoidable
+   recompile per `Instance`, traded for correctness.
+4. **A host function's Go panic survives through `fn.Call` as a
+   recoverable error** - confirmed with a custom error type: wazero
+   recovers the panic and wraps it, retrievable via `errors.As`. This is
+   what lets a real thrown JS import callback (llhttp's `wasm_on_*`
+   callbacks do throw in real use, e.g. on `maxHeaderSize` exceeded)
+   cross back out of wasm as the *original* JS exception rather than
+   being flattened into a generic message or silently swallowed.
+5. **Error subclassing** - confirmed a real `Error` instance is a
+   `PlainObject` (same as `Blob`), so `CompileError`/`LinkError`/
+   `RuntimeError` can be built with the same Construct-then-reparent
+   trick `file_global.go` uses for `File` on `Blob`. One catch found
+   only by testing, not by reading: the base `Error` constructor sets
+   its own `name` as an *own* property on the instance, which shadows
+   whatever a subclass's own prototype says unless the instance's own
+   copy is overridden too - without that fix, every thrown
+   `CompileError` reported `.name === "Error"`.
+
+The JS<->wasm memory bridge (`wasmMemoryBridge`) is copy-based, not
+zero-copy: paserati's `ArrayBufferObject.data` is unexported (no public
+way to alias an externally-owned `[]byte` as its backing store - the
+same limitation buffer.go's own doc comment already hit), and wazero's
+aliasing view disconnects on grow regardless. Bridges at exactly the two
+points JS and wasm can observe each other's writes: `syncIn()` (JS's
+cached `ArrayBuffer` -> real wasm memory, immediately before any
+exported-function call) and a lazy, dirty-flagged `.buffer` getter (real
+wasm memory -> a fresh `ArrayBuffer`, only when wasm ran since the last
+vend or wasm's own size changed) - matching real undici's own call
+pattern of always re-reading `.memory.buffer` fresh rather than caching
+it, so an uncommitted JS-side write is never silently clobbered by an
+eager sync-out.
+
+**Two review passes caught real gaps before any of this reached
+undici**: a first review flagged (all fixed) - `bytesFromArrayLike`'s
+per-element property lookup cost (documented, not hit by any real
+BufferSource/TypedArray path); `subarray`/`slice`'s reparenting touching
+only the *returned* view, not the receiver (added
+`TestBufferSubarrayDoesNotMutateReceiver` to pin it down); the
+`instanceof ArrayBuffer` paserati bug's relevance to `Memory.buffer`
+specifically (filed as #377 rather than left as a curiosity). A second
+review, after the bridge was written and passing, caught three real
+correctness gaps that unit tests alone hadn't: (1) the import trampoline
+was silently zeroing results on a thrown JS callback instead of
+propagating it - fixed via the `wasmJSCallPanic` mechanism in point 4
+above, verified by `TestWebAssemblyImportThrowPropagates`; (2) multi-
+value wasm results were silently truncated to the first value instead of
+refusing - both the export-wrapper and the import-trampoline now throw a
+clear, honest "not supported" error instead; (3) `mem.Read`'s own
+success flag was being dropped in the `.buffer` getter, which could have
+hidden a real read failure behind a plausible-looking zero-filled
+buffer - now checked, falling back to the last-known-good buffer instead
+of fabricating new state.
+
+**Verification**: `go build`/`go vet ./...` clean. New Go tests in
+`internal/host/webassembly_global_test.go`: globals exist; a real
+`CompileError` is catchable (the exact shape real undici's `try { new
+WebAssembly.Module(simd) } catch {}` fallback needs); two `Instance`s
+built from the same `Module` with different import objects each route
+correctly to their own JS functions (written *before* the bridge code,
+per review); the full JS -> native export -> wazero -> Go trampoline ->
+`vm.Call` -> JS reentrancy path returns the right value; memory
+read/write in both directions, including the offset-view form
+(`new Uint8Array(mem.buffer, ptr, len).set(data)`) real undici's own
+`Parser.execute` actually uses, not just the whole-buffer form; memory
+growth (byte length, previous-page-count return value, data surviving
+the grow); a thrown JS import callback propagates as the same real
+exception; a non-BufferSource argument to `Module` throws a real
+`CompileError`. Full `internal/host` suite green except the same
+pre-existing, unrelated `TestEventsAddAbortListener`.
+
+**Status**: core bridge real and unit-verified end to end, including the
+hard parts (cross-instance isolation, deep reentrancy, memory growth,
+catchable errors, a thrown-callback round trip). Real-undici end-to-end
+verification (actually running real undici's `fetch()` through
+`lazyllhttp()`) **not attempted this round** - every prior round that
+probed real undici surfaced at least one new engine bug with its own
+debugging tail, and starting that probe now risked an unbounded session
+rather than a clean stopping point. Left for a following round.
