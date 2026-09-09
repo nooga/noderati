@@ -8358,12 +8358,19 @@ nothing - there is no `WebAssembly` global, no WASM bytecode interpreter,
 nothing to build on at all. This is not a small, isolable engine bug like
 #302/#372 above; it's an entire missing engine capability (a WASM
 runtime), structurally different in scope from every other gap this
-investigation has found and fixed or filed so far. Not filed as a
-paserati issue this round - a five-line repro and a root-cause diff isn't
-the right shape for "please add a WebAssembly interpreter," and the
-decision to take that on is the project's to make deliberately, not
-something to request via the same routine channel as an accessor bug.
-Flagging it here, plainly, as the actual current state of things instead.
+investigation has found and fixed or filed so far. Initially left
+unfiled this round - a five-line repro and a root-cause diff isn't the
+right shape for "please add a WebAssembly interpreter," and taking that
+on is the project's decision to make deliberately, not something to
+request via the same routine channel as an accessor bug. The user then
+asked for it to be filed anyway, with the exact JS-visible surface
+undici's real call site needs spelled out, since a separate agent is
+being tasked with wiring in [wazero](https://github.com/tetratelabs/wazero)
+(a pure-Go WASM runtime) as the actual execution engine - filed as
+[paserati#375](https://github.com/nooga/paserati/issues/375), scoped
+explicitly to core WebAssembly 1.0 (`Module`/`Instance`/`Memory`, the
+exact import/export shape `lazyllhttp()` uses), not a request to
+reimplement a WASM VM from scratch.
 
 **Verification**: `go build`/`go vet` clean. New Go tests
 (`url_test.go`/`http_test.go`/`events_test.go`/`queue_microtask_test.go`/
