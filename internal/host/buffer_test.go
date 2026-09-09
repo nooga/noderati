@@ -102,20 +102,21 @@ func TestBufferIsRealUint8Array(t *testing.T) {
 			isU8: b instanceof Uint8Array,
 			len: b.length,
 			b0: b[0], b1: b[1], b2: b[2], b3: b[3],
-			// Not asserting "b.buffer instanceof ArrayBuffer" here - a
+			// Was carefully NOT asserted here through paserati#377: a
 			// minimal, noderati-free repro (new Uint8Array(4).buffer
-			// instanceof ArrayBuffer) confirms that's false even for a
-			// completely vanilla paserati Uint8Array, so it's a
-			// pre-existing paserati engine bug unrelated to Buffer, not
-			// something this file's construction gets wrong.
-			bufferCtorName: b.buffer.constructor.name,
+			// instanceof ArrayBuffer) confirmed that false even for a
+			// completely vanilla paserati Uint8Array - filed as #377,
+			// fixed upstream and pulled (paserati@c6a66eda), so this now
+			// asserts the real, correct behavior instead of routing
+			// around it.
+			bufIsArrayBuffer: b.buffer instanceof ArrayBuffer,
 			byteLength: b.buffer.byteLength,
 		})
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	want := `{"isU8":true,"len":4,"b0":0,"b1":97,"b2":115,"b3":109,"bufferCtorName":"ArrayBuffer","byteLength":4}`
+	want := `{"isU8":true,"len":4,"b0":0,"b1":97,"b2":115,"b3":109,"bufIsArrayBuffer":true,"byteLength":4}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
