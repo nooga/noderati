@@ -8927,3 +8927,155 @@ same pre-existing, unrelated `TestEventsAddAbortListener`.
 `declareUndici()` restored (was only ever disabled locally during this
 round's own probing, per standing procedure - see the trap described
 above for exactly why forgetting this is so easy to do silently).
+
+## Round 78: paused-mode Readable implemented on Socket - real undici's parser now genuinely receives its bytes, next blocker isolated and filed
+
+Implemented the fix Round 77 diagnosed and deliberately left undone:
+real `Readable` semantics on `net.Socket` (`internal/host/net.go`,
+shared with `tls.go`). Scoped to exactly what real undici's HTTP/1.1
+client actually uses (confirmed by reading `client-h1.js` directly,
+same discipline as every round before this one) - `.read([size])` and
+the `'readable'` event - rather than the full Node `Readable` surface
+(no `readableFlowing`/`readableLength`/`pipe()` on `Socket`, none of
+which any real call site here touches).
+
+**Design**: `socketState` gained a `flowing` bool mirroring real Node's
+flowing/paused stream mode, a flat `readBuf []byte` accumulator, and
+`sourceEnded`/`endEmitted` bookkeeping. `readerLoop` now routes every
+chunk through `pushReadData`: while flowing, it emits `'data'`
+immediately - this implementation's entire prior behavior, so every
+existing `'data'`-based caller in this codebase keeps working
+unchanged (verified: not one existing test needed to change). While
+not flowing, bytes accumulate in `readBuf` and a coalesced `'readable'`
+fires (`maybeScheduleReadable`, reset just before it actually emits so
+a later arrival still gets its own follow-up rather than being
+silently swallowed). `read(size)` pulls from `readBuf` - all of it if
+no size is given (real undici's own call shape, `readMore()`'s
+`this.socket.read()` with no arguments, in a loop until `null`) or up
+to `size` bytes, leaving the remainder queued.
+
+Mode selection: `buildSocketObject` overrides `on`/`addListener`/
+`once`/`prependListener`/`prependOnceListener` (installed after
+`newEventEmitterObject`'s generic versions) to auto-switch into flowing
+mode - draining anything already buffered as one `'data'` event - the
+instant a `'data'` listener is registered, exactly matching real Node's
+own behavior; `pause()`/`resume()` also toggle it (in addition to their
+existing job of gating the OS-level read pump for real backpressure).
+A socket that only ever registers `'readable'` - real undici's own
+usage, and nothing else in this codebase yet - stays in paused mode for
+its whole life, which is exactly the case that was completely broken
+before this round.
+
+The trickiest correctness edge, gotten right on the first pass thanks
+to advisor review before committing: EOF arriving while `readBuf` still
+has unread bytes in it. Real Node's own contract is that `'end'` never
+fires while there's still unread buffered data - a paused-mode consumer
+needs `read()` to see every last byte first. `readerLoop`'s EOF branch
+now only fires `'end'` (and destroys) immediately if the buffer already
+happens to be empty; otherwise it defers to whichever of `read()` or
+`startFlowing` next drains the buffer to empty, which is where the
+actual `'end'` emission (and deferred destroy) now lives too, guarded
+by `endEmitted` so the two possible triggers can't double-fire it. This
+isn't a hypothetical edge case, either - a server that writes its whole
+response and closes immediately (the common case for a small response)
+routinely delivers the final chunk and EOF back to back, so a
+paused-mode consumer that hasn't gotten around to calling `read()` yet
+when EOF lands is the *normal* case, not a rare race. Verified directly
+with a test built for exactly this ordering
+(`TestNetSocketReadableEndDeferredUntilBufferDrained` - a server that
+writes and closes immediately, a client that deliberately delays
+calling `read()` past that point via `setTimeout`) and, since a test
+that merely didn't fail isn't the same as a test that would have caught
+a regression, confirmed causally: temporarily reverting just this
+deferred-end logic back to firing `'end'` unconditionally on EOF made
+this exact test fail (`{"result":"","endFired":true}` instead of the
+full payload) before the revert was itself reverted.
+
+New tests, alongside the one above:
+`TestNetSocketReadableProtocolDrivesParserStyleConsumer` (drives a real
+socket with real undici's *exact* protocol - `'readable'` + `read()`
+loop, never `'data'` - and asserts the bytes arrive byte-exact, the
+direct regression guard for the Round 76/77 hang's actual root cause),
+`TestNetSocketReadWithSizeLeavesRemainderQueued` (a sized `read(n)`
+leaves the correct remainder queued for the next call), and
+`TestNetSocketDataListenerStillWorksAlongsideReadableFix` (the
+opposite-direction regression guard - adding paused-mode support must
+not break existing push-mode/`'data'` consumers, and once a `'data'`
+listener switches a socket to flowing, `'readable'` correctly stops
+firing at all, matching real Node).
+
+**Verified against the real thing, not just unit tests**: with
+`declareUndici()` disabled (per the Round 77 entry's own documented
+trap - forgotten and immediately re-caught once via a `pprof` dump
+showing Go's own `net/http.persistConn` again this round; the fix for
+forgetting this is apparently "read your own docs before probing," not
+a code change) and a fresh, unmodified real undici@7.11.0, the exact
+same repro that hung in Round 76/77 now genuinely delivers bytes to the
+parser. Traced directly by temporarily instrumenting the vendored
+`client-h1.js` (restored byte-for-byte afterward, confirmed via `diff`
+against a saved copy) with `console.error` at `onHttpSocketReadable`,
+`readMore()`, and the `socket.read()` call site: `typeof socket.read`
+is now `"function"` (was `"undefined"`), `'readable'` fires, and
+`socket.read()` returns the real 151-byte response - all previously
+impossible. This is the concrete, traced proof that this round's fix
+is correct and addresses the actual documented root cause, not just a
+plausible-sounding one.
+
+**The next blocker, isolated and filed rather than guessed at**: with
+bytes now reaching the parser, `llhttp_execute` itself started
+throwing, from inside the `wasm_on_status` host-import callback - a
+new failure mode, one layer deeper than anything reached before. Traced
+the actual thrown error (not assumed): `TypeError: undefined is not a
+constructor`, from `client-h1.js`'s own `const FastBuffer =
+Buffer[Symbol.species]` followed by `new FastBuffer(...)` inside that
+callback. Isolated to a real, minimal, two-line, undici-free,
+noderati-free repro directly in a real `paserati` checkout:
+`Uint8Array[Symbol.species]` (and every other built-in constructor's)
+is `undefined` - confirmed directly against real Node first
+(`Object.getOwnPropertyDescriptor(Buffer, Symbol.species)` is a real
+accessor there, returning an internal `FastBuffer extends Uint8Array`
+class) before concluding paserati's behavior is wrong rather than
+assuming it. This is genuine paserati core engine surface (`Symbol.species`
+entirely unimplemented on any built-in constructor), not anything
+`buffer.go` can work around correctly - a plausible-looking downstream
+patch (defining `Buffer[Symbol.species]` to return `Buffer` itself) was
+considered and deliberately rejected per advisor review: real Node's
+own `Buffer[Symbol.species]` is provably *not* `Buffer` (verified
+directly against real Node), and undici's whole reason for reading it
+is to get something that specifically isn't the slower, more-checked
+public `Buffer` constructor - patching around this one call site with
+the wrong semantics would risk quietly breaking in a different way
+later, for one probe iteration's worth of progress. Filed as
+[paserati#381](https://github.com/nooga/paserati/issues/381) with the
+minimal repro and the real-world undici call site that surfaces it.
+
+One more finding worth recording precisely because it *didn't* need
+fixing: the `resumeH1`/`socket.unref()` trace captured during this same
+probe showed `kSize= 1` both times it was called - meaning
+`socket.unref()` (the thing Round 76/77's ref/unref fix was originally,
+wrongly, suspected of fixing) never actually ran in this exact repro at
+all (it's gated on `kSize === 0`, no in-flight request). This
+independently reconfirms last round's causal-ablation finding that the
+ref/unref fix was always orthogonal to the Round 76 hang, from a
+completely different angle (this round's trace) than the one that
+found it originally (the ablation itself).
+
+**Status**: real undici's own parser is now proven to receive every
+byte of a real HTTP response through the exact protocol it actually
+uses, in the exact real, unmodified npm package - the Readable-protocol
+gap this whole diagnosis chain (Round 76 -> 77 -> 78) set out to close
+is closed. Full real-undici `fetch()` end-to-end remains blocked, now
+on paserati#381 (`Symbol.species`), one layer further into the same
+onion this whole investigation has been peeling one bug at a time since
+Round 76. Not pursued further this round - diagnosing and fixing the
+Readable gap was this round's actual scope, and paserati#381 is now a
+clean, filed, upstream-owned blocker exactly like #302/#372/#377 before
+it, not something to chase further downstream.
+
+**Verification**: `go build ./...`/`go vet ./...` clean, `gofmt`
+clean. Full `internal/host` suite green (including all four new tests
+above) except the same pre-existing, unrelated
+`TestEventsAddAbortListener`. `declareUndici()` restored; the vendored
+undici copy under the scratchpad used for tracing was diffed back to
+byte-identical with its pre-instrumentation copy before being discarded
+(it was never part of this repo to begin with).

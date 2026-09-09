@@ -77,6 +77,34 @@ type socketState struct {
 
 	encoding string // set via setEncoding(); "" means emit Buffers, matching real Node's default
 
+	// Paused-mode Readable support (see pushReadData/read()/startFlowing).
+	// Real undici's own HTTP/1.1 client (client-h1.js) drives its parser
+	// exclusively through Node's paused-mode Readable protocol -
+	// socket.on('readable', onHttpSocketReadable), which calls
+	// socket.read() in a loop - and never listens for 'data' at all.
+	// Before this existed, readerLoop unconditionally emitted 'data' with
+	// no paused-mode alternative, so those bytes arrived, were drained
+	// off the real OS socket, and were emitted into an event nobody was
+	// listening for - undici's parser was never fed a single byte, and
+	// the whole request hung forever. Confirmed directly via a minimal,
+	// undici-free repro before writing this (docs/real-node-plan.md,
+	// Round 77).
+	//
+	// flowing mirrors real Node's "flowing" vs "paused" stream mode:
+	// registering the first 'data' listener (see buildSocketObject's
+	// on/addListener/once overrides) or calling resume() switches to
+	// flowing, where bytes auto-emit as 'data' exactly like this
+	// implementation always did before this change; pause() switches
+	// back. While not flowing, incoming bytes accumulate in readBuf and
+	// a coalesced 'readable' fires so a caller can drain them via
+	// read() - the only two primitives real undici's parser actually
+	// needs.
+	flowing           bool
+	readBuf           []byte
+	readableScheduled bool // coalesces bursts of arrivals into one 'readable' emission per drain cycle, reset just before that emission actually runs so a later arrival can schedule the next one
+	sourceEnded       bool // true once readerLoop has observed real EOF - 'end' is deferred (see read()) until readBuf is fully drained, matching Node's own contract that 'end' never fires while there's still unread buffered data
+	endEmitted        bool // guards against emitting 'end' (and destroying) more than once between the EOF branch and read()'s own end-of-buffer check racing to notice it first
+
 	pendingNoDelay    *bool
 	pendingKeepAlive  *bool
 	keepAliveInitDlay time.Duration
@@ -190,22 +218,113 @@ func valueToBytes(vmInst *vm.VM, v vm.Value) []byte {
 	return []byte(v.ToString())
 }
 
-// emitDataChunk mirrors real Node's default: a socket's 'data' event
-// carries a Buffer unless setEncoding() was called, in which case it
-// carries a decoded string instead. The encoding is only ever read here,
-// on the VM thread (via scheduleEmit's ScheduleNextTick), never from the
-// background read goroutine that captured the raw bytes.
-func emitDataChunk(vmInst *vm.VM, obj *vm.PlainObject, chunk []byte, encoding string) {
+// encodeChunkValue mirrors real Node's default: a chunk is a Buffer
+// unless setEncoding() was called, in which case it's a decoded string
+// instead. Shared between emitDataChunk (flowing-mode 'data' events) and
+// read() (paused-mode's pull side) so both encode identically.
+func encodeChunkValue(vmInst *vm.VM, chunk []byte, encoding string) vm.Value {
 	switch encoding {
 	case "":
-		scheduleEmit(vmInst, obj, "data", wrapBuffer(vmInst, chunk))
+		return wrapBuffer(vmInst, chunk)
 	case "hex":
-		scheduleEmit(vmInst, obj, "data", vm.NewString(hex.EncodeToString(chunk)))
+		return vm.NewString(hex.EncodeToString(chunk))
 	case "base64":
-		scheduleEmit(vmInst, obj, "data", vm.NewString(base64.StdEncoding.EncodeToString(chunk)))
+		return vm.NewString(base64.StdEncoding.EncodeToString(chunk))
 	default:
-		scheduleEmit(vmInst, obj, "data", vm.NewString(string(chunk)))
+		return vm.NewString(string(chunk))
 	}
+}
+
+// emitDataChunk schedules a 'data' event carrying chunk, encoded per
+// encoding. The encoding is only ever read here, on the VM thread (via
+// scheduleEmit's ScheduleNextTick), never from the background read
+// goroutine that captured the raw bytes.
+func emitDataChunk(vmInst *vm.VM, obj *vm.PlainObject, chunk []byte, encoding string) {
+	scheduleEmit(vmInst, obj, "data", encodeChunkValue(vmInst, chunk, encoding))
+}
+
+// pushReadData is what readerLoop calls with each newly-received chunk.
+// While flowing, it emits 'data' immediately - this implementation's
+// original, still-default behavior, and what every existing 'data'-based
+// caller in this codebase already relies on. Otherwise (paused mode) it
+// buffers the bytes into readBuf and schedules a single coalesced
+// 'readable' emission, which is the other half of the protocol real
+// undici's h1 client actually drives its parser through.
+func (s *socketState) pushReadData(vmInst *vm.VM, obj *vm.PlainObject, chunk []byte) {
+	s.mu.Lock()
+	if s.flowing {
+		encoding := s.encoding
+		s.mu.Unlock()
+		emitDataChunk(vmInst, obj, chunk, encoding)
+		return
+	}
+	s.readBuf = append(s.readBuf, chunk...)
+	s.mu.Unlock()
+	s.maybeScheduleReadable(vmInst, obj)
+}
+
+// maybeScheduleReadable schedules one 'readable' emission unless one is
+// already pending, resetting readableScheduled just before the emission
+// actually fires (not when it's merely queued) so a chunk that arrives
+// in between still gets its own follow-up emission rather than being
+// silently coalesced away. Both pushReadData and readerLoop's own EOF
+// branch (which buffers no new bytes but still needs a 'readable' to
+// tell a paused-mode consumer there's a final chunk left to drain) go
+// through this same coalescing check rather than scheduling directly.
+func (s *socketState) maybeScheduleReadable(vmInst *vm.VM, obj *vm.PlainObject) {
+	s.mu.Lock()
+	alreadyScheduled := s.readableScheduled
+	s.readableScheduled = true
+	s.mu.Unlock()
+	if alreadyScheduled {
+		return
+	}
+	vmInst.GetAsyncRuntime().ScheduleNextTick(func() {
+		s.mu.Lock()
+		s.readableScheduled = false
+		s.mu.Unlock()
+		emitOnObject(vmInst, obj, "readable")
+	})
+}
+
+// startFlowing switches the socket into flowing mode (see the flowing
+// field's doc comment) - triggered by registering the first 'data'
+// listener or calling resume(). Anything that accumulated in readBuf
+// while paused is drained as one 'data' event immediately, and if the
+// source had already hit EOF while paused, this drain is exactly what
+// finally empties the buffer, so 'end' (and the deferred destroy) fires
+// here too - the same logic read() applies when it empties the buffer
+// itself.
+func (s *socketState) startFlowing(vmInst *vm.VM, obj *vm.PlainObject) {
+	s.mu.Lock()
+	if s.flowing {
+		s.mu.Unlock()
+		return
+	}
+	s.flowing = true
+	buffered := s.readBuf
+	s.readBuf = nil
+	encoding := s.encoding
+	shouldEnd := s.sourceEnded && !s.endEmitted
+	if shouldEnd {
+		s.endEmitted = true
+	}
+	s.mu.Unlock()
+	if len(buffered) > 0 {
+		emitDataChunk(vmInst, obj, buffered, encoding)
+	}
+	if shouldEnd {
+		scheduleEmit(vmInst, obj, "end")
+		s.destroyInternal(vmInst, obj, false)
+	}
+}
+
+// stopFlowing switches back to paused mode (pause()). Bytes that arrive
+// afterwards accumulate in readBuf instead of auto-emitting as 'data'.
+func (s *socketState) stopFlowing() {
+	s.mu.Lock()
+	s.flowing = false
+	s.mu.Unlock()
 }
 
 // writerLoop is the only goroutine that ever calls conn.Write - write()/
@@ -310,14 +429,18 @@ func (s *socketState) writerLoop(vmInst *vm.VM, rt runtime.AsyncRuntime, obj *vm
 	}
 }
 
-// readerLoop pulls bytes off conn as they arrive and schedules a 'data'
-// event per Read() call - never buffering the whole response before
-// emitting anything, so a slow/large response streams incrementally the
-// same way http.go's pumpHTTPResponseBody already had to get right.
-// pause()/resume() gate this loop directly (not just the JS-visible
-// event delivery) so a paused socket genuinely stops pulling bytes off
-// the OS socket, which is what makes TCP-level backpressure apply
-// upstream instead of us just buffering in Go instead of buffering in JS.
+// readerLoop pulls bytes off conn as they arrive and hands each Read()
+// call's chunk to pushReadData - which either emits 'data' immediately
+// (flowing mode, this implementation's original behavior) or buffers it
+// for read() to pull out later (paused mode - see pushReadData/read()/
+// startFlowing) - never buffering the whole response before making it
+// available one way or the other, so a slow/large response streams
+// incrementally the same way http.go's pumpHTTPResponseBody already had
+// to get right. pause()/resume() gate this loop directly (not just the
+// JS-visible event delivery) so a paused socket genuinely stops pulling
+// bytes off the OS socket, which is what makes TCP-level backpressure
+// apply upstream instead of us just buffering in Go instead of
+// buffering in JS.
 func (s *socketState) readerLoop(vmInst *vm.VM, rt runtime.AsyncRuntime, obj *vm.PlainObject) {
 	buf := make([]byte, 64*1024)
 	for {
@@ -336,11 +459,10 @@ func (s *socketState) readerLoop(vmInst *vm.VM, rt runtime.AsyncRuntime, obj *vm
 		if n > 0 {
 			s.mu.Lock()
 			s.bytesRead += int64(n)
-			encoding := s.encoding
 			s.mu.Unlock()
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
-			emitDataChunk(vmInst, obj, chunk, encoding)
+			s.pushReadData(vmInst, obj, chunk)
 		}
 		if err != nil {
 			s.mu.Lock()
@@ -350,8 +472,28 @@ func (s *socketState) readerLoop(vmInst *vm.VM, rt runtime.AsyncRuntime, obj *vm
 				return
 			}
 			if err == io.EOF {
-				scheduleEmit(vmInst, obj, "end")
-				s.destroyInternal(vmInst, obj, false)
+				// 'end' must not fire while there's still unread
+				// buffered data sitting in readBuf (real Node's own
+				// contract - a paused-mode consumer needs read() to see
+				// every remaining byte before 'end'). Only emit it
+				// (and destroy) immediately when the buffer already
+				// happens to be empty right now; otherwise defer to
+				// whichever of read()/startFlowing next drains it to
+				// empty.
+				s.mu.Lock()
+				s.sourceEnded = true
+				empty := len(s.readBuf) == 0
+				shouldEnd := empty && !s.endEmitted
+				if shouldEnd {
+					s.endEmitted = true
+				}
+				s.mu.Unlock()
+				if shouldEnd {
+					scheduleEmit(vmInst, obj, "end")
+					s.destroyInternal(vmInst, obj, false)
+				} else if !empty {
+					s.maybeScheduleReadable(vmInst, obj)
+				}
 			} else {
 				scheduleErrorEmit(vmInst, rt, obj, err)
 				s.destroyInternal(vmInst, obj, true)
@@ -458,6 +600,73 @@ func buildSocketObject(vmInst *vm.VM, s *socketState) (*vm.PlainObject, vm.Value
 
 	rt := vmInst.GetAsyncRuntime()
 
+	// on/addListener/once/prependListener/prependOnceListener override
+	// newEventEmitterObject's generic versions with one Socket-specific
+	// addition: registering a 'data' listener auto-switches the socket
+	// into flowing mode, exactly like real Node's Readable. This is what
+	// lets every existing 'data'-based caller in this codebase (and any
+	// future one) keep working unchanged, while a caller that never adds
+	// a 'data' listener - real undici's h1 client, which only ever uses
+	// 'readable' + read() - stays in paused mode and must pull bytes out
+	// itself. See the flowing field's doc comment on socketState.
+	registerListener := func(name string, once, prepend bool) {
+		obj.SetOwn(name, vm.NewNativeFunction(2, false, name, func(args []vm.Value) (vm.Value, error) {
+			if len(args) < 2 {
+				return self, nil
+			}
+			event := args[0].ToString()
+			result := addListener(vmInst, obj, event, args[1], once, prepend)
+			if event == "data" {
+				s.startFlowing(vmInst, obj)
+			}
+			return result, nil
+		}))
+	}
+	registerListener("on", false, false)
+	registerListener("addListener", false, false)
+	registerListener("once", true, false)
+	registerListener("prependListener", false, true)
+	registerListener("prependOnceListener", true, true)
+
+	// read([size]) is paused-mode Readable's pull side: real undici's h1
+	// client calls it with no arguments in a loop (readMore(), driven by
+	// 'readable') to pull everything currently buffered out at once. A
+	// size argument, when given, takes only that many bytes and leaves
+	// the rest queued - real Node supports this too, and it costs
+	// nothing extra to honor here since readBuf is already a flat byte
+	// slice. Returns null when nothing is available yet, matching real
+	// Node exactly (the caller waits for the next 'readable').
+	obj.SetOwn("read", vm.NewNativeFunction(1, false, "read", func(args []vm.Value) (vm.Value, error) {
+		size := -1
+		if len(args) > 0 && args[0].IsNumber() {
+			size = int(args[0].ToFloat())
+		}
+		s.mu.Lock()
+		if len(s.readBuf) == 0 {
+			shouldEnd := s.sourceEnded && !s.endEmitted
+			if shouldEnd {
+				s.endEmitted = true
+			}
+			s.mu.Unlock()
+			if shouldEnd {
+				scheduleEmit(vmInst, obj, "end")
+				s.destroyInternal(vmInst, obj, false)
+			}
+			return vm.Null, nil
+		}
+		var chunk []byte
+		if size < 0 || size >= len(s.readBuf) {
+			chunk = s.readBuf
+			s.readBuf = nil
+		} else {
+			chunk = append([]byte(nil), s.readBuf[:size]...)
+			s.readBuf = s.readBuf[size:]
+		}
+		encoding := s.encoding
+		s.mu.Unlock()
+		return encodeChunkValue(vmInst, chunk, encoding), nil
+	}))
+
 	obj.SetOwn("write", vm.NewNativeFunction(3, true, "write", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
 			return vm.True, nil
@@ -502,6 +711,7 @@ func buildSocketObject(vmInst *vm.VM, s *socketState) (*vm.PlainObject, vm.Value
 		s.mu.Lock()
 		s.paused = true
 		s.mu.Unlock()
+		s.stopFlowing()
 		return self, nil
 	}))
 	obj.SetOwn("resume", vm.NewNativeFunction(0, false, "resume", func(_ []vm.Value) (vm.Value, error) {
@@ -509,6 +719,7 @@ func buildSocketObject(vmInst *vm.VM, s *socketState) (*vm.PlainObject, vm.Value
 		s.paused = false
 		s.mu.Unlock()
 		s.cond.Broadcast()
+		s.startFlowing(vmInst, obj)
 		return self, nil
 	}))
 
