@@ -25,16 +25,22 @@ import (
 // NewConstructorWithProps, NewExceptionError) - no paserati changes
 // required.
 //
-// Scoped exactly to what real undici's `lib/dispatcher/client-h1.js`
-// (`lazyllhttp()`) actually needs, per paserati#375's own investigation:
-// `new WebAssembly.Module(bufferSource)`, `new WebAssembly.Instance(module,
-// importObject)` with plain-number (i32/i64/f32/f64) function imports,
-// and `instance.exports.memory.buffer` reflecting current wasm memory
+// Scoped to what real undici's `lib/dispatcher/client-h1.js`
+// (`lazyllhttp()`) actually needs: `WebAssembly.Module`/`Instance`
+// (both the synchronous constructors *and* the async
+// `compile`/`instantiate` statics - paserati#375's own issue text
+// quoted an undici version using only the synchronous constructors, but
+// a real end-to-end probe against a real installed undici@7.11.0 found
+// its actual current lazyllhttp() uses `await WebAssembly.compile(...)`
+// + `await WebAssembly.instantiate(mod, {...})` instead - confirmed by
+// running the real probe, not assumed from the issue's own summary)
+// with plain-number (i32/i64/f32/f64) function imports, and
+// `instance.exports.memory.buffer` reflecting current wasm memory
 // (including after growth). No WebAssembly.Table, no Global, no
-// streaming/async instantiate, no multi-value returns - none of those
-// are needed by the concrete call site this exists for, and this
-// project's own discipline is to build the real thing a real call site
-// needs, not speculative surface.
+// streaming instantiate, no multi-value returns - none of those are
+// needed by the concrete call site this exists for, and this project's
+// own discipline is to build the real thing a real call site needs, not
+// speculative surface.
 //
 // Depends on Buffer being real (see buffer.go) - real undici's own
 // vendored llhttp-wasm.js does `Buffer.from(base64, 'base64')`, and a
@@ -97,9 +103,15 @@ func installWebAssemblyGlobal(p *driver.Paserati) {
 	instanceProtoVal := vm.NewValueFromPlainObject(instanceProto)
 
 	moduleCtor := buildWasmModuleConstructor(vmInst, moduleProtoVal, errs)
+	if props := moduleCtor.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+		props.Properties.DefineFixedProperty("prototype", moduleProtoVal)
+	}
 	moduleProto.SetOwnNonEnumerable("constructor", moduleCtor)
 
 	instanceCtor := buildWasmInstanceConstructor(vmInst, instanceProtoVal, memoryProtoVal, errs)
+	if props := instanceCtor.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+		props.Properties.DefineFixedProperty("prototype", instanceProtoVal)
+	}
 	instanceProto.SetOwnNonEnumerable("constructor", instanceCtor)
 
 	memoryCtor := vm.NewConstructorWithProps(1, false, "Memory", func(args []vm.Value) (vm.Value, error) {
@@ -124,6 +136,66 @@ func installWebAssemblyGlobal(p *driver.Paserati) {
 	ns.SetOwn("CompileError", errs.compileError)
 	ns.SetOwn("LinkError", errs.linkError)
 	ns.SetOwn("RuntimeError", errs.runtimeError)
+
+	// WebAssembly.compile/instantiate (the async statics) - added after
+	// the synchronous Module/Instance constructors above were found, via
+	// a real end-to-end probe against a real installed undici@7.11.0,
+	// to be what that actual current version's own lazyllhttp() calls
+	// instead of `new WebAssembly.Module(...)`/`new
+	// WebAssembly.Instance(...)`: paserati#375's own issue text quoted
+	// an older undici version using the synchronous constructors
+	// directly, but the real current package does `await
+	// WebAssembly.compile(...)` then `await WebAssembly.instantiate(mod,
+	// {...})`. Confirmed by running the real probe before assuming
+	// either shape - not by reading the issue text alone. Both are
+	// synchronous under the hood (wazero itself is synchronous; there's
+	// no real async work to do), so these just wrap
+	// compileWasmModule/instantiateWasmModule in an
+	// already-resolved-or-rejected Promise rather than doing anything
+	// genuinely asynchronous.
+	ns.SetOwn("compile", vm.NewNativeFunction(1, false, "compile", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(
+				throwWasmError(vmInst, errs.compileError, "WebAssembly.compile: missing bufferSource argument"))), nil
+		}
+		modVal, err := compileWasmModule(vmInst, moduleProtoVal, errs, args[0])
+		if err != nil {
+			return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(err)), nil
+		}
+		return vmInst.NewResolvedPromise(modVal), nil
+	}))
+	ns.SetOwn("instantiate", vm.NewNativeFunction(2, false, "instantiate", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(
+				throwWasmError(vmInst, errs.compileError, "WebAssembly.instantiate: missing module/bufferSource argument"))), nil
+		}
+		importObject := vm.Undefined
+		if len(args) > 1 {
+			importObject = args[1]
+		}
+		// Two overloads per spec: instantiate(module, imports) resolves
+		// to just the Instance; instantiate(bufferSource, imports)
+		// compiles first and resolves to {module, instance}.
+		if isWasmModuleValue(args[0]) {
+			instVal, ierr := instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, errs, args[0], importObject)
+			if ierr != nil {
+				return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(ierr)), nil
+			}
+			return vmInst.NewResolvedPromise(instVal), nil
+		}
+		modVal, cerr := compileWasmModule(vmInst, moduleProtoVal, errs, args[0])
+		if cerr != nil {
+			return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(cerr)), nil
+		}
+		instVal, ierr := instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, errs, modVal, importObject)
+		if ierr != nil {
+			return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(ierr)), nil
+		}
+		result := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+		result.SetOwn("module", modVal)
+		result.SetOwn("instance", instVal)
+		return vmInst.NewResolvedPromise(vm.NewValueFromPlainObject(result)), nil
+	}))
 
 	gobj.SetOwn("WebAssembly", vm.NewValueFromPlainObject(ns))
 }
@@ -210,38 +282,75 @@ func bytesFromBufferSource(v vm.Value) ([]byte, bool) {
 	return nil, false
 }
 
+// compileWasmModule is the actual `WebAssembly.Module` construction
+// logic, factored out so both `new WebAssembly.Module(bytes)` and the
+// static `WebAssembly.compile(bytes)`/`instantiate(bytes, ...)` async
+// functions share it rather than duplicating the validate-and-store
+// steps. Compiles the bytes once, against a scratch runtime, purely to
+// validate them and surface a real CompileError - the scratch runtime is
+// discarded immediately after (see instantiateWasmModule's own doc
+// comment for why the *real* compile happens again, per-Instance,
+// against that Instance's own runtime, rather than reusing this one).
+func compileWasmModule(vmInst *vm.VM, moduleProtoVal vm.Value, errs wasmErrorCtors, source vm.Value) (vm.Value, error) {
+	data, ok := bytesFromBufferSource(source)
+	if !ok {
+		return vm.Undefined, throwWasmError(vmInst, errs.compileError, "WebAssembly.Module: argument must be a BufferSource (ArrayBuffer or TypedArray)")
+	}
+
+	ctx := context.Background()
+	scratchRT := wazero.NewRuntime(ctx)
+	_, err := scratchRT.CompileModule(ctx, data)
+	scratchRT.Close(ctx)
+	if err != nil {
+		return vm.Undefined, throwWasmError(vmInst, errs.compileError, "WebAssembly.Module: "+err.Error())
+	}
+
+	id := wasmModuleSeq.Add(1)
+	wasmModuleRegistry.Store(id, data)
+
+	obj := vm.NewObject(moduleProtoVal).AsPlainObject()
+	obj.SetOwnNonEnumerable(wasmModuleHandleMarker, vm.NumberValue(float64(id)))
+	return vm.NewValueFromPlainObject(obj), nil
+}
+
 // buildWasmModuleConstructor implements `new WebAssembly.Module(bytes)`.
-// Compiles the bytes once, against a scratch runtime, purely to
-// validate them and surface a real CompileError synchronously - the
-// scratch runtime is discarded immediately after (see
-// buildWasmInstanceConstructor's own doc comment for why the *real*
-// compile happens again, per-Instance, against that Instance's own
-// runtime, rather than reusing this one).
 func buildWasmModuleConstructor(vmInst *vm.VM, moduleProtoVal vm.Value, errs wasmErrorCtors) vm.Value {
 	return vm.NewConstructorWithProps(1, false, "Module", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
 			return vm.Undefined, throwWasmError(vmInst, errs.compileError, "WebAssembly.Module: missing bufferSource argument")
 		}
-		data, ok := bytesFromBufferSource(args[0])
-		if !ok {
-			return vm.Undefined, throwWasmError(vmInst, errs.compileError, "WebAssembly.Module: argument must be a BufferSource (ArrayBuffer or TypedArray)")
-		}
-
-		ctx := context.Background()
-		scratchRT := wazero.NewRuntime(ctx)
-		_, err := scratchRT.CompileModule(ctx, data)
-		scratchRT.Close(ctx)
-		if err != nil {
-			return vm.Undefined, throwWasmError(vmInst, errs.compileError, "WebAssembly.Module: "+err.Error())
-		}
-
-		id := wasmModuleSeq.Add(1)
-		wasmModuleRegistry.Store(id, data)
-
-		obj := vm.NewObject(moduleProtoVal).AsPlainObject()
-		obj.SetOwnNonEnumerable(wasmModuleHandleMarker, vm.NumberValue(float64(id)))
-		return vm.NewValueFromPlainObject(obj), nil
+		return compileWasmModule(vmInst, moduleProtoVal, errs, args[0])
 	})
+}
+
+// isWasmModuleValue reports whether v is a WebAssembly.Module built by
+// compileWasmModule (carries the real registry handle marker), as
+// opposed to a plain BufferSource - the distinction
+// WebAssembly.instantiate's overload resolution depends on.
+func isWasmModuleValue(v vm.Value) bool {
+	obj := asPlainObjectSafe(v)
+	if obj == nil {
+		return false
+	}
+	_, ok := obj.GetOwn(wasmModuleHandleMarker)
+	return ok
+}
+
+// asPlainObjectSafe is Value.AsPlainObject, but safe to call on an
+// arbitrary caller-supplied argument of unknown type: AsPlainObject
+// itself panics on anything whose type tag isn't exactly TypeObject
+// (confirmed directly in pkg/vm/value.go, not assumed) - a real, easy
+// mistake this file made twice (here and in instantiateWasmModule)
+// before a Go-level panic surfaced it: `new WebAssembly.Instance(module,
+// ...)`/`WebAssembly.instantiate(bufferSource, ...)` both hand this
+// function a real user-supplied argument that could be any type at all
+// (a TypedArray for the instantiate(bufferSource, ...) overload, in
+// particular).
+func asPlainObjectSafe(v vm.Value) *vm.PlainObject {
+	if v.Type() != vm.TypeObject {
+		return nil
+	}
+	return v.AsPlainObject()
 }
 
 // wasmMemoryBridge is the copy-based JS<->wasm linear memory bridge:
@@ -483,7 +592,24 @@ func makeHostImportTrampoline(vmInst *vm.VM, jsFn vm.Value, params, results []ap
 }
 
 // buildWasmInstanceConstructor implements `new WebAssembly.Instance(module,
-// importObject)`.
+// importObject)` (see instantiateWasmModule for the actual logic).
+func buildWasmInstanceConstructor(vmInst *vm.VM, instanceProtoVal, memoryProtoVal vm.Value, errs wasmErrorCtors) vm.Value {
+	return vm.NewConstructorWithProps(2, false, "Instance", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vm.Undefined, vmInst.NewTypeError("WebAssembly.Instance: missing module argument")
+		}
+		importObject := vm.Undefined
+		if len(args) > 1 {
+			importObject = args[1]
+		}
+		return instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, errs, args[0], importObject)
+	})
+}
+
+// instantiateWasmModule is the actual `WebAssembly.Instance` construction
+// logic, factored out so both `new WebAssembly.Instance(module, imports)`
+// and the static `WebAssembly.instantiate(module, imports)` async
+// function share it.
 //
 // One wazero Runtime per Instance, deliberately, not one shared runtime
 // for the whole process/session: confirmed directly (a two-runtime
@@ -495,121 +621,114 @@ func makeHostImportTrampoline(vmInst *vm.VM, jsFn vm.Value, params, results []ap
 // own JS import functions) would therefore corrupt each other on a
 // shared runtime. The tradeoff: the Module's own bytes get recompiled
 // here, once per Instance, rather than the compiled artifact being
-// reused - correctness over that one avoidable recompile.
-func buildWasmInstanceConstructor(vmInst *vm.VM, instanceProtoVal, memoryProtoVal vm.Value, errs wasmErrorCtors) vm.Value {
-	return vm.NewConstructorWithProps(2, false, "Instance", func(args []vm.Value) (vm.Value, error) {
-		if len(args) == 0 {
-			return vm.Undefined, vmInst.NewTypeError("WebAssembly.Instance: missing module argument")
-		}
-		moduleObj := args[0].AsPlainObject()
-		var idVal vm.Value
-		var ok bool
-		if moduleObj != nil {
-			idVal, ok = moduleObj.GetOwn(wasmModuleHandleMarker)
-		}
-		if !ok {
-			return vm.Undefined, vmInst.NewTypeError("WebAssembly.Instance: first argument must be a WebAssembly.Module")
-		}
-		rawBytesAny, ok := wasmModuleRegistry.Load(uint64(idVal.ToFloat()))
-		if !ok {
-			return vm.Undefined, vmInst.NewTypeError("WebAssembly.Instance: stale or invalid WebAssembly.Module")
-		}
-		wasmBytes := rawBytesAny.([]byte)
+// reused - correctness over that one avoidable recompile (and, as
+// docs/real-node-plan.md's Round 76 entry notes, each of these Runtimes
+// is never closed - fine at real usage, which memoizes lazyllhttp()'s
+// result to 1-2 Instances per process, but worth knowing the shape of).
+func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal vm.Value, errs wasmErrorCtors, moduleVal, importObject vm.Value) (vm.Value, error) {
+	moduleObj := asPlainObjectSafe(moduleVal)
+	var idVal vm.Value
+	var ok bool
+	if moduleObj != nil {
+		idVal, ok = moduleObj.GetOwn(wasmModuleHandleMarker)
+	}
+	if !ok {
+		return vm.Undefined, vmInst.NewTypeError("WebAssembly.Instance: first argument must be a WebAssembly.Module")
+	}
+	rawBytesAny, ok := wasmModuleRegistry.Load(uint64(idVal.ToFloat()))
+	if !ok {
+		return vm.Undefined, vmInst.NewTypeError("WebAssembly.Instance: stale or invalid WebAssembly.Module")
+	}
+	wasmBytes := rawBytesAny.([]byte)
 
-		importObject := vm.Undefined
-		if len(args) > 1 {
-			importObject = args[1]
+	ctx := context.Background()
+	rt := wazero.NewRuntime(ctx)
+
+	compiled, err := rt.CompileModule(ctx, wasmBytes)
+	if err != nil {
+		rt.Close(ctx)
+		return vm.Undefined, throwWasmError(vmInst, errs.compileError, "WebAssembly.Instance: "+err.Error())
+	}
+
+	// Group the module's declared function imports by their own
+	// module namespace (e.g. "env"), building one wazero host
+	// module per namespace and one trampoline per function, each
+	// resolved against importObject[moduleName][funcName].
+	importsByModule := map[string][]api.FunctionDefinition{}
+	var importOrder []string
+	for _, fd := range compiled.ImportedFunctions() {
+		modName, _, _ := fd.Import()
+		if _, seen := importsByModule[modName]; !seen {
+			importOrder = append(importOrder, modName)
 		}
-
-		ctx := context.Background()
-		rt := wazero.NewRuntime(ctx)
-
-		compiled, err := rt.CompileModule(ctx, wasmBytes)
-		if err != nil {
-			rt.Close(ctx)
-			return vm.Undefined, throwWasmError(vmInst, errs.compileError, "WebAssembly.Instance: "+err.Error())
-		}
-
-		// Group the module's declared function imports by their own
-		// module namespace (e.g. "env"), building one wazero host
-		// module per namespace and one trampoline per function, each
-		// resolved against importObject[moduleName][funcName].
-		importsByModule := map[string][]api.FunctionDefinition{}
-		var importOrder []string
-		for _, fd := range compiled.ImportedFunctions() {
-			modName, _, _ := fd.Import()
-			if _, seen := importsByModule[modName]; !seen {
-				importOrder = append(importOrder, modName)
+		importsByModule[modName] = append(importsByModule[modName], fd)
+	}
+	for _, modName := range importOrder {
+		fnDefs := importsByModule[modName]
+		var nsVal vm.Value = vm.Undefined
+		if importObject.IsObject() {
+			if v, gerr := vmInst.GetProperty(importObject, modName); gerr == nil {
+				nsVal = v
 			}
-			importsByModule[modName] = append(importsByModule[modName], fd)
 		}
-		for _, modName := range importOrder {
-			fnDefs := importsByModule[modName]
-			var nsVal vm.Value = vm.Undefined
-			if importObject.IsObject() {
-				if v, gerr := vmInst.GetProperty(importObject, modName); gerr == nil {
-					nsVal = v
+		builder := rt.NewHostModuleBuilder(modName)
+		for _, fd := range fnDefs {
+			_, fname, _ := fd.Import()
+			var jsFn vm.Value = vm.Undefined
+			if nsVal.IsObject() {
+				if v, gerr := vmInst.GetProperty(nsVal, fname); gerr == nil {
+					jsFn = v
 				}
 			}
-			builder := rt.NewHostModuleBuilder(modName)
-			for _, fd := range fnDefs {
-				_, fname, _ := fd.Import()
-				var jsFn vm.Value = vm.Undefined
-				if nsVal.IsObject() {
-					if v, gerr := vmInst.GetProperty(nsVal, fname); gerr == nil {
-						jsFn = v
-					}
-				}
-				if !jsFn.IsCallable() {
-					rt.Close(ctx)
-					return vm.Undefined, throwWasmError(vmInst, errs.linkError,
-						fmt.Sprintf("WebAssembly.Instance: import #%s.%s is not a function", modName, fname))
-				}
-				params := fd.ParamTypes()
-				resultsT := fd.ResultTypes()
-				builder = builder.NewFunctionBuilder().
-					WithGoFunction(api.GoFunc(makeHostImportTrampoline(vmInst, jsFn, params, resultsT)), params, resultsT).
-					Export(fname)
-			}
-			if _, ierr := builder.Instantiate(ctx); ierr != nil {
+			if !jsFn.IsCallable() {
 				rt.Close(ctx)
-				return vm.Undefined, throwWasmError(vmInst, errs.linkError, "WebAssembly.Instance: "+ierr.Error())
+				return vm.Undefined, throwWasmError(vmInst, errs.linkError,
+					fmt.Sprintf("WebAssembly.Instance: import #%s.%s is not a function", modName, fname))
 			}
+			params := fd.ParamTypes()
+			resultsT := fd.ResultTypes()
+			builder = builder.NewFunctionBuilder().
+				WithGoFunction(api.GoFunc(makeHostImportTrampoline(vmInst, jsFn, params, resultsT)), params, resultsT).
+				Export(fname)
 		}
-
-		mod, err := rt.InstantiateModule(ctx, compiled, wazero.NewModuleConfig())
-		if err != nil {
+		if _, ierr := builder.Instantiate(ctx); ierr != nil {
 			rt.Close(ctx)
-			return vm.Undefined, throwWasmError(vmInst, errs.linkError, "WebAssembly.Instance: "+err.Error())
+			return vm.Undefined, throwWasmError(vmInst, errs.linkError, "WebAssembly.Instance: "+ierr.Error())
 		}
+	}
 
-		exportsObj := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
-		var bridges []*wasmMemoryBridge
+	mod, err := rt.InstantiateModule(ctx, compiled, wazero.NewModuleConfig())
+	if err != nil {
+		rt.Close(ctx)
+		return vm.Undefined, throwWasmError(vmInst, errs.linkError, "WebAssembly.Instance: "+err.Error())
+	}
 
-		for name := range compiled.ExportedMemories() {
-			mem := mod.ExportedMemory(name)
-			if mem == nil {
-				continue
-			}
-			memVal, bridge := buildWasmMemoryValue(vmInst, memoryProtoVal, mem)
-			bridges = append(bridges, bridge)
-			exportsObj.SetOwn(name, memVal)
+	exportsObj := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+	var bridges []*wasmMemoryBridge
+
+	for name := range compiled.ExportedMemories() {
+		mem := mod.ExportedMemory(name)
+		if mem == nil {
+			continue
 		}
-		for name := range compiled.ExportedFunctions() {
-			fn := mod.ExportedFunction(name)
-			if fn == nil {
-				continue
-			}
-			def := fn.Definition()
-			params := def.ParamTypes()
-			resultsT := def.ResultTypes()
-			exportsObj.SetOwn(name, wrapWasmExportedFunction(vmInst, fn, params, resultsT, bridges, errs.runtimeError))
+		memVal, bridge := buildWasmMemoryValue(vmInst, memoryProtoVal, mem)
+		bridges = append(bridges, bridge)
+		exportsObj.SetOwn(name, memVal)
+	}
+	for name := range compiled.ExportedFunctions() {
+		fn := mod.ExportedFunction(name)
+		if fn == nil {
+			continue
 		}
+		def := fn.Definition()
+		params := def.ParamTypes()
+		resultsT := def.ResultTypes()
+		exportsObj.SetOwn(name, wrapWasmExportedFunction(vmInst, fn, params, resultsT, bridges, errs.runtimeError))
+	}
 
-		instObj := vm.NewObject(instanceProtoVal).AsPlainObject()
-		instObj.SetOwnNonEnumerable("exports", vm.NewValueFromPlainObject(exportsObj))
-		return vm.NewValueFromPlainObject(instObj), nil
-	})
+	instObj := vm.NewObject(instanceProtoVal).AsPlainObject()
+	instObj.SetOwnNonEnumerable("exports", vm.NewValueFromPlainObject(exportsObj))
+	return vm.NewValueFromPlainObject(instObj), nil
 }
 
 // wrapWasmExportedFunction wraps one wazero-exported function as a real

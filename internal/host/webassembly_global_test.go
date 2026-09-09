@@ -31,7 +31,13 @@ func wasmFixtureBytes(t *testing.T) []byte {
 // (base64 string in the test file) just to get it into the VM.
 func installWasmFixtureBuffer(t *testing.T, p *driver.Paserati) {
 	t.Helper()
-	data := wasmFixtureBytes(t)
+	installWasmBytesAsGlobal(t, p, "FIXTURE_WASM_BYTES", wasmFixtureBytes(t))
+}
+
+// installWasmBytesAsGlobal exposes arbitrary wasm bytes to JS as a real
+// Uint8Array global under the given name.
+func installWasmBytesAsGlobal(t *testing.T, p *driver.Paserati, name string, data []byte) {
+	t.Helper()
 	vmInst := p.GetVM()
 	ab := vm.NewArrayBuffer(len(data))
 	copy(ab.AsArrayBuffer().GetData(), data)
@@ -40,7 +46,23 @@ func installWasmFixtureBuffer(t *testing.T, p *driver.Paserati) {
 	if !ok {
 		t.Fatal("no globalThis")
 	}
-	gt.AsPlainObject().SetOwn("FIXTURE_WASM_BYTES", u8)
+	gt.AsPlainObject().SetOwn(name, u8)
+}
+
+// realLLHTTPWasmBytes loads a real, unmodified copy of undici@7.11.0's
+// own vendored `lib/llhttp/llhttp-wasm.js` payload (MIT licensed, same
+// license as undici itself), extracted once via `Buffer.from(base64,
+// 'base64')` in a real Node process and checked in as a plain .wasm
+// binary - see testdata/llhttp-real.wasm. This is the actual production
+// wasm binary real undici's own `lazyllhttp()` instantiates on every
+// real HTTP/1.1 request, not a synthetic stand-in.
+func realLLHTTPWasmBytes(t *testing.T) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "llhttp-real.wasm"))
+	if err != nil {
+		t.Fatalf("reading real llhttp wasm fixture: %v", err)
+	}
+	return data
 }
 
 func TestWebAssemblyGlobalsExist(t *testing.T) {
@@ -90,6 +112,42 @@ func TestWebAssemblyCompileErrorIsCatchable(t *testing.T) {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
 	want := `{"caught":true,"isCompileError":true,"isError":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestWebAssemblyAsyncCompileAndInstantiate exercises the async
+// `WebAssembly.compile`/`instantiate` statics real undici@7.11.0's own
+// current lazyllhttp() actually uses (`await WebAssembly.compile(...)`
+// then `await WebAssembly.instantiate(mod, {...})`) - found necessary via
+// a real end-to-end probe against a real installed copy, not assumed
+// from paserati#375's own issue text (which quoted an undici version
+// using the synchronous constructors directly). Covers both
+// `instantiate(module, imports)` (resolves to just the Instance) and
+// `instantiate(bytesSource, imports)` (resolves to {module, instance}).
+func TestWebAssemblyAsyncCompileAndInstantiate(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	installWasmFixtureBuffer(t, p)
+	val, errs := p.RunCode(`
+		const mod = await WebAssembly.compile(FIXTURE_WASM_BYTES);
+		const inst = await WebAssembly.instantiate(mod, { env: { host_add: (a, b) => a + b } });
+		const r1 = inst.exports.add_via_host(2, 3);
+
+		const { module, instance } = await WebAssembly.instantiate(FIXTURE_WASM_BYTES, { env: { host_add: (a, b) => a * b } });
+		const r2 = instance.exports.add_via_host(2, 3);
+
+		JSON.stringify({
+			r1, r2,
+			moduleIsModule: module instanceof WebAssembly.Module,
+			instanceIsInstance: instance instanceof WebAssembly.Instance,
+		})
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"r1":5,"r2":6,"moduleIsModule":true,"instanceIsInstance":true}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
@@ -317,6 +375,111 @@ func TestWebAssemblyModuleRejectsNonBufferSource(t *testing.T) {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
 	want := `{"isCompileError":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestWebAssemblyInstanceRejectsNonModuleArgument guards a real bug
+// found while adding the async compile/instantiate statics: passing a
+// non-object (or a plain object that isn't a real WebAssembly.Module)
+// as the first argument to `new WebAssembly.Instance(...)` or
+// `WebAssembly.instantiate(bufferSource, ...)`'s internal module-type
+// check used to panic the whole VM (`value.AsPlainObject()` panics on
+// any non-TypeObject value - confirmed directly in pkg/vm/value.go -
+// and this file called it unconditionally on a raw user argument)
+// instead of throwing a catchable TypeError.
+func TestWebAssemblyInstanceRejectsNonModuleArgument(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		let caught = null;
+		try {
+			new WebAssembly.Instance(new Uint8Array([1, 2, 3]), {});
+		} catch (e) {
+			caught = e;
+		}
+		JSON.stringify({ caught: caught !== null, isTypeError: caught instanceof TypeError })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"caught":true,"isTypeError":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestWebAssemblyRealLLHTTPParsesRealHTTPResponse is the actual
+// end-to-end proof this whole bridge exists for: compile and instantiate
+// real undici's own vendored llhttp wasm binary (not a synthetic
+// fixture), feed it a real, complete HTTP/1.1 response byte-for-byte the
+// way real undici's own `Parser.execute()` does (`new
+// Uint8Array(memory.buffer, ptr, len).set(chunk)` then
+// `llhttp_execute(ptr, ptr, len)`), and confirm every one of llhttp's
+// real wasm_on_* callbacks fires, in the right order, with the right
+// argument values, and llhttp_execute returns 0 (HPE_OK).
+//
+// Verified directly (not assumed) against a real, unmodified, currently
+// installed undici@7.11.0 before writing this: a standalone script using
+// exactly this call pattern against the exact same wasm binary produced
+// this exact same callback sequence. Confirms the actual hard technical
+// risk this whole feature existed to resolve - the real WASM<->JS memory
+// bridge and host-function trampolines - works against production wasm,
+// independent of whatever separate, unrelated issue exists further up
+// undici's own Client/socket dispatch layer (not attempted here - see
+// docs/real-node-plan.md's Round 76 entry).
+func TestWebAssemblyRealLLHTTPParsesRealHTTPResponse(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	installWasmBytesAsGlobal(t, p, "LLHTTP_WASM_BYTES", realLLHTTPWasmBytes(t))
+
+	val, errs := p.RunCode(`
+		const TYPE_RESPONSE = 2;
+		const log = [];
+		const importObject = {
+			env: {
+				wasm_on_url: (p, at, len) => { log.push(["on_url", at, len]); return 0; },
+				wasm_on_status: (p, at, len) => { log.push(["on_status", at, len]); return 0; },
+				wasm_on_message_begin: (p) => { log.push(["on_message_begin"]); return 0; },
+				wasm_on_header_field: (p, at, len) => { log.push(["on_header_field", at, len]); return 0; },
+				wasm_on_header_value: (p, at, len) => { log.push(["on_header_value", at, len]); return 0; },
+				wasm_on_headers_complete: (p, statusCode, upgrade, shouldKeepAlive) => {
+					log.push(["on_headers_complete", statusCode, upgrade, shouldKeepAlive]);
+					return 0;
+				},
+				wasm_on_body: (p, at, len) => { log.push(["on_body", at, len]); return 0; },
+				wasm_on_message_complete: (p) => { log.push(["on_message_complete"]); return 0; },
+			}
+		};
+
+		const mod = await WebAssembly.compile(LLHTTP_WASM_BYTES);
+		const instance = await WebAssembly.instantiate(mod, importObject);
+		const llhttp = instance.exports;
+
+		const ptr = llhttp.llhttp_alloc(TYPE_RESPONSE);
+
+		const response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+		const chunk = new TextEncoder().encode(response);
+
+		const bufSize = Math.ceil(chunk.length / 4096) * 4096;
+		const bufPtr = llhttp.malloc(bufSize);
+		new Uint8Array(llhttp.memory.buffer, bufPtr, bufSize).set(chunk);
+
+		const ret = llhttp.llhttp_execute(ptr, bufPtr, chunk.length);
+		llhttp.llhttp_free(ptr);
+
+		JSON.stringify({
+			ret,
+			eventNames: log.map(e => e[0]),
+			headersComplete: log.find(e => e[0] === "on_headers_complete"),
+			bodyLength: log.find(e => e[0] === "on_body")[2],
+		})
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"ret":0,"eventNames":["on_message_begin","on_status","on_header_field","on_header_value","on_header_field","on_header_value","on_headers_complete","on_body","on_message_complete"],"headersComplete":["on_headers_complete",200,0,1],"bodyLength":5}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
