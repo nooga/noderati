@@ -364,3 +364,79 @@ func TestNetSocketDestroyRightAfterWriteDoesNotHang(t *testing.T) {
 		t.Errorf("got %v 'close' events, want exactly 1", val)
 	}
 }
+
+// TestNetSocketUnrefLetsProcessDrainWithConnectionStillOpen guards
+// Socket.unref()/.ref() directly: real undici's client-h1.js calls
+// socket.unref() the instant a keep-alive connection has no in-flight
+// request (resumeH1), specifically so a pooled idle connection can't by
+// itself keep the process running - exactly like real Node's own
+// socket.unref(). Before this existed, unref()/ref() were pure no-op
+// stubs, so DrainUntilIdle's WaitForExternalOp() would wait forever on
+// any still-open socket regardless of unref() - confirmed directly via a
+// live pprof goroutine dump during a real-undici fetch() E2E probe
+// (docs/real-node-plan.md, Round 76/77) before writing this fix, though
+// that specific hang's actual root cause turned out to be a different,
+// unrelated bug (Socket never implementing paused-mode Readable, so
+// undici's parser was never fed any bytes at all - see that round's
+// entry). This test exercises unref() in isolation, independent of that
+// other bug: the server below never closes the connection, so if
+// unref() were still a no-op, DrainUntilIdle would hang this test
+// forever - guarded with a timeout so a regression fails loudly instead
+// of hanging the whole suite.
+func TestNetSocketUnrefLetsProcessDrainWithConnectionStillOpen(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// Deliberately never closes or writes again - a real, live,
+		// open connection that would keep readerLoop's conn.Read()
+		// blocked forever, exactly like an idle real-undici keep-alive
+		// socket.
+		_ = conn
+		<-make(chan struct{})
+	}()
+	host, port := splitHostPort(t, ln.Addr().String())
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let connected = false;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s }, () => {
+				connected = true;
+				socket.unref();
+				resolve();
+			});
+			socket.on("error", reject);
+		});
+		connected
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if !val.AsBoolean() {
+		t.Fatalf("socket never connected")
+	}
+
+	// The connection above is still open (the server never closes or
+	// destroys it, and this script never called socket.destroy()/end()
+	// either) - only unref() stands between DrainUntilIdle and waiting
+	// on it forever.
+	done := make(chan struct{})
+	go func() {
+		p.GetVM().DrainUntilIdle()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DrainUntilIdle did not return within 5s - socket.unref() did not release its external-op registration (connection is still open)")
+	}
+}

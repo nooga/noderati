@@ -65,6 +65,7 @@ func doTLSConnect(vmInst *vm.VM, optsVal vm.Value, connectCb vm.Value) vm.Value 
 
 	rt := vmInst.GetAsyncRuntime()
 	rt.BeginExternalOp()
+	s.beginTrackedExternalOp(rt)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -142,7 +143,7 @@ func doTLSConnect(vmInst *vm.VM, optsVal vm.Value, connectCb vm.Value) vm.Value 
 
 	go func() {
 		wg.Wait()
-		rt.EndExternalOp()
+		s.endTrackedExternalOp()
 	}()
 
 	return self
