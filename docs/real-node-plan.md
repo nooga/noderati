@@ -8205,3 +8205,193 @@ Four real paserati bugs have now been found and filed by this
 investigation (#292, #297, #298 fixed and merged same-day each time;
 #302 open) - each isolated to a minimal, undici-free repro before
 filing, per this project's own standing discipline.
+
+## Round 75: paserati#302 fixed and pulled - real undici's fetch() now runs its actual network path, blocked on a hard structural gap (no WebAssembly at all)
+
+Prompted by paserati landing on `main` with "millions of fixes" since Round
+74 - pulled it, rebuilt, and confirmed directly (not assumed) that
+`5d656722 fix(builtins): preserve existing accessor when defineProperty
+gets a generic descriptor` is exactly paserati#302 (`Fixes #302` in its own
+commit message) - the bug isolated last round that destroyed `Request`'s
+class-getter accessors the instant undici's `Object.defineProperties(
+Request.prototype, { signal: kEnumerableProperty, ... })` ran.
+
+**Recovery note before any of the above could be verified**: the entire
+Round 70-74 diff (net.go/tls.go/async_hooks.go/... - everything documented
+in those rounds' own entries) turned out to have been sitting uncommitted
+in the main checkout (`/Users/nooga/lab/noderati`) the whole time, not in
+the fresh worktree this session started in (which had branched off
+`origin/main` at Round 68, before even Round 69 was pushed). Confirmed the
+uncommitted diff still built and passed the full suite against paserati's
+new `main` before committing it as-is (one combined commit covering all
+five rounds, since that's genuinely how it happened - see that commit's
+own message for the per-round breakdown); continued all of this round's
+work in the main checkout from there, per the user's own explicit choice
+when asked.
+
+**Re-running the real undici probe (`declareUndici()` disabled, a fresh
+unmodified copy of the real npm package, the exact same
+`EnvHttpProxyAgent({allowH2:false,...})` + `setGlobalDispatcher` +
+`install()` + real `fetch()` call pattern as every prior round) against a
+real local Go `net/http` test server** turned up four more real, precisely
+isolated gaps, each fixed and each moving the failure measurably further
+into undici's own real request pipeline before the next one surfaced:
+
+1. **`node:events`'s `addAbortListener` missing entirely.** Real undici's
+   `lib/core/util.js` destructures it off `require("node:events")` at
+   module load time and calls it unconditionally on every request that
+   carries a signal. Added a real implementation (`events.go`): the
+   already-aborted branch queues the listener via a new real
+   `queueMicrotask` global (see next item); the common branch does a real
+   `signal.addEventListener('abort', listener, {once:true})` and returns
+   a real disposer keyed by the real `Symbol.dispose` (confirmed present
+   in paserati directly - `typeof Symbol.dispose === "symbol"`).
+
+2. **Global `queueMicrotask` missing entirely** (`queue_microtask.go`,
+   new file) - needed by (1)'s already-aborted branch. Built on the same
+   real primitive as `Promise.withResolvers` (`vmInst.NewPromiseFromExecutor`),
+   not anything synthetic: resolves a real Promise and hands the callback
+   to its real `.then`, which schedules it on the engine's own real
+   promise-reaction-job queue. Measured directly against both
+   `Promise.resolve()` and `setTimeout` rather than assumed: correctly
+   ordered *before* any macrotask, though it takes one extra microtask
+   tick versus V8's native fast path (documented in the file's own
+   comment, not glossed over) - a real, honest deviation, not a
+   correctness bug, since no real call site found so far depends on
+   tick-exact timing.
+
+3. **While testing (2), found and filed a genuine, separate paserati
+   engine bug**: `AbortController.abort()` never dispatches the `'abort'`
+   event to any listener registered via `addEventListener` (nor calls
+   `.onabort`, which doesn't even exist as a property), and
+   `removeEventListener` on an AbortSignal is a complete no-op. Isolated
+   to a 5-line repro (`ac.signal.addEventListener('abort', fn);
+   ac.abort(); // fn never runs`) with the exact `abort_controller_init.go`
+   root cause identified (the `abort()` method flips `.aborted`/`.reason`
+   but never reads or calls `signalRef.listeners`) before filing as
+   [paserati#372](https://github.com/nooga/paserati/issues/372). Not
+   fixable on our side per this project's standing rule; (1)'s
+   already-aborted branch doesn't depend on it and keeps working, so
+   `addAbortListener`'s own test locks in today's honest (not
+   spec-correct) behavior with a comment pointing at #372, to be flipped
+   the moment it's fixed upstream.
+
+4. **`new URL("http://host").pathname` was `""`, not `"/"`** - a real bug
+   in noderati's *own* `url.go` (not paserati; the URL class lives here),
+   found because real undici's `lib/core/util.js#parseOrigin` re-parses
+   a dispatcher's origin URL and throws `InvalidArgumentError('invalid
+   url')` unless `pathname === '/'` exactly, on every single Pool/Client
+   construction. Root cause: Go's `net/url.Parse("http://host")` leaves
+   `.Path` empty (no error), and nothing normalized that per WHATWG's own
+   rule that a special-scheme URL's path is never empty. Fixed by
+   normalizing `parsed.Path` to `"/"` before computing both `Pathname`
+   and `Href` (real Node: the same URL's `.href` is also `"http://host/"`,
+   not `"http://host"` - fixed together, not just the one field the crash
+   happened to hit first).
+
+5. **`http.maxHeaderSize` missing from the `node:http` shim.** Real
+   undici's `lib/dispatcher/client.js` reads it unconditionally at
+   module-load time, throwing `InvalidArgumentError('http module not
+   available or http.maxHeaderSize invalid')` the instant any
+   Client/Pool is constructed without it. Added as `16384` (real Node's
+   own default since v13.13.0) to `http.go`'s shim only, not `https` -
+   real Node doesn't expose it there either, confirmed rather than
+   copy-pasted across both for convenience.
+
+6. **Global `setTimeout` returning a plain number instead of a real
+   `Timeout`-shaped object** - the deepest and most structurally
+   interesting fix this round. Real undici's `lib/util/timers.js#refreshTimeout`
+   does `fastNowTimeout = setTimeout(onTick, TICK_MS);
+   fastNowTimeout?.unref()` on every single `FastTimer` construction (hit
+   on every request). A plain number has no `.unref` property - the `?.`
+   only guards the *receiver* (`fastNowTimeout`) being nullish, not the
+   looked-up property itself being absent - so calling it throws
+   "undefined is not a function", a real and unconditional crash, not an
+   edge case. Wrote `timeout_object.go`: a real Go-native `Timeout` object
+   wrapping paserati's own real numeric timer id in a closure, with real
+   `.ref()`/`.unref()` (honest no-ops - paserati's timer initializer has
+   no ref-counted keep-alive concept to hook into at all, so there's
+   nothing for them to toggle) and a real `.refresh()`/`.close()` that
+   clear-and-reschedule/clear the real underlying paserati timer, not
+   stubs.
+
+   **A real architectural discovery along the way, found by directly
+   testing rather than assuming the established `gobj.SetOwn(...)`
+   pattern from every prior global-install file would just work here
+   too**: it silently didn't. `globalThis.GetOwn("setTimeout")` (the Go
+   PlainObject API) and `vmInst.GetGlobal("setTimeout")` (paserati's
+   internal by-name heap lookup) returned two *different* underlying
+   function values immediately after `New()`, before any of this round's
+   code ran - proof that core compile-time-known globals like
+   `setTimeout`/`clearTimeout` (registered by paserati's own
+   `HostTimerInitializer`) are resolved by bare identifiers through a
+   dedicated heap slot, entirely separate from `globalThis`'s own-property
+   map. Writing to the latter (what every prior global-install file in
+   this codebase does - `file_global.go`, `promise_with_resolvers.go`,
+   this round's own `queue_microtask.go`) only ever touches a cold copy
+   for names that already have a reserved slot; it works for *brand-new*
+   names precisely because those have no such slot and correctly fall
+   back to a `globalThis` property lookup. A genuine
+   `globalThis.setTimeout = ...` assignment *executed as real bytecode*,
+   by contrast, measurably does update what bare identifiers subsequently
+   resolve to (confirmed directly, not assumed) - so the actual override
+   in `timeout_object.go` is done through one `p.EvalCode(...)` call
+   rather than the raw Go property-API pattern this file otherwise
+   follows throughout. Safe now specifically because paserati#298 (the
+   second-eval exception-propagation bug that forced `file_global.go` and
+   friends onto pure-Go construction in Round 73) is fixed upstream -
+   confirmed by a standalone repro test (`EvalCode` then a later
+   `RunCode` whose thrown exception still propagates correctly) before
+   relying on it here.
+
+**The wall this round actually hit, past all six of the above**: real
+undici's `lib/dispatcher/client-h1.js` (the real HTTP/1.1 connection
+handler `connectH1` reaches) unconditionally instantiates its bundled
+`llhttp` HTTP parser as a **WebAssembly** module
+(`new WebAssembly.Module(...)`, `new WebAssembly.Instance(...)`) the
+moment any real HTTP/1.1 request tries to parse a response - this specific
+undici version ships no pure-JS parser fallback at all
+(`/* global WebAssembly */` right at the top of the file, not a
+conditionally-reached corner). Checked paserati directly rather than
+assumed: `grep -rl WebAssembly pkg/` across the whole engine returns
+nothing - there is no `WebAssembly` global, no WASM bytecode interpreter,
+nothing to build on at all. This is not a small, isolable engine bug like
+#302/#372 above; it's an entire missing engine capability (a WASM
+runtime), structurally different in scope from every other gap this
+investigation has found and fixed or filed so far. Not filed as a
+paserati issue this round - a five-line repro and a root-cause diff isn't
+the right shape for "please add a WebAssembly interpreter," and the
+decision to take that on is the project's to make deliberately, not
+something to request via the same routine channel as an accessor bug.
+Flagging it here, plainly, as the actual current state of things instead.
+
+**Verification**: `go build`/`go vet` clean. New Go tests
+(`url_test.go`/`http_test.go`/`events_test.go`/`queue_microtask_test.go`/
+`timeout_object_test.go`) drive every real call shape found above,
+including one (`TestEventsAddAbortListener`) that deliberately asserts
+today's honest pre-#372-fix behavior rather than the spec-correct one, so
+it fails loudly (in the right direction) the moment that issue closes
+upstream instead of silently drifting. Full suite green 3x plus once under
+`-race`. `pi --version`/`--help` (real, unmodified `pi-coding-agent@0.80.2`)
+both still succeed; a live Fireworks `-p` smoke test could not be attempted
+this round - no API key configured in this environment (not the account
+suspension noted last round; simply nothing to authenticate with here) -
+so the tool-call/plain-reply paths are unverified live this specific round
+too, for an unrelated reason each time now.
+
+**Status**: real undici's `fetch()` now gets past every prior blocker
+(#302's accessor destruction, `addAbortListener`, `queueMicrotask`,
+`http.maxHeaderSize`, the URL pathname bug, and the `Timeout` object
+shape) and reaches its actual real network/parsing path before failing -
+a genuinely different kind of blocker than every previous round's, and
+one this project cannot build its way past: it needs paserati to grow a
+WebAssembly runtime, not another host-layer gap fix. `undici.go`'s shim
+stays in place; deleting it now would still be a regression. `net.go`/
+`tls.go` remain real and verified, still without a load-bearing consumer
+(undici's `Client`/`Pool` construct real sockets via `node:net.connect`
+that these files provide, but never gets to use one - it fails inside
+`connectH1`'s WASM setup before a socket write would happen). Five real
+paserati bugs found and filed by this investigation across all rounds now
+(#292, #297, #298, all fixed and merged same-day each time; #302 fixed
+and merged; #372 open) - each isolated to a minimal, undici-free repro
+before filing, per this project's own standing discipline.
