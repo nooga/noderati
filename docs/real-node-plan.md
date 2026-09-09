@@ -8532,7 +8532,15 @@ them, per this project's standing discipline:
    purely to surface a real `CompileError`, then discarded) and stores
    the raw validated bytes; each `Instance` gets its own fresh
    `wazero.Runtime` and recompiles from those bytes. One avoidable
-   recompile per `Instance`, traded for correctness.
+   recompile per `Instance`, traded for correctness - and each of those
+   Runtimes is never closed (no lifecycle hook exists to know when an
+   `Instance` JS object becomes unreachable), so it's not just a handle
+   leak, it's a compiled-code-holding runtime per `Instance`. Fine at
+   `lazyllhttp()`'s actual real usage (its result is memoized, so this
+   is 1-2 `Instance`s for a process's whole life); would matter a lot if
+   something ever instantiated per-request instead. Named here so a
+   future round hits this as an already-known tradeoff, not a surprise
+   under load.
 4. **A host function's Go panic survives through `fn.Call` as a
    recoverable error** - confirmed with a custom error type: wazero
    recovers the panic and wraps it, retrievable via `errors.As`. This is
