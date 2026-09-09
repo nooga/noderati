@@ -20,6 +20,12 @@ func New(argv []string) *driver.Paserati {
 		fmt.Fprintf(os.Stderr, "noderati: preload native modules: %v\n", err)
 	}
 	installBufferGlobal(p)
+	installUtilNatives(p)
+	installFileGlobal(p)
+	installMessagePortGlobal(p)
+	installEventGlobals(p)
+	installDOMExceptionGlobal(p)
+	installPromiseWithResolvers(p)
 	installAssertGlobal(p)
 	installWorkerThreadsExports(p)
 	p.AddResolver(NewNodeModulesResolver())
@@ -35,6 +41,7 @@ func installModules(p *driver.Paserati) {
 	declareConstants(p)
 	declareOS(p)
 	declareUtil(p)
+	declareUtilTypes()
 	declareFS(p)
 	declareURL(p)
 	declareQuerystring(p)
@@ -56,6 +63,17 @@ func installModules(p *driver.Paserati) {
 	declareVM(p)
 	declareHTTP()
 	installHTTPNatives(p)
+	declareNet()
+	installNetNatives(p)
+	declareTLS()
+	installTLSNatives(p)
+	declareAsyncHooks()
+	declareConsole()
+	declareTimers()
+	declareDNS()
+	installDNSNatives(p)
+	declareZlib()
+	installZlibNatives(p)
 
 	// Ledger group B (docs/real-node-plan.md): third-party npm package
 	// fakes, individually toggleable for the Phase 2 scoreboard. jiti/

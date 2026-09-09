@@ -31,7 +31,9 @@ import (
 //     docs/real-node-plan.md's Phase 4 section). One honest caveat:
 //     this resolver can't tell "node:xxx isn't a real Node builtin at
 //     all" from "node:xxx is a real Node builtin noderati just hasn't
-//     implemented yet" (e.g. `node:net`, a tracked Phase 5 gap) -
+//     implemented yet" (e.g. `node:dgram`, a tracked gap; `node:net`/
+//     `node:tls` were the same kind of gap until round 69, see
+//     docs/real-node-plan.md) -
 //     doing that would mean maintaining a list of every real builtin
 //     name. Real Node would never error on the latter case at all (the
 //     module genuinely exists there), so this message is only precise

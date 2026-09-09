@@ -65,3 +65,23 @@ func TestBufferAlloc(t *testing.T) {
 		t.Errorf("Buffer.alloc = %q", val.ToString())
 	}
 }
+
+// TestBufferAllocUnsafe guards against the real requirement found while
+// probing undici (round 74, docs/real-node-plan.md): its own
+// websocket/constants.js calls Buffer.allocUnsafe(0) at module load time.
+func TestBufferAllocUnsafe(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Buffer } from "node:buffer";
+		const b = Buffer.allocUnsafe(4);
+		JSON.stringify({ length: b.length, isBuffer: Buffer.isBuffer(b) })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"length":4,"isBuffer":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}

@@ -43,6 +43,16 @@ func structuredCloneValue(vmInst *vm.VM, v vm.Value, seen map[any]vm.Value) (vm.
 	if obj == nil {
 		return v, nil
 	}
+	// Real Node's node:worker_threads.markAsUncloneable(obj) marks an
+	// object so a later structuredClone()/postMessage attempt on it
+	// throws DataCloneError - real undici's own CacheStorage/Cache/
+	// Request/Response classes call it on themselves at construction
+	// time (found while probing real undici, round 74,
+	// docs/real-node-plan.md). Checked here via the same hidden marker
+	// worker_threads.go's markAsUncloneable sets.
+	if marked, ok := obj.GetOwn(uncloneableMarker); ok && marked.IsTruthy() {
+		return vm.Undefined, fmt.Errorf("DataCloneError: object cannot be cloned")
+	}
 	if cloned, ok := seen[obj]; ok {
 		return cloned, nil
 	}
