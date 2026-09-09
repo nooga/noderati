@@ -189,12 +189,16 @@ func TestWebAssemblyMemoryReadWrite(t *testing.T) {
 		inst.exports.write_byte(300, 77);
 		const viaJS = new Uint8Array(mem.buffer)[300];
 
-		JSON.stringify({ readBack, viaJS, isArrayBuffer: mem.buffer.constructor.name })
+		// mem.buffer instanceof ArrayBuffer matters for real: webidl
+		// converter code in real vendored packages checks exactly this.
+		// Was paserati#377 (fixed upstream, pulled as of paserati@c6a66eda)
+		// before this could be asserted meaningfully.
+		JSON.stringify({ readBack, viaJS, isArrayBuffer: mem.buffer instanceof ArrayBuffer })
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	want := `{"readBack":42,"viaJS":77,"isArrayBuffer":"ArrayBuffer"}`
+	want := `{"readBack":42,"viaJS":77,"isArrayBuffer":true}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
