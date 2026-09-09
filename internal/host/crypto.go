@@ -57,7 +57,7 @@ func declareCrypto(p *driver.Paserati) {
 			if _, err := rand.Read(b); err != nil {
 				return vm.Undefined, err
 			}
-			return wrapBuffer(vmInst, string(b)), nil
+			return wrapBuffer(vmInst, b), nil
 		})
 		// getHashes(): real Node returns every digest algorithm name
 		// OpenSSL supports on the running system (a large list).

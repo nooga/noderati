@@ -112,23 +112,18 @@ func socketStateFromValue(v vm.Value) *socketState {
 	return nil
 }
 
-// valueToBytes accepts either a JS string or one of this codebase's own
-// Buffer objects (buffer.go's wrapBuffer - a PlainObject whose toString()
-// closure returns the raw byte-aliased Go string it was built from) and
-// returns the underlying bytes. Buffer objects can't be read via
-// Value.ToString() directly - that generic conversion has no notion of
-// calling a user-level toString() and would just produce "[object
-// Object]" (pkg/vm/value.go) - so the buffer marker case explicitly
-// invokes the closure instead.
+// valueToBytes accepts either a JS string or a real Buffer/TypedArray
+// (buffer.go's Buffer is a real Uint8Array subclass as of the Buffer
+// realness pass done alongside paserati#375/WebAssembly - see buffer.go)
+// and returns the underlying bytes. A TypedArray's own real backing
+// bytes are read directly via typedArrayBytes rather than through any
+// string round trip, so this is safe for arbitrary binary data too.
 func valueToBytes(vmInst *vm.VM, v vm.Value) []byte {
-	if isBufferValue(v) {
-		if obj := v.AsPlainObject(); obj != nil {
-			if fn, ok := obj.GetOwn("toString"); ok && fn.IsCallable() {
-				if res, err := vmInst.Call(fn, v, nil); err == nil {
-					return []byte(res.ToString())
-				}
-			}
+	if ta := v.AsTypedArray(); ta != nil {
+		if b := typedArrayBytes(ta); b != nil {
+			return b
 		}
+		return nil
 	}
 	return []byte(v.ToString())
 }
@@ -141,7 +136,7 @@ func valueToBytes(vmInst *vm.VM, v vm.Value) []byte {
 func emitDataChunk(vmInst *vm.VM, obj *vm.PlainObject, chunk []byte, encoding string) {
 	switch encoding {
 	case "":
-		scheduleEmit(vmInst, obj, "data", wrapBuffer(vmInst, string(chunk)))
+		scheduleEmit(vmInst, obj, "data", wrapBuffer(vmInst, chunk))
 	case "hex":
 		scheduleEmit(vmInst, obj, "data", vm.NewString(hex.EncodeToString(chunk)))
 	case "base64":

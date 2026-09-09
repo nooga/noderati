@@ -141,7 +141,7 @@ func buildZlibDecompressor(vmInst *vm.VM, newReader func(io.Reader) (io.Reader, 
 			if n > 0 {
 				chunk := make([]byte, n)
 				copy(chunk, buf[:n])
-				scheduleEmit(vmInst, obj, "data", wrapBuffer(vmInst, string(chunk)))
+				scheduleEmit(vmInst, obj, "data", wrapBuffer(vmInst, chunk))
 			}
 			if rerr != nil {
 				if rerr == io.EOF {

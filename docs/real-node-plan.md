@@ -8402,3 +8402,90 @@ paserati bugs found and filed by this investigation across all rounds now
 (#292, #297, #298, all fixed and merged same-day each time; #302 fixed
 and merged; #372 open) - each isolated to a minimal, undici-free repro
 before filing, per this project's own standing discipline.
+
+## Round 76: WebAssembly, pivoted to noderati-only (paserati#375 needs no paserati changes); Phase 0 - Buffer made real
+
+Re-read paserati#375's own scoped surface against `pkg/vm`'s already
+*exported* API before writing a line of implementation, per this
+project's habit of checking rather than assuming: `ArrayBufferObject`/
+`TypedArrayObject` (real `[]byte`-backed, `AsArrayBuffer()`/
+`AsTypedArray()`, `NewArrayBuffer`/`NewTypedArray`), `vm.Call(fn, this,
+args)` for a Go callback to re-enter JS (already the exact mechanism
+`host_timers.go`'s `setTimeout` and this codebase's own `emitter.go` use
+for every other JS-callback bridge), `NewConstructorWithProps`, and
+`vmInstance.NewExceptionError` for throwing a real, catchable JS
+exception from Go. That's the entire toolkit `WebAssembly.Module`/
+`Instance`/`Memory` (wazero-backed) needs - nothing paserati doesn't
+already expose. So this is being built as a host-injected global here in
+noderati, the same way `File`/`MessagePort`/`DOMException` already are,
+not as a paserati core feature - commented on paserati#375 to that
+effect rather than leaving it looking like still-pending paserati work.
+
+**Before any of the WebAssembly bridge itself, a blocking prerequisite
+found by reading the actual real call site again, not just the issue's
+own summary of it**: real undici's `lazyllhttp()` does `new
+WebAssembly.Module(require('../llhttp/llhttp-wasm.js'))`, and that
+`require()` returns a real Node `Buffer` (`Buffer.from('<base64>',
+'base64')` in the vendored file itself). `internal/host/buffer.go`'s
+`Buffer` was a complete fake through Round 75: a `PlainObject` carrying
+its bytes hidden inside a Go string closure, no indexed access, no
+`ArrayBuffer` backing at all - `AsTypedArray()`/`AsArrayBuffer()` both
+failed on it. A `WebAssembly.Module` constructor that (correctly, per
+spec) only accepts real `ArrayBuffer`/`TypedArray` input could not read
+this fake Buffer's bytes at all - the actual motivating call site would
+stay broken under a perfectly-implemented WebAssembly bridge. The same
+gap was latent for any binary data ever routed through the old
+`wrapBuffer(vmInst, string)` generally: forcing arbitrary bytes through
+a Go string and back through paserati's own JS string representation
+isn't a safe carrier once those bytes aren't valid UTF-8.
+
+Rebuilt `Buffer` as a real `Uint8Array` subclass - real Node's own
+`Buffer` literally is one. `Buffer.prototype`'s `[[Prototype]]` is the
+real `Uint8Array.prototype` (same reparenting trick `file_global.go`
+uses to build `File` on top of the real `Blob`), so indexed byte access,
+`.length`, iteration, `.buffer`, and paserati's own real ES2024
+`toBase64`/`fromBase64`/`toHex`/`fromHex` typed-array methods all come
+free, for real, off the actual shared prototype chain - only the
+genuinely Buffer-specific surface (`from`/`alloc`/`allocUnsafe`/
+`isBuffer`/`byteLength`/`concat` statics, `toString(encoding)`/`write()`
+instance methods) needed writing. `subarray()`/`slice()` needed an
+explicit wrap-the-result step: confirmed directly (a vanilla, Buffer-free
+`new Uint8Array(...).subarray()` repro) that paserati's generic
+`%TypedArray%.prototype` implementation doesn't species-construct
+through `this.constructor`, so those two are overridden on
+`Buffer.prototype` to call the real inherited method via
+`vmInst.GetProperty`+`vmInst.Call` and reparent just the *result* back
+onto `Buffer.prototype` - not a paserati bug, just a real behavioral gap
+this file has to close itself since the fix belongs entirely in
+noderati's own control.
+
+**A second, genuine paserati bug found in passing, filed nowhere yet**:
+`new Uint8Array(4).buffer instanceof ArrayBuffer` is `false` - confirmed
+with a minimal repro with zero noderati or Buffer involvement at all
+(`constructor.name` correctly reports `"ArrayBuffer"`, but `instanceof`
+itself fails). Not this round's to fix or file without asking; flagged to
+the user, not yet filed.
+
+Only three other files touched `wrapBuffer`/the old string-carrier
+model - `crypto.go` (`randomBytes`), `net.go` (socket `data` chunks,
+plus `valueToBytes` which used to invoke the fake Buffer's `toString()`
+closure to get bytes back out and now reads real `TypedArray` bytes
+directly), `zlib.go` (decompressed chunks) - all three already held real
+`[]byte` at their call sites and needed only the signature change
+(`wrapBuffer` now takes `[]byte`, not `string`).
+
+**Verification**: `go build`/`go vet ./...` clean. New Go tests
+(`TestBufferIsRealUint8Array`, `TestBufferBase64RoundTrip` - the exact
+`Buffer.from(bytes).toString('base64')`/`Buffer.from(b64,
+'base64')` round trip real undici's own vendored wasm-embedding file
+uses - `TestBufferSubarrayStaysBuffer`) added alongside the existing
+Buffer suite, all passing. Full `internal/host` suite re-run before and
+after: identical to baseline except this round's own additions - the one
+still-failing test (`TestEventsAddAbortListener`) reproduces byte-for-byte
+on a stash of this round's diff too, confirming it's the same
+already-documented pre-#372-fix sentinel from Round 74, unrelated to
+this round's work.
+
+**Status**: Phase 0 (real `Buffer`) done. Phase 1 (the actual
+`WebAssembly.Module`/`Instance`/`Memory` bridge, wazero-backed) not
+started yet this round.
