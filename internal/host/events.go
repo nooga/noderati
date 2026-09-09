@@ -29,7 +29,7 @@ const eventsShim = `class EventEmitter {
   emit(event, ...args) {
     const list = this._events[event];
     if (!list || list.length === 0) return false;
-    for (const fn of list.slice()) fn(...args);
+    for (const fn of list.slice()) fn.call(this, ...args);
     return true;
   }
 }
