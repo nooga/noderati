@@ -82,7 +82,39 @@ EventEmitter.getMaxListeners = getMaxListeners;
 EventEmitter.setMaxListeners = setMaxListeners;
 EventEmitter.defaultMaxListeners = defaultMaxListeners;
 
-export { EventEmitter, getMaxListeners, setMaxListeners, defaultMaxListeners };
+// addAbortListener was missing entirely - found while re-probing real
+// undici after paserati#302 was fixed (round 75, docs/real-node-plan.md):
+// with the accessor-destroying bug gone, a real fetch() call now gets
+// all the way into undici's own lib/core/util.js, which does
+// 'const { addAbortListener: addAbortListenerNative } =
+// require("node:events")' at module load time and calls it
+// unconditionally (no try/catch) the moment any request carries a
+// signal - a real, unavoidable call site, not a hypothetical one. Real
+// Node's own implementation (lib/events.js): if the signal is already
+// aborted, queues the listener as a microtask instead of calling it
+// synchronously (spec requires abort listeners never run
+// synchronously with the call that set .aborted); otherwise it's a
+// real signal.addEventListener('abort', ..., {once:true}) - both
+// AbortController/AbortSignal are real paserati builtins (a real
+// EventTarget), not anything faked here. The return value matters:
+// undici does 'addAbortListenerNative(signal, listener)[Symbol.dispose]'
+// (grabbing the disposer function, not calling it yet), so the returned
+// object must carry a real, callable Symbol.dispose property - Symbol.dispose
+// is itself a real well-known symbol in paserati (confirmed directly),
+// so this needs no faking either.
+function addAbortListener(signal, listener) {
+  let removeEventListener;
+  if (signal && signal.aborted) {
+    queueMicrotask(() => listener());
+  } else {
+    signal.addEventListener("abort", listener, { once: true });
+    removeEventListener = () => { signal.removeEventListener("abort", listener); };
+  }
+  return { [Symbol.dispose]() { if (removeEventListener) removeEventListener(); } };
+}
+EventEmitter.addAbortListener = addAbortListener;
+
+export { EventEmitter, getMaxListeners, setMaxListeners, defaultMaxListeners, addAbortListener };
 export default EventEmitter;
 `
 

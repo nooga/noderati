@@ -45,6 +45,32 @@ func TestHTTPRequestGET(t *testing.T) {
 	}
 }
 
+// TestHTTPMaxHeaderSize drives the exact real gap found while re-probing
+// real undici's fetch() (round 75, docs/real-node-plan.md): undici's own
+// lib/dispatcher/client.js reads http.maxHeaderSize at module-load time
+// unconditionally, throwing InvalidArgumentError the instant any
+// Client/Pool is constructed if it's missing/non-numeric. Real Node
+// exposes this only on node:http (default 16384), not node:https.
+func TestHTTPMaxHeaderSize(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import http from "node:http";
+		import https from "node:https";
+		JSON.stringify({
+			httpMaxHeaderSize: http.maxHeaderSize,
+			httpsHasMaxHeaderSize: "maxHeaderSize" in https,
+		})
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"httpMaxHeaderSize":16384,"httpsHasMaxHeaderSize":false}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
 func TestHTTPRequestPOSTBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

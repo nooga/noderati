@@ -93,6 +93,23 @@ func newJSURL(href string, base vm.Value) (*jsURL, error) {
 	if specialSchemes[parsed.Scheme] {
 		origin = protocol + "//" + parsed.Host
 	}
+	// WHATWG's URL parser gives a special-scheme URL with no path
+	// component a single-slash path, never an empty one - real Node:
+	// new URL("http://x").pathname === "/", not "". Go's net/url.Parse
+	// leaves Path empty for "http://x" (no error, just an empty string),
+	// so this needs an explicit normalization step. Found the hard way
+	// while re-probing real undici's fetch() after paserati#302 was
+	// fixed (round 75, docs/real-node-plan.md): undici's own
+	// lib/core/util.js#parseOrigin re-parses the dispatcher's origin
+	// URL and throws InvalidArgumentError('invalid url') unless
+	// pathname === '/' exactly - a real, unconditional check on a real
+	// call path (every request through Pool/Client construction), not
+	// an edge case. Mutating parsed.Path before it feeds Href below
+	// also fixes href (real Node: same URL's .href is
+	// "http://x/", not "http://x") for the same reason.
+	if specialSchemes[parsed.Scheme] && parsed.Path == "" {
+		parsed.Path = "/"
+	}
 	search := ""
 	if parsed.RawQuery != "" {
 		search = "?" + parsed.RawQuery

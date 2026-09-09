@@ -55,6 +55,32 @@ func TestURLParse(t *testing.T) {
 	}
 }
 
+// TestURLEmptyPathNormalizesToSlash drives the exact real gap found while
+// re-probing real undici's fetch() (round 75, docs/real-node-plan.md):
+// undici's own lib/core/util.js#parseOrigin re-parses a dispatcher's
+// origin URL and throws InvalidArgumentError('invalid url') unless its
+// pathname is exactly "/" - a real, unconditional check hit on every
+// request. Real Node/browsers give a special-scheme URL with no path
+// component pathname "/" (never ""), and the same normalization must
+// show up in href too (real Node: new URL("http://x").href is
+// "http://x/", not "http://x").
+func TestURLEmptyPathNormalizesToSlash(t *testing.T) {
+	p := newURLHost(t)
+	js := `
+		import { URL } from "url";
+		const u = new URL("http://127.0.0.1:8991");
+		[u.pathname, u.href].join("|")
+	`
+	val, errs := p.RunCode(js, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := "/|http://127.0.0.1:8991/"
+	if val.ToString() != want {
+		t.Errorf("got %q, want %q", val.ToString(), want)
+	}
+}
+
 func TestURLNodeAlias(t *testing.T) {
 	p := newURLHost(t)
 	js := `
