@@ -8618,3 +8618,128 @@ verification (actually running real undici's `fetch()` through
 probed real undici surfaced at least one new engine bug with its own
 debugging tail, and starting that probe now risked an unbounded session
 rather than a clean stopping point. Left for a following round.
+
+## Round 76 (cont.): real-undici E2E probe - a real noderati `this`-binding bug fixed, real undici's actual async compile/instantiate usage discovered and implemented, real llhttp wasm parses a real HTTP response end to end
+
+Took on the E2E verification explicitly deferred above, installed a real
+`undici@7.11.0` (npm, into a scratch dir - not committed) and ran the
+same `EnvHttpProxyAgent({allowH2:false})` + `setGlobalDispatcher` +
+`install()` + real `fetch()` pattern every prior round has used, against
+a real local Go `net/http` test server, with `declareUndici()`
+temporarily disabled (restored before every commit, per this project's
+own standing procedure for these probes).
+
+**First real finding, entirely unrelated to WASM**: the very first run
+crashed inside `Pool` construction itself, long before any request -
+`Cannot set index on non-array/object/typedarray type 'undefined'` in
+`dispatcher/pool-base.js`'s `onDrain`, which does `this[kNeedDrain] =
+needDrain`. Isolated to a minimal, undici-free repro before touching
+anything (per standing discipline): a class extending `node:events`'
+`EventEmitter` that assigns a plain (non-arrow) function to an instance
+property inside its own constructor, later used as *another* emitter's
+listener - `this` inside it was `undefined` instead of the emitter that
+dispatched the event. A plain, non-subclassed `EventEmitter` instance
+doing the exact same thing was unaffected, which is what pointed at
+noderati's own `events.go` shim rather than paserati: its `emit()` called
+listeners via a bare `fn(...args)` instead of `fn.call(this,
+...args)` - real Node's own documented behavior is that a plain-function
+listener's `this` is bound to the emitter. One-line fix
+(`internal/host/events.go`), full suite re-verified green before
+continuing.
+
+**Second real finding**: with that fixed, the crash moved forward into
+`lazyllhttp()` itself - `undefined is not a function`. Reading the real
+installed file directly (not re-reading the issue's own quoted code)
+showed why: `undici@7.11.0`'s actual `lazyllhttp()` does `await
+WebAssembly.compile(require('../llhttp/llhttp_simd-wasm.js'))` then
+`await WebAssembly.instantiate(mod, {...})` - the *async* statics, not
+`new WebAssembly.Module(...)`/`new WebAssembly.Instance(...)` directly.
+paserati#375's own issue text quoted an older undici version using the
+synchronous constructors only; this round's own earlier work (this same
+Round 76 entry, above) had deliberately scoped those statics out on that
+basis. Corrected by real evidence rather than defended on the issue's
+own authority: refactored the synchronous constructors' bodies into two
+shared functions (`compileWasmModule`/`instantiateWasmModule`) and added
+`WebAssembly.compile`/`instantiate` as thin async wrappers around them
+(genuinely synchronous under the hood - wazero itself is synchronous -
+so these just return an already-resolved-or-rejected Promise; both
+`instantiate` overloads per spec are implemented: `instantiate(module,
+imports)` resolves to just the `Instance`, `instantiate(bufferSource,
+imports)` compiles first and resolves to `{module, instance}`).
+
+That refactor's own review (writing `TestWebAssemblyAsyncCompileAndInstantiate`
+immediately after, not waiting for the next probe to find it) caught two
+real bugs in this file's own code, neither paserati's fault:
+
+1. `WebAssembly.Module.prototype`/`WebAssembly.Instance.prototype` were
+   never actually wired up - `moduleProto`/`instanceProto` had their
+   `constructor` property pointed at the right constructors, but the
+   reverse link (`moduleCtor.prototype = moduleProtoVal`) was never set.
+   Every `x instanceof WebAssembly.Module`/`Instance` check was silently
+   guaranteed to throw ("Function has non-object prototype in instanceof
+   check") - just never exercised by this file's own tests until the new
+   one checked it.
+2. `isWasmModuleValue`/`instantiateWasmModule`'s module-type check called
+   `Value.AsPlainObject()` unconditionally on a raw, arbitrary caller
+   argument. Confirmed directly (not assumed) that `AsPlainObject` panics
+   on anything whose type tag isn't exactly `TypeObject` (`pkg/vm/value.go`) -
+   so `WebAssembly.instantiate(someTypedArray, imports)` (a real, spec-legal
+   call shape, and exactly the second `instantiate` overload's own first
+   argument) crashed the whole VM instead of throwing a catchable
+   `TypeError`. Fixed with a small `asPlainObjectSafe` guard;
+   `TestWebAssemblyInstanceRejectsNonModuleArgument` pins it down.
+
+**With all of the above fixed, the actual target**: real undici's
+`fetch()` against the local Go server got further than any prior
+round - past module load, past `Pool`/`Client` construction, past
+`lazyllhttp()`'s real `WebAssembly.compile`/`instantiate` calls
+completing successfully - and then the *process itself* hung (near-zero
+CPU, not a busy loop) partway through the actual request. A `SIGQUIT`
+didn't produce a dump (noderati installs its own signal handling), so
+diagnosed via `NODERATI_PPROF`'s pprof endpoint instead: a goroutine
+dump showed the VM's single interpreter goroutine blocked in
+`DefaultAsyncRuntime.WaitForExternalOp`, and a real, still-open
+`net.Conn` read blocked waiting for more bytes from the (idle,
+keep-alive) server connection - i.e. something in the `Client`/socket
+dispatch layer above the parser never told the async runtime the
+response was actually complete, so the event loop is correctly waiting
+on a genuinely pending (if permanently idle) external op forever. This
+is a *different*, separate bug from anything WASM-related - almost
+certainly somewhere in the `Client`/`Dispatcher`/socket coordination
+layer, not in `lazyllhttp()` or the WASM bridge itself (confirmed next).
+Not isolated or filed this round - a real further investigation of its
+own, out of scope for what this round set out to verify.
+
+**To settle definitively whether the WASM bridge itself is sound**,
+independent of that separate hang: wrote a standalone script that
+bypasses undici's `Client`/socket layer entirely and drives the real
+`llhttp-wasm.js` binary directly, replicating `client-h1.js`'s own exact
+call pattern (`WebAssembly.compile`/`instantiate` with real
+`wasm_on_*` import callbacks, `llhttp_alloc(TYPE.RESPONSE)`,
+`malloc`/`new Uint8Array(memory.buffer, ptr, len).set(chunk)`/
+`llhttp_execute`) against a real, complete, hand-written HTTP/1.1
+response. **Every callback fired, in the exact right order, with the
+exact right argument values, and `llhttp_execute` returned 0 (`HPE_OK`)**:
+`on_message_begin` -> `on_status` -> two `on_header_field`/`on_header_value`
+pairs -> `on_headers_complete` (status 200, no upgrade, keep-alive) ->
+`on_body` (5 bytes) -> `on_message_complete`. This is the actual hard
+technical risk this whole feature existed to resolve, proven against
+production wasm bytes, not a synthetic fixture - checked in as a
+permanent Go test (`TestWebAssemblyRealLLHTTPParsesRealHTTPResponse`,
+`internal/host/testdata/llhttp-real.wasm` - a real, unmodified,
+MIT-licensed copy of undici@7.11.0's own vendored llhttp wasm binary,
+extracted once via `Buffer.from(base64, 'base64')` in a real Node
+process).
+
+**Verification**: `go build`/`go vet ./...` clean. Full `internal/host`
+suite green except the same pre-existing, unrelated
+`TestEventsAddAbortListener`. `declareUndici()` restored (was only ever
+disabled locally during the probe itself, per standing procedure).
+
+**Status**: the WASM<->JS bridge this whole feature exists for is now
+proven correct against real, production `llhttp` wasm bytes end to end,
+independent of the rest of the HTTP stack. Real `fetch()` through real
+undici all the way to a real response is still blocked - now on a
+different, newly-found bug in the `Client`/socket dispatch layer above
+the parser, not on WebAssembly - left for a following round to isolate
+and file properly rather than rushed here.
