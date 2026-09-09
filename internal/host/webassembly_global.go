@@ -751,6 +751,18 @@ func wrapWasmExportedFunction(vmInst *vm.VM, fn api.Function, params, resultsT [
 	return vm.NewNativeFunction(len(params), false, name, func(args []vm.Value) (vm.Value, error) {
 		for _, b := range bridges {
 			b.syncIn()
+			// Mark dirty immediately, *before* the call, not just after
+			// it returns. syncIn() just committed every pending JS write
+			// into wasm memory, so wasm's own memory is authoritative
+			// starting now - and wasm may call back into JS (a host
+			// import) *during* fn.Call below, before this wrapper ever
+			// returns. If a host import reads memory.buffer expecting to
+			// see bytes wasm wrote earlier in this same call (real
+			// llhttp callbacks do exactly this: they're invoked with
+			// pointers into memory wasm just populated), dirty must
+			// already be true so bufferValue() re-reads from wasm rather
+			// than handing back a stale cached ArrayBuffer.
+			b.markDirty()
 		}
 
 		callArgs := make([]uint64, len(params))
@@ -769,6 +781,13 @@ func wrapWasmExportedFunction(vmInst *vm.VM, fn api.Function, params, resultsT [
 		results, callErr := fn.Call(context.Background(), callArgs...)
 
 		for _, b := range bridges {
+			// Redundant with the pre-call markDirty above for the common
+			// case, but cheap and covers a memory.grow that happened
+			// during the call (grow already forces a re-read via the
+			// size-changed check in bufferValue, but keeping this here
+			// costs nothing and documents the invariant: wasm is always
+			// considered authoritative after any call that could have
+			// touched its memory).
 			b.markDirty()
 		}
 

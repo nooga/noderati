@@ -8743,3 +8743,52 @@ undici all the way to a real response is still blocked - now on a
 different, newly-found bug in the `Client`/socket dispatch layer above
 the parser, not on WebAssembly - left for a following round to isolate
 and file properly rather than rushed here.
+
+**Round 76 (cont.): a real reentrancy bug in the memory bridge, caught
+before it shipped, plus one flagged concern ruled out.** A post-hoc
+review of the export-function wrapper (`wrapWasmExportedFunction`)
+found that `markDirty()` was only called *after* `fn.Call(...)`
+returned, not before it started. That's wrong for exactly the call
+pattern real llhttp uses: a wasm export can call back into a JS host
+import *during* its own execution (llhttp's `wasm_on_status`/
+`wasm_on_body`/etc. are called mid-`llhttp_execute`, each handed a
+pointer into memory llhttp just populated), and if that JS callback
+reads `memory.buffer` before the wrapper's own post-call `markDirty()`
+runs, `bufferValue()` would hand back the *stale* cached ArrayBuffer
+(whatever was last vended, reflecting JS's pre-call writes only) rather
+than a fresh read of wasm's current memory. The capstone llhttp test
+didn't catch this because every `wasm_on_*` callback in it just logged
+offsets - it never actually dereferenced them via `memory.buffer`
+inside the callback, so the exact seam real undici's own callbacks
+exercise (`new FastBuffer(currentBufferRef.buffer, start, len)`) went
+untested. Fixed with a one-line change: `markDirty()` now runs
+immediately after `syncIn()`, before `fn.Call`, on the reasoning that
+`syncIn()` just committed every pending JS write into wasm memory, so
+wasm's own memory is authoritative from that instant regardless of
+whether or how it calls back into JS mid-execution; the post-call
+`markDirty()` stays too (harmless, covers a `memory.grow` mid-call).
+Strengthened `TestWebAssemblyRealLLHTTPParsesRealHTTPResponse` itself
+to close the gap that let this ship unnoticed: `wasm_on_status` and
+`wasm_on_body` now actually decode `new Uint8Array(llhttp.memory.buffer,
+at, len)` inside the callback and assert on the resulting text ("OK"
+and "hello" respectively), rather than only logging pointer/length
+pairs - this is the assertion that would have failed under the old
+code and now passes under the fix.
+
+Separately investigated and ruled out: whether `events.go`'s
+`fn.call(this, ...args)` fix (this same round, upstream in this log)
+could have broken arrow-function listeners, since a spec-compliant
+arrow function ignores a `.call()`-supplied receiver entirely - if
+paserati's `.call()` didn't honor that, every arrow-function
+`EventEmitter` listener in the runtime (including `once()`'s own
+wrapper, itself an arrow) would silently start seeing the wrong `this`.
+Checked directly with a minimal repro (`arrow.call(obj) === <arrow's
+own lexical this>`, not `obj`) run against the current paserati: it
+correctly ignores the passed receiver for arrow functions. No latent
+bug here - the `this`-binding fix from earlier in this round only
+affects plain-function listeners, exactly as intended.
+
+**Re-verification**: `go build ./...` clean, `gofmt` clean, full
+`internal/host` suite green except the same pre-existing, unrelated
+`TestEventsAddAbortListener` (confirmed via `git stash` to fail
+identically with none of this round's changes applied).
