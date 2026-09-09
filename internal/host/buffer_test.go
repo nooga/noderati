@@ -150,6 +150,59 @@ func TestBufferBase64RoundTrip(t *testing.T) {
 	}
 }
 
+// TestBufferBase64FullByteRange is the test the base64 bridge actually
+// needs to survive: real wasm binaries (real undici's own vendored
+// llhttp-wasm.js included - confirmed directly by reading a real
+// installed copy's source, which does exactly `wasmBuffer =
+// Buffer.from(wasmBase64, 'base64')`) contain every byte value 0-255,
+// not just the small integers TestBufferBase64RoundTrip happens to use.
+// A signedness or truncation bug in the base64 decode path would still
+// pass that test while corrupting real wasm bytes.
+func TestBufferBase64FullByteRange(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Buffer } from "node:buffer";
+		const bytes = Array.from({ length: 256 }, (_, i) => i);
+		const b64 = Buffer.from(bytes).toString("base64");
+		const decoded = Buffer.from(b64, "base64");
+		const matches = decoded.length === 256 && Array.from(decoded).every((v, i) => v === bytes[i]);
+		JSON.stringify({ length: decoded.length, matches })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"length":256,"matches":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestBufferSubarrayDoesNotMutateReceiver guards the reparenting done by
+// wrapInheritedTypedArrayMethod: it must only touch the *returned* view,
+// never the receiver it was called on - otherwise calling
+// Buffer.from(existingUint8Array).subarray() would reach back and turn
+// the caller's own, unrelated Uint8Array into something
+// Buffer.isBuffer() reports true for.
+func TestBufferSubarrayDoesNotMutateReceiver(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Buffer } from "node:buffer";
+		const u = new Uint8Array([1, 2, 3]);
+		const b = Buffer.from(u);
+		b.subarray();
+		JSON.stringify({ uIsU8: u instanceof Uint8Array, uIsBuffer: Buffer.isBuffer(u) })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"uIsU8":true,"uIsBuffer":false}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
 // TestBufferSubarrayStaysBuffer checks that slicing a Buffer via the
 // inherited %TypedArray%.prototype machinery (subarray/slice) still
 // produces something Buffer.isBuffer recognizes and that shares the
