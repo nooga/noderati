@@ -8792,3 +8792,138 @@ affects plain-function listeners, exactly as intended.
 `internal/host` suite green except the same pre-existing, unrelated
 `TestEventsAddAbortListener` (confirmed via `git stash` to fail
 identically with none of this round's changes applied).
+
+## Round 77: the Round 76 hang, actually diagnosed - Socket never implements paused-mode Readable, so real undici's parser is never fed a single byte
+
+Picked up the one item Round 76 left open: the process hang found
+during the full real-undici `fetch()` E2E attempt (VM's interpreter
+goroutine parked in `DefaultAsyncRuntime.WaitForExternalOp`, diagnosed
+last round via a `pprof` goroutine dump against a real, idle keep-alive
+`net.Conn` read). Root-caused this round, confirmed with a minimal,
+undici-free repro, and fixed the one real bug found along the way
+(though - see below - it turned out not to be the cause of this
+specific hang).
+
+**The trap that ate most of this round: `declareUndici()` is a fake
+shim, and forgetting to disable it means testing nothing.**
+`internal/host/undici.go` registers a ~20-line JS shim under the
+module name `"undici"` - a fake `EnvHttpProxyAgent`, a no-op
+`setGlobalDispatcher`, and an `install()` that does nothing but
+reassign `globalThis.fetch` to itself. Because noderati's own
+module resolver checks registered shims before `node_modules`, `import
+* as undici from "undici"` resolves to this fake, *even with the real
+npm package sitting right there in `node_modules`*, unless
+`declareUndici()`'s call in `host.go` is temporarily commented out
+first. Round 75's own log mentions doing this in passing; nothing
+spelled out what happens if you forget. This round forgot, for a good
+hour: every repro of the Round 76 hang "succeeded" - small bodies,
+1.3MB streamed bodies, chunked encoding, three requests reusing a
+pooled connection, even a real HTTPS request to `https://example.com`
+- all cleanly, because every one of them was exercising noderati's own
+native Go-backed `fetch()` (the real `http`/`https` module from Round
+68), not real undici, not `WebAssembly`, not `lazyllhttp()` at all. A
+live `pprof` goroutine dump during one of these "successes" showed
+`net/http.(*persistConn).readLoop` - Go's own standard-library HTTP
+client - which is what actually caught the mistake: that stack has
+nothing to do with anything this whole investigation built. Disabling
+`declareUndici()` (matching Round 75's own method) immediately
+reproduced the exact Round 76 hang, goroutine-for-goroutine (same
+`WaitForExternalOp`, same blocked `socketState.readerLoop`, same
+never-returning `wg.Wait()`), confirming it's real and current.
+
+**Root cause, confirmed by a 20-line undici-free repro**: real undici's
+HTTP/1.1 client (`client-h1.js`) drives its parser *exclusively*
+through Node's paused-mode `Readable` protocol - `socket.on('readable',
+onHttpSocketReadable)` at module setup, then `onHttpSocketReadable`
+calling `this[kParser].readMore()`, which calls `this.socket.read()` in
+a loop and feeds whatever comes back into `llhttp_execute`. It never
+listens for `'data'` at all (confirmed by reading the file directly -
+the only `'data'` listener in `client-h1.js` is on request bodies, not
+the socket). noderati's `net.Socket` (`net.go`) implements only
+push-mode streaming: `readerLoop` reads bytes off the real OS socket
+and unconditionally emits `'data'`; there is no `.read()` method at
+all and `'readable'` is never emitted. Confirmed directly with a
+minimal script (`net.connect()`, listen for both `'readable'` and
+`'data'`, log `typeof socket.read`): `typeof socket.read === "undefined"`,
+`'readable'` never fires, and `'data'` fires once with the full
+151-byte response - proving the bytes really do arrive over the wire
+and really are drained off the OS socket by our own `readerLoop`, they
+just have zero subscribers once emitted, because real undici was never
+listening for that event in the first place.
+
+**Full causal chain, now completely explained** (correcting Round 76's
+own characterization, which described this as "something never told
+the async runtime the response was complete" - too generous; the
+response was never *parsed* at all, because it was never *delivered*
+to anything that could parse it): bytes arrive -> `readerLoop` drains
+them off the real OS socket -> emits `'data'` to zero listeners (real
+undici only ever attached a `'readable'` listener) -> `readMore()`/
+`execute()` is never called -> `llhttp_execute` never runs -> the
+in-flight request's promise never resolves -> `readerLoop` blocks on
+its next `conn.Read()` (nothing more coming - the server is correctly
+idling on a keep-alive connection) -> `writerLoop` is idle too (its one
+write already flushed) -> the `wg.Wait()` goroutine that would call
+`EndExternalOp()` never returns -> `DrainUntilIdle`'s
+`WaitForExternalOp()` waits forever, exactly matching both this
+round's and Round 76's goroutine dumps down to the line number.
+
+**Also ruled out along the way, worth stating since the capstone test
+from Round 76 only covers one of two cases**: real undici's own
+`lazyllhttp()` tries `llhttp_simd-wasm.js` (a SIMD-optimized variant)
+*first*, falling back to the plain `llhttp-wasm.js` only if compiling
+the SIMD variant throws. `TestWebAssemblyRealLLHTTPParsesRealHTTPResponse`
+only exercises the plain variant. Checked the SIMD variant directly,
+same methodology as that test (a standalone script bypassing
+`Client`/socket layer entirely): it compiles and instantiates cleanly
+under wazero and produces the identical, correct callback sequence.
+The WASM bridge is sound for both variants real undici might load -
+this hang has nothing to do with WebAssembly, confirming Round 76's
+own suspicion.
+
+**Fixed one real bug found while chasing an initially-wrong hypothesis,
+kept it, but only with a test**: before finding the actual root cause
+above, `Socket.ref()`/`.unref()` (`net.go`) were noticed to be pure
+no-op stubs - a real, separate, genuine gap, since real undici's
+`resumeH1` (`client-h1.js`) calls `socket.unref()` the instant a
+keep-alive connection has no in-flight request, exactly mirroring real
+Node's own mechanism for not letting a pooled idle connection keep the
+process alive by itself. Implemented it for real: `socketState` now
+tracks whether its one `BeginExternalOp()` registration (made at
+connect time) is currently "active," and `unref()`/`ref()` toggle it
+via a new `setExternalOpActive`, calling the matching `EndExternalOp()`/
+`BeginExternalOp()` exactly once per real transition - the connection's
+own eventual teardown (`wg.Wait()` finishing) releases whichever
+registration is still outstanding, a no-op if `unref()` already did.
+This was written and initially believed to *be* the fix for the Round
+76 hang; a direct causal ablation (temporarily reverting just this
+change and re-running the exact hang repro) proved it made no
+difference either way - the real cause is the missing-Readable-protocol
+bug above, which stops the request from ever completing long before
+`resumeH1`/`unref()` would even run. Kept the fix anyway (it's real and
+correct on its own terms) but only after adding a direct test for it
+rather than shipping it on the strength of a hypothesis that turned out
+to be wrong: `TestNetSocketUnrefLetsProcessDrainWithConnectionStillOpen`
+opens a real connection to a server that never closes it, calls
+`socket.unref()`, then asserts `VM.DrainUntilIdle()` returns within 5s
+anyway - confirmed to genuinely catch a regression (reverting just the
+ref/unref change makes this exact test hang until Go's own test timeout,
+producing the identical blocked-`readerLoop` goroutine dump).
+
+**Not fixed this round, deliberately**: implementing real paused-mode
+`Readable` semantics on `Socket` (an internal buffer, a real
+`.read([size])`, correct `'readable'` emission timing, and the
+mode-exclusivity rule a real `Readable` enforces - a stream cannot be
+in both paused and flowing mode at once, and `net.go`'s `readerLoop`
+currently just always pushes `'data'` unconditionally) is a real
+feature of its own, not a quick fix, and is exactly the next round's
+clean, fully-specified starting point. This round's job was diagnosis;
+diagnosis is now complete and confirmed by a minimal repro, with a
+precise, small, well-understood target for the fix.
+
+**Verification**: `go build ./...` clean, `gofmt` clean, full
+`internal/host` suite green (including the new
+`TestNetSocketUnrefLetsProcessDrainWithConnectionStillOpen`) except the
+same pre-existing, unrelated `TestEventsAddAbortListener`.
+`declareUndici()` restored (was only ever disabled locally during this
+round's own probing, per standing procedure - see the trap described
+above for exactly why forgetting this is so easy to do silently).

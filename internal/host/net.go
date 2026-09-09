@@ -83,6 +83,68 @@ type socketState struct {
 
 	timeoutMu    sync.Mutex
 	timeoutTimer *time.Timer
+
+	// extRT/extOpActive back Socket.ref()/.unref(): doNetConnect/
+	// doTLSConnect each call rt.BeginExternalOp() exactly once up front
+	// (so the process waits for this connection by default, matching
+	// real Node) and arrange for exactly one matching rt.EndExternalOp()
+	// over the socket's whole lifetime, via endTrackedExternalOp() once
+	// the connection's own goroutines actually finish. unref()/ref() (see
+	// setExternalOpActive) can retire or restore that one registration
+	// early - real undici's client-h1.js calls socket.unref() the moment
+	// a keep-alive connection has no in-flight request (resumeH1) so a
+	// pooled idle connection doesn't itself keep the process alive,
+	// exactly like real Node's socket.unref() does. Before this existed,
+	// unref()/ref() were no-op stubs, so a still-open idle keep-alive
+	// socket (whose reader/writer loops block on a real, live conn.Read/
+	// write forever) kept DrainUntilIdle's WaitForExternalOp() waiting
+	// forever too - confirmed directly via a live pprof goroutine dump
+	// during a real-undici fetch() E2E probe (docs/real-node-plan.md,
+	// Round 76/77) before writing this fix.
+	extRT       runtime.AsyncRuntime
+	extOpActive bool
+}
+
+// beginTrackedExternalOp records that the caller (doNetConnect/
+// doTLSConnect) already called rt.BeginExternalOp() once for this
+// socket, and remembers rt so a later unref()/ref()/endTrackedExternalOp
+// can issue the one matching EndExternalOp() this socket owes - never
+// more, never less, regardless of how many times JS toggles ref()/
+// unref() in between. Must be called before the socket's JS object is
+// ever handed back to JS (so unref()/ref() can never race ahead of it).
+func (s *socketState) beginTrackedExternalOp(rt runtime.AsyncRuntime) {
+	s.mu.Lock()
+	s.extRT = rt
+	s.extOpActive = true
+	s.mu.Unlock()
+}
+
+// setExternalOpActive is the shared logic behind Socket.unref()
+// (active=false) and Socket.ref() (active=true): only calls Begin/
+// EndExternalOp when the state actually changes, so calling either
+// repeatedly - or calling unref() before the connection even finished
+// dialing - is a harmless no-op past the first real transition, matching
+// real Node's own ref()/unref() idempotency.
+func (s *socketState) setExternalOpActive(active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.extRT == nil || s.extOpActive == active {
+		return
+	}
+	s.extOpActive = active
+	if active {
+		s.extRT.BeginExternalOp()
+	} else {
+		s.extRT.EndExternalOp()
+	}
+}
+
+// endTrackedExternalOp is called exactly once, when the connection's own
+// writer+reader goroutines actually finish, to release whichever
+// external-op registration is still outstanding - a no-op if unref()
+// already released it earlier.
+func (s *socketState) endTrackedExternalOp() {
+	s.setExternalOpActive(false)
 }
 
 func newSocketState(hwm int) *socketState {
@@ -330,7 +392,9 @@ func (s *socketState) queueWrite(vmInst *vm.VM, obj *vm.PlainObject, data []byte
 	if s.destroyed {
 		s.mu.Unlock()
 		if cb.IsCallable() {
-			scheduleEmit0(vmInst, func() { _, _ = vmInst.Call(cb, vm.NewValueFromPlainObject(obj), []vm.Value{errorValueFromGo(vmInst, io.ErrClosedPipe)}) })
+			scheduleEmit0(vmInst, func() {
+				_, _ = vmInst.Call(cb, vm.NewValueFromPlainObject(obj), []vm.Value{errorValueFromGo(vmInst, io.ErrClosedPipe)})
+			})
 		}
 		return false
 	}
@@ -520,8 +584,28 @@ func buildSocketObject(vmInst *vm.VM, s *socketState) (*vm.PlainObject, vm.Value
 		return self, nil
 	}))
 
-	obj.SetOwn("ref", vm.NewNativeFunction(0, false, "ref", func(_ []vm.Value) (vm.Value, error) { return self, nil }))
-	obj.SetOwn("unref", vm.NewNativeFunction(0, false, "unref", func(_ []vm.Value) (vm.Value, error) { return self, nil }))
+	// ref()/unref(): real Node's mechanism for telling the process "don't
+	// wait on this handle alone" - real undici's client-h1.js calls
+	// socket.unref() the instant a keep-alive connection has no in-flight
+	// request (resumeH1) specifically so a pooled idle connection can't
+	// by itself keep the process running, and .ref() to undo that the
+	// moment a new request reuses it. setExternalOpActive is what makes
+	// that real rather than a no-op: it retires/restores the one
+	// BeginExternalOp() this socket registered at connect time, which is
+	// what DrainUntilIdle's WaitForExternalOp() actually waits on. Used
+	// to be a pair of pure no-ops, which is exactly why a real, live
+	// keep-alive socket left idle (reader/writer loops blocked on a real
+	// conn.Read/write forever) hung the whole process even after undici
+	// unref'd it - confirmed via a live pprof goroutine dump during a
+	// real-undici fetch() E2E probe (docs/real-node-plan.md, Round 76/77).
+	obj.SetOwn("ref", vm.NewNativeFunction(0, false, "ref", func(_ []vm.Value) (vm.Value, error) {
+		s.setExternalOpActive(true)
+		return self, nil
+	}))
+	obj.SetOwn("unref", vm.NewNativeFunction(0, false, "unref", func(_ []vm.Value) (vm.Value, error) {
+		s.setExternalOpActive(false)
+		return self, nil
+	}))
 	// cork/uncork: real Node batches writes between these into a single
 	// underlying write; our queue already coalesces at the OS-write
 	// granularity of one item per write()/end() call, and undici's h1
@@ -700,6 +784,7 @@ func doNetConnect(vmInst *vm.VM, optsVal vm.Value, connectCb vm.Value) vm.Value 
 
 	rt := vmInst.GetAsyncRuntime()
 	rt.BeginExternalOp()
+	s.beginTrackedExternalOp(rt)
 
 	var wg sync.WaitGroup
 	wg.Add(2) // writer slot + reader slot; reader's Done() fires even on dial failure (see below)
@@ -750,7 +835,7 @@ func doNetConnect(vmInst *vm.VM, optsVal vm.Value, connectCb vm.Value) vm.Value 
 
 	go func() {
 		wg.Wait()
-		rt.EndExternalOp()
+		s.endTrackedExternalOp()
 	}()
 
 	return self
