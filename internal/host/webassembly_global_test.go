@@ -440,7 +440,19 @@ func TestWebAssemblyRealLLHTTPParsesRealHTTPResponse(t *testing.T) {
 		const importObject = {
 			env: {
 				wasm_on_url: (p, at, len) => { log.push(["on_url", at, len]); return 0; },
-				wasm_on_status: (p, at, len) => { log.push(["on_status", at, len]); return 0; },
+				wasm_on_status: (p, at, len) => {
+					// Read memory *from inside this callback*, the same
+					// way real undici's own llhttp callbacks do (they
+					// slice llhttp.memory.buffer at the pointer they're
+					// handed). This is the seam that would have gone
+					// untested if every callback just logged offsets:
+					// it exercises the memory bridge while wasm is still
+					// mid-call, exactly the reentrant case the bridge's
+					// dirty-tracking has to get right.
+					const text = new TextDecoder().decode(new Uint8Array(llhttp.memory.buffer, at, len));
+					log.push(["on_status", at, len, text]);
+					return 0;
+				},
 				wasm_on_message_begin: (p) => { log.push(["on_message_begin"]); return 0; },
 				wasm_on_header_field: (p, at, len) => { log.push(["on_header_field", at, len]); return 0; },
 				wasm_on_header_value: (p, at, len) => { log.push(["on_header_value", at, len]); return 0; },
@@ -448,7 +460,11 @@ func TestWebAssemblyRealLLHTTPParsesRealHTTPResponse(t *testing.T) {
 					log.push(["on_headers_complete", statusCode, upgrade, shouldKeepAlive]);
 					return 0;
 				},
-				wasm_on_body: (p, at, len) => { log.push(["on_body", at, len]); return 0; },
+				wasm_on_body: (p, at, len) => {
+					const text = new TextDecoder().decode(new Uint8Array(llhttp.memory.buffer, at, len));
+					log.push(["on_body", at, len, text]);
+					return 0;
+				},
 				wasm_on_message_complete: (p) => { log.push(["on_message_complete"]); return 0; },
 			}
 		};
@@ -473,13 +489,15 @@ func TestWebAssemblyRealLLHTTPParsesRealHTTPResponse(t *testing.T) {
 			ret,
 			eventNames: log.map(e => e[0]),
 			headersComplete: log.find(e => e[0] === "on_headers_complete"),
+			statusText: log.find(e => e[0] === "on_status")[3],
 			bodyLength: log.find(e => e[0] === "on_body")[2],
+			bodyText: log.find(e => e[0] === "on_body")[3],
 		})
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	want := `{"ret":0,"eventNames":["on_message_begin","on_status","on_header_field","on_header_value","on_header_field","on_header_value","on_headers_complete","on_body","on_message_complete"],"headersComplete":["on_headers_complete",200,0,1],"bodyLength":5}`
+	want := `{"ret":0,"eventNames":["on_message_begin","on_status","on_header_field","on_header_value","on_header_field","on_header_value","on_headers_complete","on_body","on_message_complete"],"headersComplete":["on_headers_complete",200,0,1],"statusText":"OK","bodyLength":5,"bodyText":"hello"}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
