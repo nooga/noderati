@@ -78,6 +78,27 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 		return wrapBuffer(vmInst, string(make([]byte, n))), nil
 	})
 
+	// allocUnsafe(size): real Node's version skips zero-filling the
+	// returned memory for speed, on the understanding that the caller
+	// will overwrite every byte before reading any of it - the returned
+	// bytes are explicitly *unspecified* old memory, not a promised
+	// value. Aliasing it to the same zero-filled alloc() above is a
+	// legitimate implementation of that contract (zero is one valid
+	// choice among "unspecified"), not a shortcut around it - found
+	// missing while probing real undici (round 74,
+	// docs/real-node-plan.md): its own websocket/constants.js calls
+	// `Buffer.allocUnsafe(0)` at module load time.
+	allocUnsafeFn := vm.NewNativeFunction(1, false, "allocUnsafe", func(args []vm.Value) (vm.Value, error) {
+		n := 0
+		if len(args) > 0 && args[0].IsNumber() {
+			n = int(args[0].ToFloat())
+		}
+		if n < 0 {
+			n = 0
+		}
+		return wrapBuffer(vmInst, string(make([]byte, n))), nil
+	})
+
 	isBufferFn := vm.NewNativeFunction(1, false, "isBuffer", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
 			return vm.False, nil
@@ -132,6 +153,7 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 	if props := bufferFn.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
 		props.Properties.SetOwn("from", fromFn)
 		props.Properties.SetOwn("alloc", allocFn)
+		props.Properties.SetOwn("allocUnsafe", allocUnsafeFn)
 		props.Properties.SetOwn("isBuffer", isBufferFn)
 		props.Properties.SetOwn("byteLength", byteLengthFn)
 	}

@@ -42,6 +42,26 @@ var nativeRequireNames = map[string]bool{
 	"diagnostics_channel": true,
 	"v8":                  true,
 	"vm":                  true,
+	"net":                 true,
+	"tls":                 true,
+	// http/https (declareHTTP, round 68) missed this same list when they
+	// were added - the exact mistake this comment already warns about,
+	// caught here only because round 69's real-undici probe actually
+	// exercises require("node:http") via undici's own CJS internals
+	// (import()-based ESM loading never would have hit requireNative at
+	// all, so the gap was invisible until something require()'d these).
+	"http":  true,
+	"https": true,
+	// async_hooks (declareAsyncHooks, round 72) added directly here too,
+	// this time on purpose rather than found the hard way - the same
+	// require() gap net/tls/http/https hit is exactly what this comment
+	// warns about.
+	"async_hooks": true,
+	"console":     true,
+	"timers":      true,
+	"dns":         true,
+	"zlib":        true,
+	"util/types":  true,
 }
 
 type cjsLoader struct {

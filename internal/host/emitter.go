@@ -172,7 +172,7 @@ func addListener(vmInst *vm.VM, obj *vm.PlainObject, event string, listener vm.V
 	if once {
 		fn = vm.NewNativeFunction(0, true, "onceWrapper", func(args []vm.Value) (vm.Value, error) {
 			removeListener(obj, event, fn)
-			_, err := vmInst.Call(listener, vm.Undefined, args)
+			_, err := vmInst.Call(listener, vm.NewValueFromPlainObject(obj), args)
 			return vm.Undefined, err
 		})
 	}
@@ -310,9 +310,18 @@ func emitOnObject(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.V
 	for i := 0; i < arr.Length(); i++ {
 		listeners[i] = arr.Get(i)
 	}
+	// Real Node's EventEmitter invokes every listener with the emitter
+	// itself as `this` - real undici's own connector relies on exactly
+	// this (lib/core/connect.js's `.once('connect', function () { ...
+	// cb(null, this) })`, read directly before writing net.go/tls.go).
+	// Passing vm.Undefined here (the previous behavior) silently handed
+	// undici back `undefined` as its own socket, breaking every
+	// downstream dispatch - a real, encountered bug, not a hypothetical
+	// one (see docs/real-node-plan.md's round 69 entry).
+	self := vm.NewValueFromPlainObject(obj)
 	for _, fn := range listeners {
 		if fn.IsCallable() {
-			_, _ = vmInst.Call(fn, vm.Undefined, args)
+			_, _ = vmInst.Call(fn, self, args)
 		}
 	}
 	return true

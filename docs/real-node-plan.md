@@ -7503,3 +7503,705 @@ different, harder thing than an HTTP round-trip): build real
 against real `httptest` TCP/TLS servers, then delete `undici.go` and
 its `installModules` registration and let real npm `undici` load and
 run - mirroring exactly how every other fake here got retired.
+
+## Round 70: real `node:net`/`node:tls` built and verified; real undici probed end-to-end and found genuinely blocked, precisely - not deleted
+
+Picked up round 69's spun-off task. Asked advisor before writing any Go,
+per its own steer to probe real undici's hard blocking constraints
+*first* rather than assume net/tls alone would unblock it - that probe
+turned out to be the actual deciding factor for this round's scope.
+
+**Built** [`net.go`](../internal/host/net.go)/[`tls.go`](../internal/host/tls.go):
+real `net.connect`/`net.createConnection`/`net.Socket` on Go's own
+`net.Dial`, and real `tls.connect`/`tls.Socket` on `crypto/tls.Client`,
+sharing one `socketState` core (writer/reader goroutines, backpressure,
+pause/resume) between both - a `*tls.Conn` satisfies `net.Conn` exactly
+like a `*net.TCPConn`, so the byte-pump plumbing underneath doesn't care
+which one it's holding. Backpressure is real: `write()` enqueues onto an
+unbounded Go-side queue (matching Node's own semantics - Node's `write()`
+doesn't block the event loop either), a dedicated goroutine drains it
+onto the actual conn, and `write()` returns `false` once queued bytes
+exceed `highWaterMark`, with `'drain'` firing for real once the queue
+empties - not on a timer. `pause()`/`resume()` gate the reader goroutine
+itself (not just event delivery), so a paused socket genuinely stops
+pulling bytes off the OS socket. TLS adds SNI (`ServerName`), ALPN
+negotiation (`ALPNProtocols`/`alpnProtocol`), and a shared
+`tls.ClientSessionCache` for real session resumption - deliberately
+*not* wired to a JS-visible `'session'` event (undici's own connector
+listens for one to populate its own cache); synthesizing a fake session
+object to satisfy that listener would be exactly the lying-no-op this
+project rejects elsewhere, so that event just stays unfired and Go's own
+resumption happens invisibly to JS instead. `net.createServer` stays
+deliberately unbuilt - round 69's own survey found nothing reachable
+needing one, and every test here uses Go as the server-side oracle
+anyway.
+
+**A real, encountered-not-hypothetical bug, found while writing this
+against undici's own `lib/core/connect.js` (read directly, not
+assumed):** [`emitter.go`](../internal/host/emitter.go)'s `emitOnObject`
+called every listener with `vm.Undefined` as `this`. Undici's connector
+does `.once('connect', function () { cb(null, this) })` and relies on
+`this` being the socket itself - with `undefined`, undici would hand
+back `undefined` as its own socket and every downstream dispatch would
+fail. Fixed for every `EventEmitter` in the codebase (the receiver should
+be the emitter universally, not just for sockets), including the
+`once()` wrapper which had the same bug independently; a new test
+(`TestNetConnectThisIsSocket`) guards it directly, and the full suite
+was re-run clean after - nothing in this codebase's existing tests
+depended on the old, wrong behavior.
+
+**Verification**: `net_test.go`/`tls_test.go` against real local Go
+TCP/TLS servers (a real `tls.Listen` with a freshly-generated self-signed
+cert, `rejectUnauthorized: false` on the client side, exactly like a real
+Node test against a self-signed endpoint) - byte-exact echo, a
+multi-write streaming test, a real cert-rejection test (default
+`rejectUnauthorized`, a genuine `crypto/tls` x509 verification failure,
+not skipped), a real connection-refused error test, and two tests that
+turn the stated backpressure/pause requirements into actual assertions:
+`TestNetSocketBackpressure` (4MB over a deliberately slow reader, `write()`
+must return `false` at least once *and* `'drain'` must actually fire
+afterward) and `TestNetSocketPauseResumeStopsReads` (an 8MB push from the
+server, `pause()` must keep the client from having pulled more than a
+small fraction of it before `resume()`). Full suite (including the
+pre-existing `TestNodeMissingResolver`/`TestMissingNodeBuiltinNamedError`,
+retargeted from `node:net` to `node:dgram` now that `node:net` is real)
+run 3x clean, plus once under `-race` given this file's concurrency -
+clean; `go vet` clean.
+
+**Then the actual, load-bearing part of this round: probing real,
+unmodified npm `undici` end-to-end before touching `undici.go` at all**,
+per advisor's explicit instruction not to assume net/tls alone would be
+enough. Built a throwaway CLI (`go build ./cmd/noderati`) and drove real
+undici (the exact copy already vendored under
+`@earendil-works/pi-coding-agent/node_modules/undici`) via the same call
+pattern pi's own `core/http-dispatcher.js` uses
+(`new undici.EnvHttpProxyAgent({allowH2:false,...})`,
+`setGlobalDispatcher`, `install()`, then a real `fetch()` against a local
+Go test server), with `declareUndici()` temporarily commented out so
+resolution could reach the real package - never committed in that state;
+restored immediately after each probe, full suite re-confirmed clean
+against the restored (shimmed) state afterward. This surfaced, in order,
+every real thing actually blocking real undici from loading at all -
+each fixed if it was noderati's own gap, filed if it was paserati's:
+
+1. **`require("node:net")`/`require("node:tls")` (and, found the same
+   way, `require("node:http")`/`require("node:https")` - missed when
+   round 68 added them) threw "Cannot find module"**, even though
+   `import`ing the same names worked fine - `cjs.go`'s own
+   `nativeRequireNames` list (a second, hand-maintained registry the
+   file's own doc comment already warns about) hadn't been updated. Real
+   undici is loaded via `require()` internally (`index.js` is plain
+   CJS), so this was a real, load-bearing gap, not a hypothetical one.
+   Fixed: all four names added to `nativeRequireNames`.
+2. **`node:events`'s CJS `require()` result was a wrapper object
+   (`{ EventEmitter }`), not the class itself**, because the shim's
+   `export default` was `{ EventEmitter }` and `cjs.go`'s
+   `requireNative` hands the default export straight back as the
+   `require()` result. Real Node's `require("events")` returns the
+   `EventEmitter` class directly. Undici's `dispatcher.js` does
+   `const EventEmitter = require('node:events'); class Dispatcher extends
+   EventEmitter` - extending a non-constructor object throws "Class
+   extends value object is not a constructor or null". Fixed
+   ([`events.go`](../internal/host/events.go)): default export is now
+   `EventEmitter` itself, with `EventEmitter.EventEmitter = EventEmitter`
+   (a self-reference real Node also has), matching real Node exactly;
+   nothing else in this codebase depended on the old shape (checked).
+3. **`util.debuglog` was missing entirely** - undici's
+   `lib/core/diagnostics.js` calls it unconditionally at module load.
+   Added ([`util.go`](../internal/host/util.go)) as a genuinely-gated
+   no-op: it actually checks `NODE_DEBUG` (case-insensitively) and only
+   prints when the section name matches, matching real Node's behavior
+   rather than accepting-and-ignoring the argument.
+4. **A real paserati parser bug, isolated to a minimal, clean repro and
+   filed as [paserati#292](https://github.com/nooga/paserati/issues/292):**
+   ASI fails after a class field with a *computed* key
+   (`[k1] = (x) => {...}`, no trailing semicolon) when the *next* class
+   member also has a computed key - confirmed the same shape with a
+   non-computed key parses fine, and an explicit semicolon fixes it
+   immediately. This is what actually blocks `require("undici")` from
+   completing *at all* right now (`lib/dispatcher/pool-base.js`, a
+   non-optional dependency of `pool.js` reached from `index.js`'s own
+   top-level requires, hits exactly this shape). Bisection: truncating
+   `pool-base.js` member-by-member (with its requires stubbed) narrowed
+   the failure to the `[kOnConnectionError] = (...) => {...}` field
+   immediately followed by `get [kBusy] () {...}`; reducing further to a
+   14-line standalone snippet confirmed it has nothing to do with
+   getters specifically (a plain computed method reproduces it too) and
+   nothing to do with undici's own code. Not fixed here (paserati is a
+   separate, actively-developed checkout per this project's standing
+   rule) - only worked around in a scratch copy, never in the real
+   installed package, to keep probing further.
+5. **`AggregateError` is missing entirely** (`typeof AggregateError ===
+   "undefined"`) - confirmed `FinalizationRegistry`/`WeakRef`/
+   `queueMicrotask` are all present, only this one global is gone. Real
+   undici's connector (`lib/core/connect.js`) checks
+   `err instanceof AggregateError` to normalize `net.connect`'s
+   `autoSelectFamily` errors. Filed as
+   [paserati#293](https://github.com/nooga/paserati/issues/293) rather
+   than patched, same reason as above.
+6. **`node:async_hooks` is missing entirely** (a whole different
+   subsystem - `AsyncLocalStorage` and friends - not something in scope
+   to build for this task) - reached once the ASI bug above was
+   worked around in a scratch copy, confirming there's at least one more
+   real, load-bearing gap beyond it. Not investigated further; noted
+   here rather than left undiscovered for whoever picks this back up.
+7. **Still not reached**: real undici's own llhttp HTTP/1.1 parser is
+   compiled to WebAssembly (`lib/llhttp/llhttp-wasm.js`, instantiated
+   lazily in `client-h1.js`'s `lazyllhttp()` - confirmed by reading the
+   file directly, `/* global WebAssembly */` and a literal
+   `new WebAssembly.Module(...)` call). `typeof WebAssembly ===
+   "undefined"` in paserati today, already recorded in round 67's survey
+   as "a genuine engine-scale project" - this round adds a second,
+   concrete real-world consumer (real undici's own parser, not just
+   image-resizing) to that same already-known gap, rather than
+   discovering a new one.
+
+**Status, stated precisely rather than left to read as
+"almost done": real undici (unmodified, as vendored in pi's own
+`node_modules`) does not load at all today** - blocked first by
+paserati#292 (item 4), with `AggregateError` (item 5), `node:async_hooks`
+(item 6), and `WebAssembly` (item 7) each waiting behind it, confirmed in
+that order by direct probing, not assumed. **`undici.go`'s shim was
+therefore *not* deleted and `declareUndici()` was *not* removed from
+`installModules`** - doing either now would be a straight regression
+(pi's `http-dispatcher.js` calls `undici.install()` unconditionally at
+startup), not a de-shim; the task's own definition of done for this push
+is explicitly conditioned on real undici actually completing a fetch
+end-to-end, which it demonstrably cannot yet. Stated plainly rather than
+left to read as a smaller claim: **`net.go`/`tls.go` have no consumer in
+this codebase today** - round 68's own note that building sockets first
+would be "foundational work with no consumer" is now literally the
+state, since the one real consumer this work targeted (undici) can't
+load at all yet. They're real, complete (for the http/1.1-only,
+no-Unix-socket, no-server surface this task scoped in) and verified
+directly against real local Go TCP/TLS servers on their own merits - but
+until paserati#292 (and the gaps behind it) close, they're real code
+sitting unused, not yet load-bearing for anything pi actually runs. The
+four fixes above (nativeRequireNames, events.go, util.go's `debuglog`)
+are the exception - real, standalone improvements independent of whether
+undici ever gets de-shimmed, and stay regardless. Re-ran the full,
+real, credentialed smoke test after every change in this round: `pi
+--version`/`--help` and both `pi --provider fireworks --model
+accounts/fireworks/models/glm-5p2 --no-session -p "..."` (a plain reply)
+and the same with a real tool call (`ls`, real tool-call IDs, correct
+final answer) all still succeed, unregressed by the `net`/`tls`
+additions, the `emitOnObject` `this` fix, or any of the four probe-driven
+fixes above.
+
+## Round 71: paserati#292 fixed upstream; #293 was a stale pin, not a real bug - corrected and closed
+
+[paserati#294](https://github.com/nooga/paserati/pull/294) landed
+upstream same-day, fixing #292 for real (`parseInfixContinuation` now
+correctly refuses to treat `[`/`.`/`(`/tagged-templates as continuing an
+unparenthesized `ArrowFunctionLiteral`, plus a second, previously-masked
+bug in `parseComputedProperty` it uncovered along the way) and
+investigating #293. The PR's own finding on #293, read directly rather
+than assumed: **not reproducible on current `main`** -
+`AggregateError` had already been fully implemented before this task
+even started probing, and round 70's `typeof AggregateError ===
+"undefined"` result was against a stale pin of the sibling `paserati`
+checkout, not a real engine gap. (The PR author's own investigation
+found a real, adjacent bug instead - `vm.IterableToArray` panicking on
+any non-plain-object iterable, e.g. `new AggregateError(someGenerator)`
+or `Promise.all(someGenerator)` - and fixed that plus two masked
+`Promise.all`/`allSettled`/`any`/`race` spec gaps in the same PR.)
+
+Pulled `../paserati` to `origin/main` (`0ec3c9a0`, fast-forward, no
+divergence to reconcile) and rebuilt noderati against it. Verified both
+fixes directly rather than trusting the PR's own description alone:
+`typeof AggregateError` is now `"function"` with real
+`.errors`/`instanceof Error` behavior, and round 70's own minimal
+14-line ASI repro (`[k1] = (x) => {...}` immediately followed by another
+computed-key member, no semicolon) now parses cleanly. Full noderati
+suite re-run 3x plus once under `-race` against the updated engine -
+still clean; `go vet` clean; the real, credentialed `pi --version`/
+`--help`/`-p` (plain reply and a real tool call) smoke tests still
+succeed, unregressed by the engine update.
+
+**Re-ran round 70's own undici probe against the truly unmodified real
+npm package** (re-copied fresh from `pi-coding-agent`'s `node_modules`,
+not the scratch copy with the semicolon workaround from before) with
+`declareUndici()` again temporarily disabled, restored immediately
+after: `require("undici")`'s chain now gets past both `pool-base.js`'s
+ASI shape and `AggregateError` cleanly, confirming both fixes for real
+rather than by reading the PR description. **The next real blocker is
+exactly where round 70 said it would be**: `require("node:async_hooks")`
+- genuinely missing from noderati, a whole different subsystem, still
+out of scope for this task. `node:async_hooks`, then `WebAssembly`
+(item 7 from round 70, still unreached) remain; `undici.go`'s shim stays
+exactly as-is for the same reason as before - real undici still can't
+complete a load, let alone a fetch.
+
+Commented on and closed
+[paserati#293](https://github.com/nooga/paserati/issues/293) with this
+confirmation, matching the maintainer's own diagnosis rather than
+leaving a stale-pin false-positive open against the real project.
+
+## Round 72: node:async_hooks, util.types/promisify, node:console, node:timers, node:dns built - real undici's require chain now reaches node:zlib
+
+User picked up round 71's own next-blocker item directly ("let's do the
+async hooks then"). Grepped every real async_hooks call site in the
+vendored undici before writing anything, per this round's own recurring
+discipline: `class X extends AsyncResource { constructor() { super('Y') }
+}` then `this.runInAsyncScope(fn, thisArg, ...args)`, in exactly five
+files (api-request/pipeline/upgrade/connect/stream.js) - nothing else.
+
+**Built** [`async_hooks.go`](../internal/host/async_hooks.go): a real
+`AsyncResource` (pure JS shim, no Go natives needed - `runInAsyncScope`
+genuinely is `fn.apply(thisArg, args)` for a host with no async_hooks
+instrumentation behind it, not a stand-in for missing behavior).
+**Deliberately did not export `AsyncLocalStorage`**: its one real
+consumer in this whole dependency tree, `@aws/lambda-invoke-store`'s
+`InvokeStoreMulti.create()` (used by `@aws-sdk/core` on Bedrock's
+request-middleware path), is only reached when
+`AWS_LAMBDA_MAX_CONCURRENCY` is set or a caller forces multi-instance
+mode - checked directly in the real source, neither is ever true for pi
+running as a CLI tool, which always takes the sibling
+`InvokeStoreSingle` path instead. A real `AsyncLocalStorage.run(store,
+fn)` needs `store` to survive across an `await` inside `fn` - Node does
+this by hooking every promise continuation at the engine level; a naive
+JS-level stack that pops in a `finally` block pops the instant `fn`'s
+pending promise is returned, not when `fn` actually finishes, so
+`getStore()` would silently return the wrong thing after the first
+`await` - exactly the shape `InvokeStoreMulti.run()` is actually called
+with. Shipping that behind the real name would be a lying no-op wearing
+the right API shape, and since nothing reachable needs it, there's
+nothing to build. (Advisor flagged this distinction explicitly before
+any code was written - the naive stack version was the wrong direction
+this round almost took.)
+
+**Then re-ran round 71's undici probe and kept fixing whatever it hit
+next**, the same real-package, `declareUndici()`-disabled-then-restored
+methodology as every round since 69:
+
+- **`util.types`/`util.promisify` missing** - `lib/mock/mock-utils.js`
+  does `const { types: { isPromise } } = require('node:util')`, a
+  *nested* destructure that throws "Cannot destructure 'undefined'" the
+  instant `types` itself is absent (not just a silently-undefined
+  `isPromise`). Fixed in [`util.go`](../internal/host/util.go)'s new
+  `installUtilNatives`: `types.isPromise`/`isProxy`/`isArrayBuffer`/
+  `isSharedArrayBuffer`/`isAnyArrayBuffer`/`isDataView`/`isTypedArray`/
+  `isArrayBufferView` - only the confirmed-reachable subset (grepped
+  across undici and pi-coding-agent's own dist, not Node's full ~30-name
+  list), each mapping onto one of paserati's own dedicated `ValueType`
+  tags (`TypePromise`/`TypeProxy`/`TypeArrayBuffer`/.../`TypeDataView`) -
+  real, exact engine-level checks, not a heuristic
+  `Object.prototype.toString` guess. `promisify` is a real
+  implementation too (built on `vmInst.NewPromiseFromExecutor`, the same
+  primitive backing real `new Promise()`), not a stub - cheap to get
+  right and a genuinely useful, common API, even though its only real
+  call site here (`mock-client.js`'s `close()`) is mock-only and never
+  reached by an actual fetch.
+- **`node:console`'s `Console` class missing** -
+  `lib/mock/pending-interceptors-formatter.js` does `new Console({
+  stdout: someTransform, ... })` to pretty-print `MockAgent`'s pending-
+  interceptor list (a debugging convenience, never reached by a real
+  fetch). paserati already has a real global `console` singleton
+  (confirmed directly - `pkg/builtins/console_init.go`), just no
+  constructible class alongside it. Built as a pure JS shim
+  ([`console.go`](../internal/host/console.go)): formats and writes to
+  whichever stream it's given, falling back to the real global console
+  when none was - genuine behavior, just a small surface, since nothing
+  reachable calls its methods yet.
+- **`node:timers` missing** - `lib/mock/snapshot-recorder.js` does
+  `const { setTimeout, clearTimeout } = require('node:timers')`.
+  Re-exports the same globals every other real timer call in this
+  codebase already uses ([`timers.go`](../internal/host/timers.go));
+  does *not* export `setInterval`/`setImmediate` under Node's real
+  names, because paserati has neither as a global at all (checked
+  directly - a separate, pre-existing, unrelated gap, not something to
+  paper over here).
+- **`node:dns` missing** - `lib/interceptor/dns.js` (required
+  unconditionally at `index.js`'s own top level, as one of undici's
+  built-in interceptors) does `const { lookup } = require('node:dns')`,
+  called as `lookup(hostname, { all: true, family, order: 'ipv4first'
+  }, (err, addresses) => {...})`. Built for real
+  ([`dns.go`](../internal/host/dns.go)) on Go's own
+  `net.DefaultResolver.LookupIPAddr` - genuine DNS resolution, not a
+  synthetic answer, dispatched off the VM thread via the same
+  `BeginExternalOp`/`ScheduleNextTick` pattern every other async host
+  call in this codebase uses. Real Node's stdlib made this exactly as
+  cheap to build correctly as it would have been to fake, so it's real.
+
+**Verification**: nine new Go tests
+(`async_hooks_test.go`/`console_test.go`/`util_test.go`/`dns_test.go`)
+drive the exact real call shapes found above - `AsyncResource`
+subclassed with `runInAsyncScope` forwarding args/`this`/thrown errors,
+a `Console` bound to a fake stream actually receiving written output,
+`util.types` predicates against real typed arrays/`ArrayBuffer`/
+`DataView`/`Promise` values, `util.promisify` both resolving and
+rejecting a real Node-style callback function, and `dns.lookup` in both
+its `all:true` and single-result shapes plus a real resolution-failure
+path (an `.invalid`-TLD hostname, RFC 2606-reserved to never resolve).
+Full suite re-run 3x plus once under `-race`, `go vet` clean; the real,
+credentialed `pi --version`/`--help`/`-p` (plain reply and a real tool
+call) smoke tests still succeed, unregressed by any of the five new
+modules.
+
+**Status**: real undici's `require()` chain now clears async_hooks,
+util's nested-destructure gap, console, timers, and dns cleanly -
+confirmed by re-running the same real-package probe after each fix, not
+assumed from the fix alone. The next (and, as of this round, current)
+blocker is **`node:zlib`**: `lib/interceptor/decompress.js` (also
+required unconditionally at `index.js`'s top level) does
+`const { createInflate, createGunzip, createBrotliDecompress,
+createZstdDecompress } = require('node:zlib')`. This is a materially
+bigger ask than anything this round built - `createInflate`/
+`createGunzip` map cleanly onto Go's own `compress/flate`/`compress/gzip`,
+but `createBrotliDecompress`/`createZstdDecompress` have no Go stdlib
+equivalent at all and would need a third-party pure-Go dependency (e.g.
+`github.com/andybalholm/brotli`) added to `go.mod` - a real scope/
+dependency decision, not a same-shape "grep the call site, build the
+Go native" round like this one, so it's flagged here rather than
+started without checking in first. `undici.go`'s shim stays exactly as
+before - real undici still can't complete a `require()`, let alone a
+fetch.
+
+## Round 73: zlib (gzip/inflate real, brotli/zstd honestly refused), util/types, File, MessagePort, Event/EventTarget/CustomEvent, stream.Transform built - two real paserati bugs found and filed; require chain now blocked on one of them
+
+User's call on round 72's zlib question: "gzip/inflate for real, throw for
+brotli/zstd for now." Built exactly that, then kept re-running the same
+real-undici probe from round 72 and fixing whatever it hit next, the
+same grep-first methodology as every round since 69 - six more real
+gaps closed this round, two genuine paserati bugs found and filed
+(rather than worked around silently), and the require chain now
+reaches a blocker this project can't fix itself.
+
+**[`zlib.go`](../internal/host/zlib.go)**: `createGunzip`/`createInflate`/
+`createInflateRaw` are real, incremental decompression Transform
+streams on Go's own `compress/gzip`/`compress/zlib`/`compress/flate` -
+write()/end() feed an `io.Pipe` via the same buffered-channel-plus-
+feeder-goroutine discipline `http.go`'s request bodies already use, a
+second goroutine reads decompressed bytes back out and emits real
+`'data'`/`'end'`/`'error'` events incrementally, never buffering a whole
+response first. `createBrotliDecompress`/`createZstdDecompress` throw a
+clear, real error naming exactly why (no Go stdlib decoder, and faking
+decompression would silently corrupt a real response body) rather than
+existing as a lying no-op. `createGzip`/`createDeflate`/`createDeflateRaw`
+(the compression direction) aren't built at all - grepped every real
+call site across undici and pi-coding-agent's own dist and found none,
+so nothing was built against a guess.
+
+**A real, race-detector-caught bug, found writing zlib.go's own tests,
+not hypothetical:** `errorValueFromGo` (which calls `vmInst.Construct`
+on the `Error` constructor, mutating shared VM fields like
+`currentThis`/`inConstructorCall`) was being called *eagerly* on a
+background goroutine in several places - `scheduleEmit(vmInst, obj,
+"error", errorValueFromGo(vmInst, err))` evaluates `errorValueFromGo`
+before `scheduleEmit` ever runs, on whichever goroutine made the call,
+not deferred onto the VM's own tick the way it looks. `go test -race`
+caught it in `zlib_test.go`'s corrupt-data test; auditing every
+`errorValueFromGo` call site in the codebase found the same bug already
+present in `net.go`'s `writerLoop`/`readerLoop` (present since round 70,
+just never triggered by `-race` before now) - not something new this
+round's own code introduced in isolation. Fixed by adding
+`scheduleErrorEmit` (net.go) - constructs the Error value only inside
+the `ScheduleNextTick` closure that actually runs on the VM thread - and
+using it at every affected site. `go test -race` clean across 3 runs
+after the fix, where it wasn't reliably clean before.
+
+**`util.go`/[`util_types.go`](../internal/host/util_types.go)**: real
+undici's `lib/mock/mock-utils.js` does
+`const { types: { isPromise } } = require('node:util')` (fixed in round
+72), but `lib/web/websocket/websocket.js` and `lib/web/fetch/util.js`/
+`body.js` separately do `require('node:util/types')` as its *own*
+distinct module, not `util`'s `.types` property - added `isUint8Array`
+(checked via paserati's own `TypedArrayObject.GetElementType() ==
+TypedArrayUint8`, not just "is a typed array") alongside the existing
+predicates, and a real `util/types` module reusing the exact same
+predicate functions (exposed via `globalThis.__noderatiUtilTypes`)
+rather than a second copy of the same logic.
+
+**[`file_global.go`](../internal/host/file_global.go)**: real undici's
+`lib/web/webidl/index.js` does `webidl.is.File =
+webidl.util.MakeTypeAssertion(File)` at its own module top level - a
+missing `File` throws immediately at require() time, unconditionally.
+paserati already has real `Blob`/`FormData`/`Headers`/`Request`/
+`Response`/`fetch` globals, just no `File` alongside them - and a real
+File genuinely just is a Blob with `name`/`lastModified` added (the
+WHATWG spec defines it exactly that way), so this builds a real Blob
+subclass: `vmInst.Construct(blobCtor, ...)` builds a genuine Blob
+instance, then re-parents it onto File's own prototype (itself pointing
+at Blob's real prototype) - `.slice()`/`.arrayBuffer()`/`.text()`/
+`.stream()` all come from the real Blob implementation for free, not a
+second copy.
+
+**A second real, filed paserati bug, found building `file_global.go`,
+not assumed:** the first version installed `File` by running a small
+JS snippet (`globalThis.File = class File extends globalThis.Blob {
+...}`) through `p.RunCode`/`p.EvalCode` from inside `New()`, before the
+real user script ever runs. Bisected a previously-passing test
+(`runInAsyncScope` propagating a thrown `Error`) that started silently
+failing only once this ran - down to *any* prior `RunCode`/`EvalCode`
+call on the same `*driver.Paserati` instance, reproduced even with a
+prior script as trivial as `1+1`, regardless of `RunCode` vs `EvalCode`
+vs `Script`-mode vs module-mode. Filed as
+[paserati#298](https://github.com/nooga/paserati/issues/298) with a
+minimal Go-level repro rather than silently worked around. The actual
+fix: build `File` as a real native Go constructor (`vm.NewConstructorWithProps`
++ direct `vm.Value` manipulation) instead of evaluating JS source at
+all - the same discipline every other global this codebase installs at
+construction time (`Buffer`, `util.types`/`promisify`, ...) already
+followed, for reasons that are now very concretely justified rather
+than just stylistic.
+
+**[`message_port_global.go`](../internal/host/message_port_global.go)**:
+same shape as `File` - `webidl.is.MessagePort =
+webidl.util.MakeTypeAssertion(MessagePort)`, confirmed every other real
+`MessagePort` reference is confined to `lib/web/websocket/events.js`'s
+own WebIDL converter setup (WebSocket-specific, never touched by a
+plain `fetch()`), so a minimal but real `EventEmitter`-shaped
+constructible class (`postMessage`/`start` honest no-ops - there's no
+paired port for a message to actually flow to; `close()` is real, it
+actually emits `'close'`) is the correctly-scoped build here, not a
+placeholder and not a full `MessageChannel`.
+
+**[`event_global.go`](../internal/host/event_global.go)**: real undici's
+`lib/web/websocket/events.js` does `class MessageEvent extends Event` /
+`class CloseEvent extends Event` at module top level - confirmed every
+real `Event`/`EventTarget` construction/subclass site across the
+vendored package is confined to WebSocket/EventSource support, same
+never-reached-by-plain-fetch shape as `File`/`MessagePort`. Built real,
+spec-shaped `Event` (bubbles/cancelable/composed/defaultPrevented/
+target/currentTarget/timeStamp state, real `preventDefault`/
+`stopPropagation`/`stopImmediatePropagation`/`composedPath`),
+`CustomEvent` (adds `.detail`), and `EventTarget` -
+`addEventListener`/`removeEventListener`/`dispatchEvent` built directly
+on `emitter.go`'s own real `newEventEmitterObject`/`addListener`/
+`removeListener`/`emitOnObject`, not a second implementation of the same
+listener bookkeeping. All three are native Go constructors with a real
+`.prototype` object (needed for `class X extends Event` to resolve at
+all - found the hard way, the first version had no `"prototype"`
+property and threw "Class extends value does not have valid prototype
+property" the instant something tried to subclass it).
+
+**`stream.go`**: real undici's `lib/web/eventsource/eventsource-stream.js`
+does `class EventSourceStream extends Transform` - `node:stream`'s shim
+only exported `Readable`/`Writable`/`pipeline` before this, no
+`Transform` at all. Added a real Transform (a Writable+Readable joined
+by a per-chunk `_transform(chunk, encoding, callback)` step a subclass
+overrides to push output, plus `_flush`) as plain JS in the existing
+shim - safe to extend this way (unlike the Go-native globals above)
+since JS shims run inside the *same* single script execution as
+everything else, not a second top-level run, so paserati#298 doesn't
+apply here.
+
+**A third real, filed paserati bug - and the one currently blocking
+this chain:** past all of the above, `require()`-ing real undici's
+`lib/web/fetch/response.js` or `request.js` (or `lib/web/websocket/websocket.js`)
+throws `TypeError: Reflect.deleteProperty called on non-object` - both
+files do `Reflect.deleteProperty(Response, 'getResponseHeaders')` etc.
+at their own module top level, to remove internal helper functions they
+temporarily attach to their own exported classes for cross-module
+access. Bisected to a genuinely minimal repro with nothing undici-
+specific left in it: `Reflect.deleteProperty` throws on *any* function
+or class target (`function F(){}; F.x=1; Reflect.deleteProperty(F,
+'x')` throws the identical error), while the same call on a plain
+object works correctly - a real bug in `Reflect.deleteProperty`'s own
+target-type check, not anything about undici's specific classes. Filed
+as [paserati#297](https://github.com/nooga/paserati/issues/297).
+
+**Verification**: 6 new Go test files
+(`zlib_test.go`/`util_test.go`/`file_global_test.go`/
+`message_port_global_test.go`/`event_global_test.go`, plus additions to
+`stream_test.go`) drive the exact real call shapes found above - real
+gzip/zlib/raw-deflate decompression against Go's own stdlib compressor
+as the oracle (byte-exact, incremental multi-write, and a real corrupt-
+data error path), `util/types` predicates against real typed values,
+`File`/`MessagePort`/`Event`/`EventTarget`/`CustomEvent` each
+subclassed and exercised through their real methods (not just
+constructed), and a `Transform` subclass whose `_transform` override
+actually drives `write()`'s output plus `.pipe()`-forwarding to a
+downstream `Writable`. Full suite re-run 3x, `go vet` clean, and `-race`
+run 3x clean *after* the eager-`errorValueFromGo` fix (not clean
+before it, on the same code otherwise - a real regression this round's
+own testing caught, not something carried in from round 70 undetected
+until now). The real, credentialed `pi --version`/`--help`/`-p` (plain
+reply and a real tool call) smoke tests still succeed, unregressed by
+any of this round's five new global-installing files or the
+`stream.go`/`net.go` changes.
+
+**Status**: the require chain now clears `node:zlib`,
+`node:util/types`, `File`, `MessagePort`, `Event`/`EventTarget`/
+`CustomEvent`, and `stream.Transform` - confirmed by re-running the same
+real-package probe after each fix. It's now blocked on paserati#297
+(`Reflect.deleteProperty` on a function target), hit inside three of
+real undici's own core files (`fetch/response.js`, `fetch/request.js`,
+`websocket/websocket.js`) at their own module top level - not fixable
+from noderati's side, filed upstream instead of worked around.
+`undici.go`'s shim stays exactly as before; `net.go`/`tls.go` remain
+real, verified, and still without a load-bearing consumer until this
+(and whatever comes after it) closes.
+
+## Round 74: paserati#297/#298 fixed upstream and merged same-day; real undici's require() now fully completes and real fetch() actually runs - blocked on one newly-found, precisely-isolated engine bug (filed as #302) inside real Request construction itself
+
+User asked "299 is merged in paserati, does it help?" - PR #299 fixed
+both #297 (`Reflect.deleteProperty` on a function/class target) and
+#298 (the leaked top-level script frame that corrupted later exception
+propagation) in one PR, plus an unrelated closure-upvalue-on-unwind bug
+found along the way. Pulled `../paserati` (already at the merge commit,
+`ea1f6d84`), rebuilt, full suite re-run 3x clean against the updated
+engine, real credentialed `pi --version`/`--help`/`-p` still succeeded
+before continuing (a plain-reply Fireworks call and a real tool call,
+both unregressed) - then re-ran the same real-undici probe from round
+73, fixing each new blocker exactly as it surfaced, same as every round
+since 69:
+
+- **`crypto.getHashes()` missing** - real undici's own
+  `lib/web/subresource-integrity/subresource-integrity.js` calls it
+  unconditionally at module load to check SRI support. Added
+  ([`crypto.go`](../internal/host/crypto.go)) returning exactly (not
+  more, not fewer than) the five algorithms `createHash` actually
+  implements - a real, accurate answer, not Node's much larger OpenSSL-
+  backed list restated as a lie.
+- **`node:worker_threads`' `markAsUncloneable` missing** - real undici's
+  `webidl/index.js` wires it in, then `CacheStorage`/`Cache`/`Request`/
+  `Response` constructors all call it on themselves. Built for real
+  ([`worker_threads.go`](../internal/host/worker_threads.go)): marks the
+  object with a hidden own-property that
+  [`structuredclone.go`](../internal/host/structuredclone.go)'s own
+  `structuredCloneValue` now checks - a later `structuredClone()` on a
+  marked object genuinely throws `DataCloneError`, not a no-op that
+  merely avoids crashing on the call.
+- **`Buffer.allocUnsafe` missing** - real undici's
+  `websocket/constants.js` calls `Buffer.allocUnsafe(0)` at module load.
+  Aliased to the same zero-filled path `Buffer.alloc` already uses - a
+  legitimate implementation of "unspecified" memory (zero is one valid
+  choice), not a shortcut around the real contract.
+- **`DOMException` global missing** -
+  [`dom_exception_global.go`](../internal/host/dom_exception_global.go):
+  real undici throws `new DOMException(message, name)` directly in
+  three files, and `websocket/stream/websocketerror.js` does
+  `class Test extends DOMException { get reason() {...} }` at its own
+  module top level (a real Node bug workaround check,
+  nodejs/node#59677) before ever building a real `WebSocketError`. Built
+  with the real 25-entry legacy numeric `.code` table the WHATWG spec
+  still defines, and confirmed the getter-override subclassing case
+  works correctly (`new Test().reason !== undefined`), not just that the
+  class is constructible.
+- **`Promise.withResolvers()` missing** - real undici's own
+  `lib/web/fetch/index.js` does `let p = Promise.withResolvers()` at the
+  very top of its exported `fetch()`, so every real fetch() call hit
+  this immediately. Added
+  ([`promise_with_resolvers.go`](../internal/host/promise_with_resolvers.go))
+  as a real static method on the actual `Promise` constructor (built on
+  `vmInst.NewPromiseFromExecutor`, the same primitive backing a real
+  `new Promise()`) - not a JS-eval'd polyfill, for the same paserati#298
+  reason `file_global.go` already wasn't.
+- **`node:events`' `getMaxListeners`/`setMaxListeners`/
+  `defaultMaxListeners` missing** - found incidentally: real undici's
+  `request.js` calls `getMaxListeners(new AbortController().signal)` at
+  module load, guarded by its own `try/catch` (so not itself blocking),
+  but a real, separate gap worth closing anyway. Added
+  ([`events.go`](../internal/host/events.go)) working generically on
+  *any* object with a `_maxListeners` slot (a real `AbortSignal` is
+  exactly such an object, confirmed directly, not an instance of this
+  module's own `EventEmitter` class) - attached as static properties on
+  the `EventEmitter` function itself, not a separate wrapper default
+  export, so the existing `const EventEmitter = require("node:events")`
+  bare-default shape (round 69) and the new
+  `const { getMaxListeners } = require("node:events")` named shape both
+  keep working side by side.
+
+**With all of the above, real undici's `require()` completes entirely
+and a real `fetch()` call actually starts running** - past every module-
+load-time gap this whole investigation (rounds 69-74) has been closing
+one at a time. It fails at a new point, deep inside real `Request`
+construction: `requestObject.signal.aborted` throws `Cannot read
+property 'aborted' of undefined` - `.signal` reads back `undefined` even
+though the constructor demonstrably set it correctly moments earlier.
+
+**A real, deeply-hidden paserati bug, isolated through an extensive
+multi-stage bisection of the real ~1100-line `request.js` file - filed
+as [paserati#302](https://github.com/nooga/paserati/issues/302) once
+reduced to a clean, undici-free 13-line repro:**
+
+```js
+class Foo {
+  #signal
+  constructor() { this.#signal = "hello"; }
+  get signal() { return this.#signal; }
+}
+Object.defineProperties(Foo.prototype, {
+  signal: { enumerable: true },   // no get/set/value - should just flip enumerable
+});
+const f = new Foo();
+console.log(f.signal); // "undefined" here - should still be "hello"
+```
+
+`Object.defineProperty`/`defineProperties`, given a *partial* descriptor
+that omits `get`/`set`/`value` when redefining an existing accessor,
+silently replaces the getter instead of merging into it (per spec,
+`ValidateAndApplyPropertyDescriptor` must preserve every attribute the
+new descriptor doesn't mention). Real undici's `request.js` does exactly
+this after its `Request` class declaration - a genuinely common
+real-world idiom for making class-declared getters enumerable (they're
+non-enumerable by default) without restating each one as a full
+descriptor:
+
+```js
+const kEnumerableProperty = { enumerable: true }
+...
+Object.defineProperties(Request.prototype, {
+  method: kEnumerableProperty, url: kEnumerableProperty, ...,
+  signal: kEnumerableProperty, ...
+})
+```
+
+This silently destroys *every* one of `Request`'s real accessors the
+instant it runs, not just `signal` - `method`, `url`, `headers`, `body`,
+etc. are all equally broken, `signal` just happened to be the first one
+a real `fetch()` call actually reads.
+
+**The bisection itself, documented here because it's the actual
+verification work, not just the conclusion**: many real, concrete
+hypotheses were tested and ruled out along the way, each with a direct
+repro before moving on - constructor length/complexity (a 150-local-
+variable, 490-line constructor: fine), private field count (5 fields:
+fine), "friend" static methods reading another instance's private field
+via a parameter rather than `this` (fine), `mixinBody`'s prototype
+mutation (fine), two sequential instances of the same private-field
+class constructed inside one outer constructor (fine), a real
+`getMaxListeners` failure silently caught by `request.js`'s own
+`try/catch` (fine, and is what surfaced the gap fixed above), module-
+load-time `AbortController`/`FinalizationRegistry`/`WeakMap`
+construction (fine). Systematically re-adding chunks of the real,
+unmodified file to an otherwise-working minimal reduction (rather than
+guessing at a synthetic shape) is what actually found it: the file's own
+tail-end `Object.defineProperties(Request.prototype, {...})` call was
+the one addition that flipped a working reduction to a broken one, and
+reducing *that* in isolation is what produced the 13-line repro above.
+
+**Verification**: 8 new Go test files/additions
+(`crypto_test.go`/`worker_threads_test.go`/`buffer_test.go`/
+`dom_exception_global_test.go`/`promise_with_resolvers_test.go`/
+`events_test.go`) drive the exact real call shapes found above -
+`getHashes()` cross-checked against `createHash` actually accepting
+every name it lists, `markAsUncloneable` verified to actually block a
+later `structuredClone()` (not just exist), `DOMException`'s getter-
+override subclassing case, `Promise.withResolvers()` exercised through
+both its resolve and reject paths, and `getMaxListeners`/
+`setMaxListeners` against a real non-`EventEmitter` object. Full suite
+re-run 3x plus once under `-race`, `go vet` clean. Real credentialed `pi
+--version`/`--help` still succeed; the live Fireworks `-p` calls
+themselves returned `412 Account ... is suspended` during this round's
+final check - a real Fireworks billing/account state, not a code
+regression (confirmed by the identical failure on both the plain-reply
+and tool-call prompts, and by `--version`/`--help` both still working
+normally) - so the tool-call and plain-reply paths are unverified live
+*this specific round*, pending the account being restored, though
+nothing in this round's changes touches that code path at all.
+
+**Status**: real undici's `require()` chain is now fully clear -
+confirmed by re-running the same real-package probe (`declareUndici()`
+disabled, restored immediately after) one final time against a freshly-
+copied, completely unmodified copy of the real npm package. A real
+`fetch()` call now actually starts executing, reaching real `Request`
+construction before failing on paserati#302. `undici.go`'s shim stays
+exactly as before - deleting it now would still be a regression, since
+real undici cannot yet complete an actual request. `net.go`/`tls.go`
+remain real, verified, and still without a load-bearing consumer.
+Four real paserati bugs have now been found and filed by this
+investigation (#292, #297, #298 fixed and merged same-day each time;
+#302 open) - each isolated to a minimal, undici-free repro before
+filing, per this project's own standing discipline.

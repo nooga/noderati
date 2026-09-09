@@ -5,6 +5,13 @@ import (
 	"github.com/nooga/paserati/pkg/vm"
 )
 
+// uncloneableMarker is a hidden own-property structuredclone.go's own
+// structuredCloneValue checks for before cloning an object - shared here
+// so markAsUncloneable (below) and the actual clone-time check agree on
+// the same name without either file needing to know the other's
+// internals beyond this one constant.
+const uncloneableMarker = "__noderatiUncloneable"
+
 func declareWorkerThreads(p *driver.Paserati) {
 	p.DeclareModule("worker_threads", func(m *driver.ModuleBuilder) {
 		m.Const("parentPort", nil)
@@ -23,6 +30,24 @@ func installWorkerThreadsExports(p *driver.Paserati) {
 	exports := rec.GetExportValues()
 	workerCtor := buildWorkerConstructor(vmInst)
 	exports["Worker"] = workerCtor
+	// markAsUncloneable(obj): real Node marks obj so a later
+	// structuredClone()/postMessage attempt on it throws DataCloneError.
+	// Found missing while probing real undici (round 74,
+	// docs/real-node-plan.md): its own webidl/index.js does
+	// `webidl.util.markAsUncloneable = require('node:worker_threads').markAsUncloneable`,
+	// then CacheStorage/Cache/Request/Response constructors all call it
+	// on themselves - a real, if small, marker: this actually makes a
+	// later structuredClone() of the same object throw, checked by
+	// structuredclone.go's own structuredCloneValue, not a no-op that
+	// merely avoids crashing on the call.
+	exports["markAsUncloneable"] = vm.NewNativeFunction(1, false, "markAsUncloneable", func(args []vm.Value) (vm.Value, error) {
+		if len(args) > 0 && args[0].Type() == vm.TypeObject {
+			if obj := args[0].AsPlainObject(); obj != nil {
+				obj.SetOwnNonEnumerable(uncloneableMarker, vm.True)
+			}
+		}
+		return vm.Undefined, nil
+	})
 
 	proto := vm.Undefined
 	if vmInst != nil {

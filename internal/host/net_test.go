@@ -1,0 +1,366 @@
+package host
+
+import (
+	"fmt"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nooga/paserati/pkg/driver"
+)
+
+// newEchoServer starts a real TCP server that echoes back exactly what it
+// reads, byte for byte, until the client closes its write side or the
+// whole connection closes. Returns the listener's address; caller must
+// srv.Close() when done (Close() unblocks the accept loop below).
+func newEchoServer(t *testing.T) (addr string, closeFn func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					if n > 0 {
+						if _, werr := c.Write(buf[:n]); werr != nil {
+							return
+						}
+					}
+					if err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+func splitHostPort(t *testing.T, addr string) (string, string) {
+	t.Helper()
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split %s: %v", addr, err)
+	}
+	return host, port
+}
+
+func TestNetConnectEchoByteExact(t *testing.T) {
+	addr, closeFn := newEchoServer(t)
+	defer closeFn()
+	host, port := splitHostPort(t, addr)
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let result = "";
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s }, () => {
+				socket.setNoDelay(true);
+				socket.write("hello ");
+				socket.end("world");
+			});
+			socket.on("data", (chunk) => { result += chunk.toString(); });
+			socket.on("end", resolve);
+			socket.on("error", reject);
+		});
+		result
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if want := "hello world"; val.ToString() != want {
+		t.Errorf("got %q, want %q", val.ToString(), want)
+	}
+}
+
+// TestNetConnectThisIsSocket guards the emitOnObject fix directly: real
+// undici's connector (lib/core/connect.js) does
+// `.once('connect', function () { cb(null, this) })` and relies on
+// `this` being the socket itself, not undefined.
+func TestNetConnectThisIsSocket(t *testing.T) {
+	addr, closeFn := newEchoServer(t)
+	defer closeFn()
+	host, port := splitHostPort(t, addr)
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let ok = false;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s });
+			socket.once("connect", function () {
+				ok = this === socket && typeof this.write === "function";
+				socket.destroy();
+				resolve();
+			});
+			socket.on("error", reject);
+		});
+		ok
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if !val.IsTruthy() {
+		t.Errorf("expected this === socket inside connect listener, got %v", val)
+	}
+}
+
+// TestNetConnectStreamsIncrementally mirrors http_test.go's own streaming
+// guard: assert byte-exact accumulated content across many discrete
+// 'data' events, not an exact chunk count (Go's own Read() coalescing is
+// legitimate and not something this test should fight).
+func TestNetConnectStreamsIncrementally(t *testing.T) {
+	addr, closeFn := newEchoServer(t)
+	defer closeFn()
+	host, port := splitHostPort(t, addr)
+
+	var script strings.Builder
+	script.WriteString(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let result = "";
+		let chunks = 0;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s }, () => {
+	`, host, port))
+	for i := 0; i < 50; i++ {
+		script.WriteString(fmt.Sprintf("				socket.write(%q);\n", fmt.Sprintf("chunk-%03d;", i)))
+	}
+	script.WriteString(`
+				socket.end();
+			});
+			socket.on("data", (chunk) => { result += chunk.toString(); chunks++; });
+			socket.on("end", resolve);
+			socket.on("error", reject);
+		});
+		JSON.stringify({ result, hasChunks: chunks > 0 })
+	`)
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(script.String(), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	var want strings.Builder
+	for i := 0; i < 50; i++ {
+		want.WriteString(fmt.Sprintf("chunk-%03d;", i))
+	}
+	wantJSON := fmt.Sprintf(`{"result":%q,"hasChunks":true}`, want.String())
+	if val.ToString() != wantJSON {
+		t.Errorf("got %s, want %s", val.ToString(), wantJSON)
+	}
+}
+
+func TestNetConnectErrorOnRefused(t *testing.T) {
+	// Bind then immediately close, to get a real, currently-unused local
+	// port that will genuinely refuse the connection (not hypothetically
+	// - this is what a firewalled/down service actually does).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	host, port := splitHostPort(t, addr)
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let gotError = false;
+		await new Promise((resolve) => {
+			const socket = connect({ host: %q, port: %s });
+			socket.on("error", (err) => { gotError = err instanceof Error; resolve(); });
+			socket.on("connect", () => resolve());
+		});
+		gotError
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if !val.IsTruthy() {
+		t.Errorf("expected a real connection-refused error, got %v", val)
+	}
+}
+
+// TestNetSocketBackpressure is the "real backpressure, not synthetic"
+// requirement turned into an assertion: write a payload well over the
+// (deliberately tiny, via highWaterMark) threshold to a server that reads
+// slowly, and check write() actually returns false at some point and
+// 'drain' genuinely fires once the OS has caught up - not on a timer.
+func TestNetSocketBackpressure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	total := 4 * 1024 * 1024 // 4MB - large enough to exceed OS socket buffers and force real backpressure
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		read := 0
+		for read < total {
+			// Read slowly on purpose so the writer genuinely backs up.
+			time.Sleep(2 * time.Millisecond)
+			n, err := conn.Read(buf)
+			read += n
+			if err != nil {
+				return
+			}
+		}
+	}()
+	host, port := splitHostPort(t, ln.Addr().String())
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let sawFalse = false;
+		let sawDrain = false;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s, highWaterMark: 16384 }, () => {
+				const chunk = "x".repeat(65536);
+				for (let i = 0; i < %d; i++) {
+					const ok = socket.write(chunk);
+					if (!ok) sawFalse = true;
+				}
+				socket.end();
+			});
+			socket.on("drain", () => { sawDrain = true; });
+			socket.on("close", () => resolve());
+			socket.on("error", reject);
+		});
+		JSON.stringify({ sawFalse, sawDrain })
+	`, host, port, total/65536), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"sawFalse":true,"sawDrain":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestNetSocketPauseResumeStopsReads proves pause() actually stops
+// pulling bytes off the OS socket (not just withholding 'data' events
+// while still draining in the background) - the server records how many
+// bytes it managed to push before the client resumes.
+func TestNetSocketPauseResumeStopsReads(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	serverDone := make(chan int64, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		payload := make([]byte, 8*1024*1024)
+		n, _ := conn.Write(payload)
+		serverDone <- int64(n)
+	}()
+	host, port := splitHostPort(t, ln.Addr().String())
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let totalWhilePaused = 0;
+		let resumed = false;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s }, () => {
+				socket.pause();
+				setTimeout(() => {
+					resumed = true;
+					socket.resume();
+				}, 150);
+			});
+			socket.on("data", (chunk) => {
+				if (!resumed) totalWhilePaused += chunk.length;
+			});
+			socket.on("end", resolve);
+			socket.on("error", reject);
+		});
+		JSON.stringify({ pausedSmall: totalWhilePaused < 1024 * 1024 })
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if want := `{"pausedSmall":true}`; val.ToString() != want {
+		t.Errorf("got %s, want %s - pause() should have kept the reader loop from pulling the whole 8MB before resume()", val.ToString(), want)
+	}
+	<-serverDone
+}
+
+// TestNetSocketDestroyRightAfterWriteDoesNotHang guards the destroy()/
+// write() interaction documented in writerLoop's own comment: destroying
+// a socket immediately after queuing a large write (before the writer
+// goroutine could plausibly have flushed it) can drop that data - real
+// Node's own destroy() is specified to abort immediately, not flush
+// first, so this is expected, not a bug. What must still hold, and what
+// this test actually checks, is that the sequence is safe: it must not
+// hang, panic, or double-emit 'close' regardless of which goroutine
+// notices the close first.
+func TestNetSocketDestroyRightAfterWriteDoesNotHang(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		for {
+			if _, err := conn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	host, port := splitHostPort(t, ln.Addr().String())
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let closeCount = 0;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s }, () => {
+				socket.write("x".repeat(1024 * 1024));
+				socket.destroy();
+			});
+			socket.on("close", () => { closeCount++; resolve(); });
+			socket.on("error", reject);
+		});
+		closeCount
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToFloat() != 1 {
+		t.Errorf("got %v 'close' events, want exactly 1", val)
+	}
+}

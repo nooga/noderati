@@ -59,6 +59,24 @@ func declareCrypto(p *driver.Paserati) {
 			}
 			return wrapBuffer(vmInst, string(b)), nil
 		})
+		// getHashes(): real Node returns every digest algorithm name
+		// OpenSSL supports on the running system (a large list).
+		// Returning exactly (and only) the five algorithms createHash
+		// below actually implements is the honest analogue here - found
+		// missing while probing real undici (round 74,
+		// docs/real-node-plan.md): undici's own
+		// lib/web/subresource-integrity/subresource-integrity.js calls
+		// this unconditionally at module load time
+		// (crypto.getHashes()) to check SRI support, so a missing
+		// export threw before any of undici's own fetch code ran.
+		m.Function("getHashes", func() vm.Value {
+			arr := vm.NewArray()
+			a := arr.AsArray()
+			for _, name := range []string{"md5", "sha1", "sha256", "sha384", "sha512"} {
+				a.Append(vm.NewString(name))
+			}
+			return arr
+		})
 		m.Function("createHash", func(algo string) (*hashHasher, error) {
 			switch strings.ToLower(algo) {
 			case "md5":

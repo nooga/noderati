@@ -89,3 +89,96 @@ func TestStreamPipelineRejectsOnError(t *testing.T) {
 		t.Errorf("pipeline error = %q, want %q", val.ToString(), "boom")
 	}
 }
+
+// TestStreamTransformSubclassable drives the exact real requirement
+// found while probing undici: real undici's own
+// lib/web/eventsource/eventsource-stream.js does
+// "class EventSourceStream extends Transform", so a missing Transform
+// throws "Class extends value undefined is not a constructor or null"
+// at require() time. A subclass overriding _transform() must have its
+// override actually drive write()'s output, not the base class's
+// identity default.
+func TestStreamTransformSubclassable(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Transform } from "node:stream";
+
+		class Upper extends Transform {
+			_transform(chunk, _encoding, callback) {
+				callback(null, String(chunk).toUpperCase());
+			}
+		}
+
+		const t = new Upper();
+		let result = "";
+		let ended = false;
+		t.on("data", (chunk) => { result += chunk; });
+		t.on("end", () => { ended = true; });
+		t.write("hello ");
+		t.end("world");
+		JSON.stringify({ result, ended })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"result":"HELLO WORLD","ended":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestStreamTransformDefaultIsPassthrough checks the base class's own
+// (unoverridden) _transform default - an honest identity pass-through,
+// not a stub that drops data.
+func TestStreamTransformDefaultIsPassthrough(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Transform } from "node:stream";
+		const t = new Transform();
+		let result = "";
+		t.on("data", (chunk) => { result += chunk; });
+		t.write("abc");
+		t.end("def");
+		result
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "abcdef" {
+		t.Errorf("got %q, want %q", val.ToString(), "abcdef")
+	}
+}
+
+// TestStreamTransformPipesToDest checks Transform's own .pipe() (used
+// by real undici's pipeline() to chain a Transform into the next stage)
+// actually forwards transformed output.
+func TestStreamTransformPipesToDest(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Transform, Writable } from "node:stream";
+
+		class Double extends Transform {
+			_transform(chunk, _encoding, callback) {
+				callback(null, chunk + chunk);
+			}
+		}
+
+		const t = new Double();
+		const w = new Writable();
+		let result = "";
+		w.on("data", (chunk) => { result += chunk; });
+		t.pipe(w);
+		t.write("ab");
+		t.end();
+		result
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "abab" {
+		t.Errorf("got %q, want %q", val.ToString(), "abab")
+	}
+}
