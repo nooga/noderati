@@ -440,3 +440,201 @@ func TestNetSocketUnrefLetsProcessDrainWithConnectionStillOpen(t *testing.T) {
 		t.Fatal("DrainUntilIdle did not return within 5s - socket.unref() did not release its external-op registration (connection is still open)")
 	}
 }
+
+// TestNetSocketReadableProtocolDrivesParserStyleConsumer guards the
+// actual root cause of the Round 76/77 real-undici E2E hang directly
+// (docs/real-node-plan.md): real undici's HTTP/1.1 client drives its
+// llhttp parser exclusively through Node's paused-mode Readable
+// protocol - socket.on('readable', ...) then socket.read() in a loop -
+// and never listens for 'data' at all. Before this fix, Socket only
+// ever emitted 'data' unconditionally; those bytes arrived, were
+// drained off the real OS socket, and were emitted into an event
+// nobody was listening for, so a parser driven exactly this way never
+// received a single byte. This test drives the socket with that exact
+// protocol (never touching 'data') and asserts the bytes come through
+// byte-exact anyway.
+func TestNetSocketReadableProtocolDrivesParserStyleConsumer(t *testing.T) {
+	addr, closeFn := newEchoServer(t)
+	defer closeFn()
+	host, port := splitHostPort(t, addr)
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let result = "";
+		let endCount = 0;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s }, () => {
+				socket.write("hello ");
+				socket.end("world");
+			});
+			socket.on("readable", () => {
+				let chunk;
+				while ((chunk = socket.read()) !== null) {
+					result += chunk.toString();
+				}
+			});
+			socket.on("end", () => { endCount++; resolve(); });
+			socket.on("error", reject);
+		});
+		JSON.stringify({ result, endCount })
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"result":"hello world","endCount":1}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestNetSocketReadWithSizeLeavesRemainderQueued guards read(size)'s
+// partial-consumption behavior: taking fewer bytes than are buffered
+// must leave the rest available for the next read() call, not discard
+// or duplicate it.
+func TestNetSocketReadWithSizeLeavesRemainderQueued(t *testing.T) {
+	addr, closeFn := newEchoServer(t)
+	defer closeFn()
+	host, port := splitHostPort(t, addr)
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let firstRead = "";
+		let rest = "";
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s }, () => {
+				socket.end("0123456789");
+			});
+			let readSized = false;
+			socket.on("readable", () => {
+				if (!readSized) {
+					const chunk = socket.read(3);
+					if (chunk !== null) {
+						firstRead = chunk.toString();
+						readSized = true;
+					}
+				}
+				let chunk;
+				while ((chunk = socket.read()) !== null) {
+					rest += chunk.toString();
+				}
+			});
+			socket.on("end", resolve);
+			socket.on("error", reject);
+		});
+		JSON.stringify({ firstRead, rest, full: firstRead + rest })
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"firstRead":"012","rest":"3456789","full":"0123456789"}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestNetSocketReadableEndDeferredUntilBufferDrained guards the race
+// this fix has to get right: EOF can arrive while there's still unread
+// data sitting in readBuf (a server that writes its payload and closes
+// immediately makes this the common case, not a rare one). 'end' must
+// not fire until a paused-mode consumer actually drains that data via
+// read() - firing it early would mean a consumer relying on 'end' to
+// know it's safe to stop calling read() could miss bytes that arrived
+// before the close. This test deliberately delays calling read() past
+// the point where the server has already sent everything and closed,
+// forcing readerLoop's EOF branch to observe a non-empty buffer.
+func TestNetSocketReadableEndDeferredUntilBufferDrained(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = conn.Write([]byte("payload-before-close"))
+		// Closing immediately after the write (no pause) means the
+		// client's readerLoop is likely to observe the data and the
+		// EOF together, or in very quick succession - exactly the
+		// race this test targets.
+	}()
+	host, port := splitHostPort(t, ln.Addr().String())
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let result = "";
+		let endFired = false;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s });
+			socket.on("readable", () => {});
+			socket.on("end", () => { endFired = true; resolve(); });
+			socket.on("error", reject);
+			// Deliberately wait well past the point where the server
+			// has already written its payload and closed, before ever
+			// calling read() - readerLoop's EOF branch must have
+			// already run against a non-empty buffer by then.
+			setTimeout(() => {
+				let chunk;
+				while ((chunk = socket.read()) !== null) {
+					result += chunk.toString();
+				}
+			}, 100);
+		});
+		JSON.stringify({ result, endFired })
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"result":"payload-before-close","endFired":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestNetSocketDataListenerStillWorksAlongsideReadableFix guards against
+// a regression in the opposite direction: adding this round's
+// paused-mode Readable support must not break existing push-mode
+// ('data') consumers, which every other caller in this codebase (and
+// real Node code that never touches 'readable'/read()) still relies on.
+func TestNetSocketDataListenerStillWorksAlongsideReadableFix(t *testing.T) {
+	addr, closeFn := newEchoServer(t)
+	defer closeFn()
+	host, port := splitHostPort(t, addr)
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(fmt.Sprintf(`
+		import { connect } from "node:net";
+		let result = "";
+		let sawReadable = false;
+		await new Promise((resolve, reject) => {
+			const socket = connect({ host: %q, port: %s }, () => {
+				socket.write("hello ");
+				socket.end("world");
+			});
+			socket.on("data", (chunk) => { result += chunk.toString(); });
+			socket.on("readable", () => { sawReadable = true; });
+			socket.on("end", resolve);
+			socket.on("error", reject);
+		});
+		JSON.stringify({ result, sawReadable })
+	`, host, port), driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	// Real Node's own behavior: once a 'data' listener switches a stream
+	// to flowing mode, 'readable' no longer fires - flowing mode owns
+	// delivery entirely.
+	want := `{"result":"hello world","sawReadable":false}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
