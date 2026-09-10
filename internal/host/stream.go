@@ -34,10 +34,99 @@ const streamShim = `class EventEmitter {
   }
 }
 
+// push()/destroy()/[Symbol.asyncIterator] were missing entirely - found
+// the hard way while probing real undici's fetch() end to end (round 79,
+// docs/real-node-plan.md): lib/web/fetch/index.js's own httpNetworkFetch
+// builds the response body as "this.body = new Readable({ read: resume })",
+// pushes bytes into it directly from the dispatch handler's onData/
+// onComplete callbacks ("this.body.push(bytes)"/"this.body.push(null)"),
+// and later consumes it as "body[Symbol.asyncIterator]()" - a real,
+// unavoidable call site, not a hypothetical one. Without push(), the very
+// first onComplete() call threw "undefined is not a function" immediately
+// after a full response had already parsed correctly.
+//
+// The queue+waiters pattern below is the standard way to implement a
+// real, correct async iterator over a push-driven source: push() either
+// hands a chunk straight to a waiting next() call or buffers it if
+// nobody's waiting yet; next() either returns a buffered chunk
+// immediately or parks a Promise until push()/destroy() resolves it.
+// 'data'/'end' still fire too (unchanged from before), so pipe() and any
+// other 'data'-based consumer keep working exactly as they did - real
+// undici's fetch() body only ever uses the async-iterator path for this
+// class specifically, but nothing here assumes that's the only consumer.
+//
+// Deliberately not wired up: the constructor's 'read' option (Node's
+// real mechanism for pulling more data from upstream once the internal
+// buffer drains, e.g. backpressure on a large streamed response) is
+// accepted but never invoked - every real call site exercised so far
+// (small-to-moderate fetch() response bodies) pushes its entire content
+// synchronously before anything ever awaits a chunk, so there's never
+// been a real gap to pull against. An honest gap, not a silent one: a
+// future response large/slow enough to need genuine pull-driven
+// backpressure here would stall waiting for a next() that never
+// resolves, rather than silently dropping data - flagged for whoever
+// hits it next, not glossed over.
 class Readable extends EventEmitter {
   constructor(_opts) {
     super();
     this.readable = true;
+    this._queue = [];
+    this._ended = false;
+    this._error = null;
+    this._waiters = [];
+  }
+  _settleWaiters() {
+    while (this._waiters.length && (this._queue.length || this._ended || this._error)) {
+      const { resolve, reject } = this._waiters.shift();
+      if (this._error) {
+        reject(this._error);
+      } else if (this._queue.length) {
+        resolve({ value: this._queue.shift(), done: false });
+      } else {
+        resolve({ value: undefined, done: true });
+      }
+    }
+  }
+  push(chunk) {
+    if (chunk === undefined || chunk === null) {
+      this._ended = true;
+      this._settleWaiters();
+      this.emit("end");
+      return false;
+    }
+    this._queue.push(chunk);
+    this.emit("data", chunk);
+    this._settleWaiters();
+    return true;
+  }
+  destroy(err) {
+    if (err) {
+      this._error = err;
+      this.emit("error", err);
+    } else {
+      this._ended = true;
+    }
+    this._settleWaiters();
+    this.emit("close");
+    return this;
+  }
+  [Symbol.asyncIterator]() {
+    return {
+      next: () => {
+        if (this._queue.length) {
+          return Promise.resolve({ value: this._queue.shift(), done: false });
+        }
+        if (this._error) {
+          return Promise.reject(this._error);
+        }
+        if (this._ended) {
+          return Promise.resolve({ value: undefined, done: true });
+        }
+        return new Promise((resolve, reject) => {
+          this._waiters.push({ resolve, reject });
+        });
+      },
+    };
   }
   pipe(dest) {
     this.on("data", (chunk) => {
