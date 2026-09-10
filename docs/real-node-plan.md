@@ -9253,6 +9253,24 @@ upstream-owned blocker exactly like #302/#372/#377/#381 before it. Not
 pursued further this round - isolating and filing #384 was this
 round's actual scope.
 
+**Two follow-up checks, done before calling this round closed:**
+1. The Buffer static-prototype-chain divergence noted above (species
+   resolving to `Buffer` rather than a `FastBuffer`-shaped class) was
+   verified for more than "didn't throw": `new
+   Buffer[Symbol.species](arrayBuffer, 2, 4)` on an 8-byte buffer
+   populated `[1..8]` returns a length-4 view of `[3,4,5,6]` - the
+   offset/length slicing itself is correct, not just non-throwing.
+2. `setImmediate`'s callback-invocation error is deliberately
+   discarded (`immediate_object.go`) - checked directly whether that's
+   a new gap or an existing one: a throwing `setTimeout(fn, 0)`
+   callback exhibits the exact same silent behavior (no
+   `uncaughtException`, no nonzero exit, nothing printed) via
+   paserati's own `RunDueTimers()`. Same engine-level house pattern for
+   every `DrainUntilIdle`-driven callback, not something this round's
+   `setImmediate` introduced - documented in place rather than papered
+   over with a one-off fix that would leave `setTimeout` still silently
+   broken the same way.
+
 **Verification**: `go build ./...` clean. Full `internal/host` suite
 green (including the two new `setImmediate` tests) except the same
 pre-existing, unrelated `TestEventsAddAbortListener`.

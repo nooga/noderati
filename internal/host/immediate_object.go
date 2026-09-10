@@ -86,6 +86,17 @@ func installSetImmediate(p *driver.Paserati) {
 		// vmInst.Call directly here, with no ScheduleNextTick hop, is
 		// safe (unlike callbacks invoked from a background goroutine,
 		// which must defer any VM-value construction/call to a tick).
+		// The returned error (a throwing callback) is deliberately
+		// discarded, not silently dropped by oversight: confirmed
+		// directly that paserati's own RunDueTimers() does the exact
+		// same thing for a throwing setTimeout(fn, 0) callback (no
+		// uncaughtException, no nonzero exit, no trace at all) - this
+		// matches that existing engine-level house pattern for
+		// DrainUntilIdle-driven callbacks rather than inventing a new,
+		// inconsistent one for setImmediate alone. A real gap from
+		// Node (which does report it), but a pre-existing, paserati-wide
+		// one, not something introduced here - flagged, not fixed, per
+		// this round's own actual scope.
 		rt.ScheduleMacrotask(func() {
 			if cancelled {
 				return
