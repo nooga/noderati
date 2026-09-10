@@ -9891,3 +9891,77 @@ green (including the new `TestBufferModuleExportsBlobAndFile`), same
 pre-existing unrelated `TestEventsAddAbortListener` excluded.
 `declareUndici()` restored (was temporarily disabled for E2E probing,
 per the Round 77-documented trap).
+
+## Round 85: delete undici's fake - real, unmodified undici@7.11.0 now always loads
+
+With Round 84's milestone confirmed - a real, unmodified undici@7.11.0
+completing the full six-step scenario (GET, a 100KB body, JSON, and a
+POST with a real request body, all round-tripped through a real Go
+HTTP server) - deleted the fake `undici` shim that's been shadowing the
+real npm package throughout this entire investigation (Round 69
+onward), matching this project's own established practice for every
+other third-party package fake once its real replacement is verified
+working (`pi-tui`, `diff`, `glob`, `typebox`, `minimatch`,
+`proper-lockfile`, `jiti`, ...): delete the fake, not just leave it
+disabled by convention.
+
+Removed three things, all pointing at the same fake:
+- [`internal/host/undici.go`](../internal/host/undici.go) (the shim
+  itself: a fake `EnvHttpProxyAgent`/`setGlobalDispatcher`/`install`
+  that did nothing real) and its own
+  [`undici_test.go`](../internal/host/undici_test.go), which only ever
+  tested the fake's own behavior, not anything about a real package -
+  deleted outright rather than adapted, since there's nothing left to
+  test once the fake doesn't exist.
+- `declareUndici()`'s call site in
+  [`host.go`](../internal/host/host.go)'s `installModules` - this
+  `registerJSShim("undici", ...)` call was what made the bare
+  specifier `"undici"` resolve to the fake via `JSShimResolver`
+  (priority -50) *before* `NodeModulesResolver` (priority 0, lower
+  runs first) ever got a chance to find a real `node_modules/undici` -
+  removing it lets normal resolution reach the real package for both
+  ESM `import` and CJS `require()`.
+- `"undici"` from `cjs.go`'s `nativeRequireNames` map - this list is
+  also the direct source of `Module.builtinModules` (`builtinModulesArray()`
+  iterates the same map), and real Node's `Module.builtinModules` does
+  *not* include `"undici"` - it's an ordinary npm package, not a
+  built-in, so this entry was actively wrong even before considering
+  the fake at all. Removing it fixes `require("undici")` (previously
+  routed to `requireNative`, now correctly falls through to real
+  file-based CJS resolution) and `Module.builtinModules.includes("undici")`
+  (previously `true`, now correctly `false`) together, from one edit -
+  by design, per this same list's own long-standing comment about being
+  the single source of truth for both.
+
+**Verified the deletion three ways, not just "build succeeds"**:
+1. Re-ran the exact Round 84 six-step probe against the real,
+   unmodified vendored undici@7.11.0, with the fake *actually gone*
+   (no toggling, no temporarily-disabled comment) - identical, correct
+   results: `ALL DONE`, every status/body/echo check passing. That
+   probe uses ESM `import`, which only exercises `NodeModulesResolver`
+   directly - it doesn't touch the `nativeRequireNames` removal at all.
+   So, separately, ran a plain CJS script
+   (`const u = require("undici")`) against the same built binary:
+   `typeof u.fetch`/`typeof u.setGlobalDispatcher` both `"function"`
+   (real resolution, not `requireNative`'s old dead end) and
+   `require("module").builtinModules.includes("undici")` correctly
+   `false` - confirming the `nativeRequireNames` claim above directly
+   rather than leaving it as inferred-from-reading-`cjs.go`.
+2. Confirmed the honest-failure case too: a script importing `"undici"`
+   with no real package installed now fails exactly the way real Node
+   would - `Error: Cannot find package 'undici' imported from ...` -
+   not a silent fallback to anything, and not the old fake pretending
+   to work.
+
+**Status**: this closes out the "is the fake still there" question
+directly - no. Every future probe or real program run through noderati
+now genuinely exercises whatever real `undici` package it finds in its
+own `node_modules`, the same way every other already-deleted fake in
+this codebase's history works. The two still-open issues from Round 84
+(the GET-path hang and the process-won't-exit case, both around idle
+keep-alive socket lifecycle) are unaffected by this round - this was a
+pure deletion, no behavior change to anything that was already working.
+
+**Verification**: `go build ./...`/`go vet ./...` clean. Full
+`internal/host` suite green, same pre-existing unrelated
+`TestEventsAddAbortListener` excluded.

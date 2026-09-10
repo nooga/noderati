@@ -55,7 +55,6 @@ func installModules(p *driver.Paserati) {
 	declareReadline()
 	declareTTY(p)
 	declareEvents()
-	declareUndici()
 	declareStream()
 	declareBuffer(p)
 	declareCrypto(p)
@@ -83,10 +82,22 @@ func installModules(p *driver.Paserati) {
 	// fakes, individually toggleable for the Phase 2 scoreboard. jiti/
 	// static was the last one standing (see the note further down where
 	// it used to live) - deleted 2026-09-06, leaving no fake left to
-	// disable. disabledSet/isDisabled (scoreboard_config.go) are dead
-	// code as of this round, kept rather than deleted in case a future
-	// package quirk needs the toggle mechanism back - the same call this
-	// ledger already made for NODERATI_DISABLE_PATCHES in cmd/scoreboard.
+	// disable at that point. disabledSet/isDisabled (scoreboard_config.go)
+	// are dead code as of that round, kept rather than deleted in case a
+	// future package quirk needs the toggle mechanism back - the same
+	// call this ledger already made for NODERATI_DISABLE_PATCHES in
+	// cmd/scoreboard. undici's own fake (added later, during the
+	// real-undici fetch() E2E investigation that starts around Round 69
+	// of docs/real-node-plan.md) was deleted 2026-09-10 (Round 85) -
+	// paserati#383/#385/#388/#391/#392/#394 fixed the real engine bugs
+	// this investigation found blocking it, and a real, unmodified
+	// undici@7.11.0 was verified working end-to-end (GET and POST, real
+	// response content, a request body round-tripping through a real Go
+	// HTTP server) before this deletion - see Round 84's own entry for
+	// that verification and Round 85's for the deletion itself. Not
+	// wired into the old isDisabled toggle mechanism above (it predates
+	// the toggle being marked dead code, so it never used it) - this was
+	// a plain unconditional `declareUndici()` call.
 	// pi-tui's fake was deleted 2026-09-03 — paserati#195/#196 (v flag and
 	// \p{Default_Ignorable_Code_Point}), #218 (new RegExp() backreference
 	// fallback), and #222–#225 (arrow function `this` lost as an
