@@ -130,4 +130,13 @@ func installFileGlobal(p *driver.Paserati) {
 	)
 
 	gobj.SetOwn("File", fileCtor)
+
+	// Real Node's node:buffer module re-exports File alongside Blob and
+	// Buffer (confirmed directly via `node -e`) - mirroring buffer.go's
+	// own addition of Blob to this same exports map, for the same
+	// reason: real code (`const { File } = require('node:buffer')`)
+	// expects it there, not just as a bare global.
+	if rec, err := p.LoadModule("buffer", "."); err == nil {
+		rec.GetExportValues()["File"] = fileCtor
+	}
 }

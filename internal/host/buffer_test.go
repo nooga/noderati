@@ -229,3 +229,43 @@ func TestBufferSubarrayStaysBuffer(t *testing.T) {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
 }
+
+// TestBufferModuleExportsBlobAndFile guards a real, unavoidable call
+// site found while probing real undici's fetch() end to end (round 84,
+// docs/real-node-plan.md): real undici's own core/util.js does
+// `const { Blob } = require('node:buffer')`, then `object instanceof
+// Blob` inside isBlobLike() - called from bodyLength(), reached on
+// every real request/response with a body. Blob and File are both
+// real paserati globals already; node:buffer previously only
+// re-exported Buffer, so the destructured Blob was undefined and
+// `x instanceof undefined` threw "Right-hand side of 'instanceof' is
+// not an object" regardless of what x was - not a null-check gap
+// isBlobLike's own guards could ever catch, since the broken reference
+// was the right-hand side. Confirmed directly against real Node
+// (`node -e`) that node:buffer really does export Blob and File
+// before writing this. Deliberately checks `"x" instanceof Blob`
+// (the exact real isBlobLike() usage - a plain string body, not a
+// real Blob) rather than `new Blob(...) instanceof Blob`: constructing
+// a real Blob instance hits a separate, already-filed paserati bug
+// (paserati#395 - `new Blob(...)` doesn't produce a real instance),
+// unrelated to what this test guards.
+func TestBufferModuleExportsBlobAndFile(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Blob, File, Buffer } from "node:buffer";
+		JSON.stringify({
+			blobIsGlobal: Blob === globalThis.Blob,
+			fileIsGlobal: File === globalThis.File,
+			bufferIsGlobal: Buffer === globalThis.Buffer,
+			stringInstanceofBlobDoesNotThrow: "x" instanceof Blob,
+		})
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"blobIsGlobal":true,"fileIsGlobal":true,"bufferIsGlobal":true,"stringInstanceofBlobDoesNotThrow":false}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
