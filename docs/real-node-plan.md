@@ -9689,3 +9689,94 @@ teardown goroutine) couldn't be reproduced on demand, only reasoned
 about from the code - a test built around a guessed-at trigger would
 verify the guess, not the real race, so none was written rather than
 faking one.
+
+## Round 83: root-caused the POST hang - a real, confirmed paserati engine bug, not the tee()-integration guess from last round - filed as #393
+
+Asked directly whether the `POST` stall from Round 82 needed a paserati
+fix or a noderati one - answered honestly that it wasn't known yet, and
+was asked to go find out. Started from Round 82's own hypothesis (a
+`pull()`-driven, non-goroutine-fed `ReadableStream`'s `.tee()`'d output
+not getting consumed correctly) and built the minimal, undici-free
+version of exactly that shape - matching real undici's own
+`extractBody` byte-stream constructor line for line:
+
+```js
+const rs = new ReadableStream({
+  async pull(controller) {
+    const buffer = encoder.encode(source);
+    if (buffer.byteLength) { controller.enqueue(buffer); }
+    queueMicrotask(() => controller.close());
+  },
+  type: "bytes",
+});
+const [out1] = rs.tee();
+await out1.getReader().read(); // hangs
+```
+
+It hung, confirming *something* real and reproducible outside undici
+entirely. But the follow-up control that Round 82 hadn't actually run -
+the exact same source, reading directly with no `tee()` at all -
+**also hung**. That disproves last round's own `tee()`-integration
+hypothesis outright: this isn't about `tee()`, `pull()`-driven sources
+feeding `tee()`'s branches, or anything Go-goroutine-related. Caught
+and corrected the wrong hypothesis in the same session it was
+discovered, rather than filing the wrong report.
+
+**Bisected the real trigger from there**, testing one dimension at a
+time (5 repeats each, after an advisor review flagged that this
+project has already been burned twice by treating a single run as
+proof - the `~1-in-10` GET flake and the POST failure that changed
+shape between binaries): removing the `tee()` call, removing `async`
+from `pull`, changing the guard from `if (buffer.byteLength)` to no
+guard, to `if (true)`, to `if (buffer.length)` (a different property on
+the same object), to a getter-backed condition on an *unrelated* object
+(ruling out "any accessor read shifts microtask timing enough to
+matter," not just "any property read"), and to reading `.byteLength`
+into a discarded variable without using it as a condition. Every one of
+those variants works correctly and deterministically (20/20 runs across
+four of them). Only one shape breaks, deterministically, both with and
+without `type: "bytes"`, both with and without `tee()`: `if
+(chunk.byteLength) { controller.enqueue(chunk); }` - a `pull()`
+enqueuing a chunk conditioned on that *same* chunk's own `.byteLength`.
+With an `async pull`, the reader's `read()` promise never resolves at
+all (a genuine hang). With a `sync` `pull`, it's worse in a different
+way: no hang, but the chunk is silently dropped - `read()` resolves
+immediately with `{ done: true, value: undefined }`, as if the stream
+were empty. Confirmed the expected output directly against real Node
+(`node -e`) for the exact minimal repro: `false 2`, not `undefined`/a
+hang either way. Filed as
+[paserati#393](https://github.com/nooga/paserati/issues/393), with the
+full bisection table, both manifestations, and the real undici call
+site that makes this a real, unavoidable blocker (`extractBody`'s
+generic byte-stream constructor - used for every string/`ArrayBuffer`
+request body, i.e. almost every real `POST`/`PUT` - uses exactly this
+`if (buffer.byteLength) { controller.enqueue(buffer) }` shape).
+
+**This is now the confirmed, root-caused explanation for Round 82's
+`POST` hang** - not a guess. `extractBody` hits this exact pattern on
+every non-`ReadableStream`/`Blob` body, so the very first chunk of a
+request body never reaches the wire, and `fetch()` hangs forever
+waiting for a write that will never happen - matching everything
+observed last round (the checkpoint log printing "about to POST" but
+`fetch()` never returning, no Go-side `tee()` machinery active in the
+goroutine dump because the JS-level `pull()` callback itself never gets
+past this line). **Does not explain** the separate, still-open
+~1-in-10 non-deterministic hang in the plain `GET`/`BIG`/`JSON` stretch
+from Round 82 - a `GET` has no request body, so `extractBody`'s
+byte-stream path is never reached on that path at all. That one stays
+open, unresolved, and unrelated - noted explicitly here so it doesn't
+quietly get absorbed into this round's finding.
+
+**Status**: the question "does noderati or paserati own the `POST`
+hang" now has a real, evidenced answer - paserati, confirmed via a
+minimal, undici-free, tee()-free repro, not the vaguer
+tee()-integration guess Round 82 made. Nothing to change on noderati's
+side for this specific bug; `declareUndici()` was never touched this
+round (no E2E probing needed once the standalone repro reproduced the
+hang directly). The Round 82 `net.go` `extOpFinal` fix stands unchanged
+- still real, still not confirmed to explain the GET-path flake, still
+a separate open question.
+
+**Verification**: no noderati code changed this round. The repro and
+its bisection ran entirely against a vanilla `paserati` checkout (no
+`go build`/test cycle on the noderati side was needed).
