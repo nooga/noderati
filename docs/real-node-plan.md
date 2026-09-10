@@ -9965,3 +9965,78 @@ pure deletion, no behavior change to anything that was already working.
 **Verification**: `go build ./...`/`go vet ./...` clean. Full
 `internal/host` suite green, same pre-existing unrelated
 `TestEventsAddAbortListener` excluded.
+
+## Round 86: paserati#396 pulled (fixes #395) - `new Blob(...)` is now a real instance; the GET-path hang reproduced 2/5 on re-verification
+
+Pulled paserati main (`7f3ef722..7d2503c9`, fast-forward) for
+[paserati#396](https://github.com/nooga/paserati/pull/396), which
+fixes [paserati#395](https://github.com/nooga/paserati/issues/395) -
+the last still-open issue this undici investigation had filed.
+Root cause per the PR: `createBlobObject()` accepted a `proto`
+parameter but discarded it, always building new Blob instances on
+`ObjectPrototype` instead of `Blob.prototype` (same bug in `slice()`'s
+returned sub-Blob). While in the area, the PR also fixed
+`Response.blob()`/`Request.blob()`, which previously resolved to a
+bare `Uint8Array`/`ArrayBuffer` instead of a `Blob` at all.
+
+**Verified directly**, not just "tests pass upstream":
+- `new Blob(["hi"]) instanceof Blob` -> `true` (was `false`), with the
+  right `.constructor.name` (`"Blob"`), `.size`, `.type`.
+- `(await new Response("hello world").blob()) instanceof Blob` ->
+  `true`, with the correct `.size` - this is the actual real-world
+  path real undici's own `isBlobLike()` exercises, closer to it than
+  the bare-constructor check above.
+- Strengthened
+  [`TestBufferModuleExportsBlobAndFile`](../internal/host/buffer_test.go)
+  to also assert `new Blob(["hi"]) instanceof Blob` through
+  `node:buffer`'s own exported `Blob`, removing the workaround comment
+  that had deliberately avoided this exact assertion because of #395.
+- Re-ran the full Round 84/85 six-step undici E2E probe (GET x3, 100KB
+  body, JSON, POST with a real body) against the real vendored
+  undici@7.11.0 with the fake still gone (Round 85), 5x back-to-back
+  rather than trusting a single run - the Round 82/84 GET-path hang is
+  non-deterministic (previously observed ~1-in-8 to 3-in-10), so one
+  pass alone couldn't rule it out either way: 3/5 completed cleanly
+  (`ALL DONE`, every check correct); 2/5 stalled at the exact same
+  point Round 82/84 documented - right after `GET#2`, before `BIG` -
+  with no further output for well over a minute (run 4) and killed
+  after 15s of silence there (run 5, so "hung" for that one means
+  "stalled at that point for at least 15s," not "observed
+  indefinitely," matching the standard the rest of this file holds).
+  This is the pre-existing, already-documented, un-root-caused hang
+  reproducing live again, not a new regression from #396 - it's
+  unrelated to Blob/Response.blob() (the code #396 touches), and 2/5
+  at this small an n is within noise of the previously observed rate
+  range, on the high side of it but not a new or different failure
+  mode. Confirms the hang is still exactly as open as Round 84 left
+  it - this round didn't touch it either way. Also worth recording:
+  bounding this with `timeout 15 ...` didn't actually work - the
+  `timeout` default (SIGTERM) didn't kill either stalled run, both
+  needed a manual `kill -9`; a script wanting to bound this hang
+  automatically needs `timeout -s KILL`. That noderati doesn't exit on
+  a plain SIGTERM while parked here is itself consistent with (though
+  not confirmation of) the separate "process won't exit" symptom
+  Round 84 logged.
+
+**Verification**: `go build ./...`/`go vet ./...` clean. Full
+`internal/host` suite green (same pre-existing unrelated
+`TestEventsAddAbortListener` excluded).
+
+**Status**: checked `gh issue list --state open` directly against the
+paserati tracker rather than relying on memory of this session (the
+same discipline this investigation applied earlier after the #392
+merged/open mixup) - none of the issues this investigation filed
+(#384, #386, #387, #389, #390, #393, #395) are open any more; all are
+fixed and pulled. (`host.go`'s ledger comment names the *PR* numbers
+that shipped these fixes - #383/#385/#388/#391/#392/#394/#396 - a
+different, overlapping numbering series from the *issue* numbers
+listed here.) Two unrelated issues are open on the tracker -
+paserati#375 (WebAssembly support, filed at the user's request, not a
+blocker for the six-step scenario already verified working) and
+paserati#397 (`formData()` stub, noted as out-of-scope by #396's own
+PR description, not exercised by anything verified so far) - neither
+is part of "this line of work"'s filed-bug list. The two still-open,
+un-root-caused issues from Round 82/84 (the non-deterministic
+GET-path hang, and the separate process-won't-exit-after-success case,
+both suspected around idle keep-alive socket lifecycle) are unrelated
+to Blob and remain exactly as they were - not touched by this round.
