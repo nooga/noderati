@@ -9780,3 +9780,114 @@ a separate open question.
 **Verification**: no noderati code changed this round. The repro and
 its bisection ran entirely against a vanilla `paserati` checkout (no
 `go build`/test cycle on the noderati side was needed).
+
+## Round 84: paserati#394 pulled (fixes #393) - real undici's fetch() completes a full 6-step scenario end to end for the first time ever, including a POST with a real request body - one more real noderati gap found and fixed along the way (node:buffer missing Blob/File), one more paserati bug found and filed (#395), the Round 82 GET-path flake is still open
+
+Pulled paserati#394 (`5c498aa3` -> `7f3ef722`), which fixed #393
+(`TextEncoder.encode()` was returning a plain `Array` instead of a real
+`Uint8Array` - explaining the exact bisection table from that report:
+a plain `Array` has no `.byteLength`, so `if (chunk.byteLength) {
+controller.enqueue(chunk) }` always saw it as falsy) plus a second,
+deeper bug the maintainer found while verifying #393's own real-world
+fix end-to-end: top-level `await` was resuming immediately for an
+already-settled promise instead of always deferring through a
+microtask, letting an already-resolved `read()` jump ahead of an
+earlier-queued `queueMicrotask(() => controller.close())`. Verified
+both directly against the exact repros from #393's own report before
+doing anything else - the async-hang repro and the sync-drop repro both
+now produce the correct `false 2`, matching real Node.
+
+**Re-ran the full six-step stress probe** (`declareUndici()` disabled
+per the Round 77 trap) including `POST` for the first time since #393
+was filed. The `GET`/`BIG`/`JSON` portion still passed as before, but
+`POST` **still hung** - #393's own fix wasn't the whole story for the
+real undici path. Ran `POST` in isolation (a fresh single-request
+process, same technique as Round 82) and got a clean, different error
+this time instead of a hang: `TypeError: Right-hand side of 'instanceof'
+is not an object`, from undici's own `core/util.js#isBlobLike` (called
+from `bodyLength()`, itself called on every real request/response body
+size check - a real, unavoidable call site). Traced directly: undici
+does `const { Blob } = require('node:buffer')` at that file's own top
+level, then `object instanceof Blob` inside `isBlobLike`; noderati's
+own `node:buffer` module only ever exported `Buffer`, so the
+destructured `Blob` was `undefined`, and `x instanceof undefined`
+throws exactly this error regardless of what `x` is. `Blob` (and
+`File`) are both real, already-existing paserati globals - this was
+purely a wiring gap in this project's own module shim, not a paserati
+bug. Fixed directly in [buffer.go](../internal/host/buffer.go) (adds
+`Blob` to `node:buffer`'s exports) and
+[file_global.go](../internal/host/file_global.go) (adds `File` to the
+same exports map, alongside where the real global itself is built,
+mirroring `buffer.go`'s own addition) - confirmed directly against real
+Node (`node -e`) that `node:buffer` really does export both before
+writing the fix. New test:
+[`TestBufferModuleExportsBlobAndFile`](../internal/host/buffer_test.go).
+
+**With that fixed, the full six-step scenario completed end to end for
+the first time ever**: three sequential `GET`s, a 100KB body,
+`res.json()`, and - for the first time - a real `POST` with a request
+body, all in one process, printing `ALL DONE`. The `POST`'s response
+body was the real Go test server's own echo of the exact bytes sent
+(`method=POST body=hello-post-body`), confirming the request body
+genuinely reached the wire and back, not just that `fetch()` didn't
+throw.
+
+**One more real paserati bug found (not blocking anything tested so
+far, but worth recording and filing) while writing the regression
+test above**: the natural assertion to add,
+`new Blob(["hi"]) instanceof Blob`, is **false** - `new Blob(...)`
+doesn't produce a real `Blob` instance at all (wrong constructor,
+wrong `[[Prototype]]`, fails `instanceof`). Confirmed directly against
+real Node before concluding paserati was wrong, and confirmed it
+reproduces in vanilla `paserati` with no noderati involved. Filed as
+[paserati#395](https://github.com/nooga/paserati/issues/395). The
+regression test above was adjusted to check the actual real call site's
+shape instead (`"x" instanceof Blob` - a plain string, matching what
+`isBlobLike` is actually called with for every string-body request
+tested so far) rather than asserting something a separate, unrelated
+bug would make fail.
+
+**The Round 82 GET-path flake is still present, unresolved, and
+confirmed unrelated to anything fixed this round - and it's actually
+two distinct failure modes, not one.** Ran the full six-step probe 10
+times in a row: 7 completed cleanly, 3 hung - consistently right after
+`GET#2`, before `BIG` even starts, matching the exact pattern first
+seen in Round 82. This is the script *never finishing*: caught one live
+instance with a pprof goroutine dump showing the same signature as
+before (main goroutine parked in `WaitForExternalOp`, live idle socket
+reader/writer loops, nothing orphaned). Separately, a *different*
+failure was also caught once, in its own dedicated run: the script's
+own JS finished *successfully* (printed `ALL DONE` - every request,
+including `POST`, worked) but the *process* didn't exit afterward -
+that dump showed the main goroutine in `WaitForIdleProgress` instead of
+`WaitForExternalOp`, and re-running the identical scenario with a
+longer timeout let it complete cleanly in ~4 seconds with no changes
+made. These are two different symptoms ("work doesn't finish" vs. "work
+finished, process won't exit"), not one bug wearing two faces - grouping
+them would risk chasing a single repro that only ever explains one of
+them. (Also worth flagging honestly rather than silently: the GET#2
+hang rate measured 3-in-10 this round vs. ~1-in-8-to-10 in Round 82.
+Both `net.go`'s `extOpFinal` guard and everything in #394 landed in
+between, but n=10 is far too small to call that a regression - noted
+so a future round doesn't mistake sampling noise for a trend without
+re-measuring at a larger n first.) Neither failure mode has been
+reproduced in a minimal, undici-free repro yet - both remain real,
+open, unroot-caused issues for a future round, most plausibly related to
+idle keep-alive socket lifecycle/timing given the shape of both dumps,
+but not confirmed.
+
+**Status**: this is the milestone the whole Round 76 -> 84 chain has
+been building toward - real, unmodified undici's `fetch()` now
+genuinely works end-to-end against noderati for GET and POST requests
+alike, verified with actual response content (not just status codes),
+including a request body that round-trips correctly through a real Go
+HTTP server. The one remaining, real, and currently *un-owned* issue is
+the non-deterministic hang/slow-exit pattern around idle keep-alive
+sockets - present before this round, not caused by anything fixed here,
+and not yet reproduced minimally enough to file or fix with confidence.
+
+**Verification**: `go build ./...` clean. Full `internal/host` suite
+green (including the new `TestBufferModuleExportsBlobAndFile`), same
+pre-existing unrelated `TestEventsAddAbortListener` excluded.
+`declareUndici()` restored (was temporarily disabled for E2E probing,
+per the Round 77-documented trap).

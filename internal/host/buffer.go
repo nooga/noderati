@@ -68,6 +68,28 @@ func installBufferGlobal(p *driver.Paserati) {
 	exports := rec.GetExportValues()
 	exports["Buffer"] = ctor
 
+	// Blob was missing entirely from node:buffer's own exports - found
+	// the hard way while probing real undici's fetch() end to end
+	// (round 84, docs/real-node-plan.md): real undici's own
+	// core/util.js does `const { Blob } = require('node:buffer')`, then
+	// `object instanceof Blob` inside isBlobLike() - a real,
+	// unavoidable call on every request/response body-length check
+	// (bodyLength()), reachable the moment a real POST body is sent.
+	// With Blob undefined here, `x instanceof undefined` throws
+	// "Right-hand side of 'instanceof' is not an object" regardless of
+	// what x is - not something isBlobLike's own null/typeof guards
+	// could ever catch, since the broken reference is the right-hand
+	// side, not the value being tested. Blob itself is a real paserati
+	// core builtin (unlike Buffer, which this file builds), already a
+	// global by the time any host.go install* function runs, so this
+	// is just wiring the same real global into this module's own
+	// exports - matching real Node's own node:buffer, which re-exports
+	// Blob (and File - see file_global.go's own addition to this same
+	// exports map) alongside Buffer.
+	if blobVal, ok := vmInst.GetGlobal("Blob"); ok {
+		exports["Blob"] = blobVal
+	}
+
 	proto := vm.Undefined
 	if vmInst != nil {
 		proto = vmInst.ObjectPrototype
