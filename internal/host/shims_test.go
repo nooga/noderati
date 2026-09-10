@@ -21,18 +21,6 @@ func TestPerfHooksShim(t *testing.T) {
 	}
 }
 
-func TestStringDecoderShim(t *testing.T) {
-	p := New([]string{"noderati"})
-	p.SetSkipTypeCheck(true)
-	val, errs := p.RunCode(`
-		import { StringDecoder } from "node:string_decoder";
-		const d = new StringDecoder();
-		d.write("hi") + d.end()
-	`, driver.RunOptions{})
-	if len(errs) > 0 {
-		t.Fatalf("RunCode: %v", errs[0])
-	}
-	if val.ToString() != "hi" {
-		t.Errorf("StringDecoder = %q, want hi", val.ToString())
-	}
-}
+// StringDecoder's own tests moved to stringdecoder_test.go once it
+// became a real implementation (docs/real-node-plan.md) instead of a
+// JS-string shim that just did String(c) - see that file for coverage.

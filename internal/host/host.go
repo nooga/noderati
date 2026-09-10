@@ -139,7 +139,7 @@ func installModules(p *driver.Paserati) {
 	// findPackageDir's own real-Node-style walk-up already reaches these
 	// packages from wherever the importing file actually lives.
 	declarePerfHooks()
-	declareStringDecoder()
+	declareStringDecoder(p)
 	// typebox's own top-level entry (Type.Object etc.) was deleted
 	// 2026-09-02 (paserati#183 fixed, real package verified working via
 	// actual functional exercise — see docs/real-node-plan.md's Phase 3

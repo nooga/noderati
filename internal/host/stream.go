@@ -1,38 +1,26 @@
 package host
 
-const streamShim = `class EventEmitter {
-  constructor() {
-    this._events = Object.create(null);
-  }
-  on(event, listener) {
-    if (!this._events[event]) this._events[event] = [];
-    this._events[event].push(listener);
-    return this;
-  }
-  once(event, listener) {
-    const wrapper = (...args) => {
-      this.off(event, wrapper);
-      listener(...args);
-    };
-    return this.on(event, wrapper);
-  }
-  off(event, listener) {
-    return this.removeListener(event, listener);
-  }
-  removeListener(event, listener) {
-    const list = this._events[event];
-    if (!list) return this;
-    const i = list.indexOf(listener);
-    if (i >= 0) list.splice(i, 1);
-    return this;
-  }
-  emit(event, ...args) {
-    const list = this._events[event];
-    if (!list || list.length === 0) return false;
-    for (const fn of list.slice()) fn(...args);
-    return true;
-  }
-}
+const streamShim = `import EventEmitter from "events";
+
+// This used to hand-roll its own, separate class EventEmitter { ... }
+// here - a verbatim copy-paste of events.go's real one (down to the
+// same method set), which is exactly the "same thing implemented
+// twice" pattern docs/real-node-plan.md's ledger flagged (group A:
+// "stream.go also hand-rolls its own EventEmitter instead of reusing
+// events.go's - pick one"). Two copies didn't just duplicate code, they
+// silently drifted: events.go's own emit() was fixed to invoke every
+// listener with the emitter bound as its 'this' (real Node's own
+// behavior - see emitter.go's emitOnObject and the c8007e3 commit
+// fixing this for the Go-native EventEmitter object), but that fix
+// only ever touched events.go's copy - this file's own duplicate
+// emit() still called listeners with 'this' as undefined, a real,
+// silent behavioral divergence between "the EventEmitter you get from
+// require('events')" and "the EventEmitter every stream here actually
+// inherits from". Importing the real one instead - real Node's own
+// stream module itself does exactly this (Readable/Writable are built
+// on top of require('events')'s EventEmitter) - deletes the duplicate
+// and its drift risk in one move, and picks up that 'this'-binding fix
+// for free rather than needing its own separate copy of it.
 
 // push()/destroy()/[Symbol.asyncIterator] were missing entirely - found
 // the hard way while probing real undici's fetch() end to end (round 79,

@@ -130,6 +130,71 @@ func TestReadableDestroyIsReentrancySafe(t *testing.T) {
 	}
 }
 
+// TestStreamEventEmitterIsRealEventsClass confirms stream.go's
+// Readable/Writable/Transform now inherit from node:events' own real
+// EventEmitter (via `import EventEmitter from "events"`) rather than a
+// separate, hand-rolled duplicate class - the fix for
+// docs/real-node-plan.md's ledger note ("stream.go also hand-rolls its
+// own EventEmitter instead of reusing events.go's - pick one").
+// instanceof across the two modules only holds if they're genuinely
+// the same class object, not two separately-defined ones that happen
+// to share a method set.
+func TestStreamEventEmitterIsRealEventsClass(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { EventEmitter } from "node:events";
+		import { Readable, Writable, Transform } from "node:stream";
+
+		JSON.stringify({
+			readable: new Readable() instanceof EventEmitter,
+			writable: new Writable() instanceof EventEmitter,
+			transform: new Transform() instanceof EventEmitter,
+		})
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"readable":true,"writable":true,"transform":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestStreamEmitBindsThisToEmitter guards the specific behavioral
+// divergence the stream.go/events.go EventEmitter duplication caused
+// silently: events.go's own emit() was fixed to invoke listeners with
+// the emitter bound as `this` (real Node's own behavior, needed by real
+// undici's socket connect handler - see emitter.go's emitOnObject), but
+// that fix only ever touched events.go's copy of the class - stream.go
+// kept its own separate emit() that called listeners with a plain
+// function call, `this` left undefined. Now that stream.go imports the
+// real EventEmitter instead of duplicating it, a plain-function
+// listener registered on a Readable must see the stream itself as
+// `this`, exactly like a listener registered directly via
+// node:events' own EventEmitter would.
+func TestStreamEmitBindsThisToEmitter(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Readable } from "node:stream";
+
+		const r = new Readable();
+		let sawSelf = false;
+		r.on("data", function (chunk) {
+			sawSelf = this === r;
+		});
+		r.push("x");
+		sawSelf
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if !val.IsBoolean() || !val.AsBoolean() {
+		t.Errorf("listener's this !== the Readable emitter: %v", val)
+	}
+}
+
 // TestStreamTransformSubclassable drives the exact real requirement
 // found while probing undici: real undici's own
 // lib/web/eventsource/eventsource-stream.js does

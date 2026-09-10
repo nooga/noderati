@@ -32,9 +32,9 @@ actual Node module against Go stdlib or real logic, not another package's API:
 `buffer.go`, `packageimports.go`. This is the part of noderati worth being
 proud of and building on.
 
-**A-minus. Real builtin name, fake body — needs a real implementation, not
-deletion:** `string_decoder` (`stringdecoder.go` — `write()` just does
-`String(c)`, no actual UTF-8 multibyte/incremental decoding). `glob` was
+**A-minus (all closed).** `string_decoder` (`stringdecoder.go` — `write()`
+used to just do `String(c)`, no actual UTF-8 multibyte/incremental
+decoding) got a real implementation — Round 90, docs below. `glob` was
 listed here too (real npm surface, but `globSync` always returned `[]` —
 silently *wrong*, worse than missing) until it turned out, like
 `minimatch`, to need no from-scratch implementation at all: resolved the
@@ -43,9 +43,8 @@ group-B way instead, 2026-09-02 — deleted outright once
 real package's own blocker, real `node_modules` resolution now loads
 the genuine package (see Phase 3 below). `minimatch`'s equivalent fake
 went the same way, 2026-08-31.
-`stream.go` also hand-rolls its own `EventEmitter` instead of reusing
-`events.go`'s — pick
-one.
+`stream.go` also hand-rolled its own `EventEmitter` instead of reusing
+`events.go`'s — picked the real one, Round 90, docs below.
 
 **B. Third-party npm package fakes — delete the shim, load the real
 package.** These aren't Node surface at all; they're interceptions of specific
@@ -10382,3 +10381,117 @@ cherry-picked over after the fact, this one committed directly).
 'TestEventsAddAbortListener'`) green in ~9.2s, including the two new
 tests above and every pre-existing `fs/promises`-related test
 unchanged in behavior.
+
+## Round 90: two long-standing ledger items closed — `string_decoder` given a real implementation, `stream.go` de-duplicated onto the real `EventEmitter`
+
+Picked up the two remaining ledger group A/A-minus items from the
+"Where we actually are" section at the user's direction, now that the
+real-undici/WebAssembly investigation (Rounds 69–89) is fully closed
+out with nothing left blocking.
+
+**`string_decoder` (`stringdecoder.go`) was a complete fake**: the
+whole module was a JS-string shim whose `write(c)` just did
+`String(c)` and `end()` always returned `""` — not a decoder at all.
+Real Node's `StringDecoder` exists specifically to decode a byte
+stream arriving in arbitrary chunks (socket reads, in particular)
+correctly even when a multi-byte character is split across two
+chunks — buffering an incomplete trailing sequence from one `write()`
+and completing it with the next call's leading bytes, rather than
+mangling a split character into replacement-character garbage
+mid-stream. The old fake did none of this — no buffering, no real
+decode, just a stringify.
+
+**Fix**: rewrote `string_decoder.go` as a real Go-backed module (was
+already how `fs.go`/`crypto.go`/`url.go` work — this one had just never
+gotten the same treatment). `StringDecoder` is a real `m.Class` backed
+by a `*stringDecoder` struct (`vmInst`, normalized `encoding`, a
+`pending []byte` buffer), constructed via `newStringDecoder(vmInst)`
+closing over the VM the same way `vm.go`'s `newVMScript`/`url.go`'s
+`newJSURL` do. `Write`/`End` extract real bytes via `valueToBytes`
+(`net.go`, already shared by `fs.go`'s `writeFileSync`/`appendFileSync`
+for the same string-or-real-bytes distinction), buffer per-encoding:
+- **utf8** (and `ucs2`/`utf16le`, which `normalizeBufferEncoding`
+  already collapses to utf8 — matching `Buffer.prototype.toString()`'s
+  own established simplification rather than inventing a separate,
+  better utf16 path just for this module): a new `utf8SplitIncomplete`
+  helper mirrors real Node's own `lib/string_decoder.js` algorithm —
+  look back up to 3 trailing bytes for the lead byte of a
+  possibly-truncated sequence, hold back only the genuinely incomplete
+  tail. 3 trailing continuation bytes with no lead byte found among
+  them is *not* incomplete — it can only be the tail of an
+  already-complete 4-byte sequence (UTF-8's longest), whose lead byte
+  is the 4th-from-last.
+- **base64**: buffered to whole multiples of 3 raw bytes (a 4-character
+  group) — encoding early on a non-multiple-of-3 byte count would emit
+  a premature `=` padding character mid-stream.
+- **hex/latin1/binary/ascii**: never buffered — one input byte always
+  maps to a fixed number of output characters for these, so every
+  `write()` can encode immediately.
+`End` always flushes whatever's pending (plus an optional final
+chunk), matching real Node: nothing is held back once the caller says
+there's no more data coming.
+
+**`stream.go` hand-rolled its own, separate `class EventEmitter`**,
+byte-for-byte the same method set as `events.go`'s real one — the
+exact "same thing implemented twice" the ledger flagged. This wasn't
+just duplication for its own sake: it had already silently drifted.
+`events.go`'s own `emit()` was fixed at some point (commit `c8007e3`)
+to invoke every listener with the emitter bound as its `this`
+(real Node's own behavior — real undici's socket connect handler
+relies on exactly this, per `emitter.go`'s own `emitOnObject` doc
+comment), but that fix only ever touched `events.go`'s copy —
+`stream.go`'s duplicate `emit()` still called listeners with `this` as
+`undefined`, a real, silent behavioral divergence between "the
+EventEmitter you get from `require('events')`" and "the EventEmitter
+every stream in this codebase actually inherits from."
+
+**Fix**: `stream.go` now does `import EventEmitter from "events"` and
+deletes its own copy entirely — matching real Node's own architecture
+(`Readable`/`Writable` are themselves built on top of
+`require('events')`'s `EventEmitter`), and picking up the `this`-
+binding fix for free instead of needing a second copy of it.
+
+**A real latent bug this surfaced, fixed along the way**: making
+`stream.go` import `EventEmitter` from `"events"` and testing
+`new Readable() instanceof EventEmitter` (where the `EventEmitter` on
+the right-hand side came from a separate `import ... from
+"node:events"`) came back `false` — two textually-identical
+`class EventEmitter` bodies, evaluated as two *separate* modules, are
+two different class objects with no `instanceof` relationship. Root
+cause: `JSShimResolver.Resolve` (`shim.go`) built each shim's
+`ResolvedPath` (the module registry's real cache/identity key, per
+`pkg/driver`) directly from the specifier string, so `"events"` and
+`"node:events"` — real Node's own plain alias pair for the identical
+built-in module — resolved to two different cache entries and got
+independently evaluated. Fixed by canonicalizing the `node:` prefix
+away before building `ResolvedPath`, so both specifier forms now share
+the same cached module instance, matching real Node's actual `node:`
+prefix semantics for every JS-shim module this resolver serves, not
+just `events`/`stream`.
+
+**New tests**:
+[`stringdecoder_test.go`](../internal/host/stringdecoder_test.go) (new
+file — the old fake's one test moved from `shims_test.go`, which now
+just documents where it went): ASCII round trip, a 3-byte UTF-8
+character split across two writes, a 4-byte character split three
+ways (specifically exercising the "3 trailing continuation bytes, no
+lead found" branch), `end()` flushing a truncated tail, hex never
+buffering across writes, base64 buffering to groups of 3 (checked
+against Go's own `encoding/base64` for the same bytes), and a real
+`Uint8Array` argument to `write()`. In
+[`stream_test.go`](../internal/host/stream_test.go):
+`TestStreamEventEmitterIsRealEventsClass` (the `instanceof` check that
+surfaced the `ResolvedPath` bug above) and
+`TestStreamEmitBindsThisToEmitter` (a plain-function listener on a
+`Readable` sees the stream itself as `this`).
+
+**Verification**: `go build ./...`/`go vet ./...` clean. Full
+`internal/host` suite (`go test ./internal/host/... -skip
+'TestEventsAddAbortListener'`) green in ~9.7s, including all new tests
+above and every pre-existing `stream`/`string_decoder`/JS-shim-related
+test (`perf_hooks`, `zlib`, `dns`, `console`, `async_hooks`, ...)
+unchanged in behavior — the `ResolvedPath` canonicalization touches
+every module `registerJSShim` serves, not just `events`/`stream`, so
+the full suite (not just the two directly-touched files' tests) is
+what actually confirms nothing else depended on the old
+per-specifier-instance behavior.
