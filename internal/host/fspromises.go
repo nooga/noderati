@@ -11,16 +11,27 @@ import (
 func declareFSPromises(p *driver.Paserati) {
 	vmInst := p.GetVM()
 	p.DeclareModule("fs/promises", func(m *driver.ModuleBuilder) {
-		m.AsyncFunction("readFile", func(path string, _ ...interface{}) (string, error) {
+		m.AsyncFunction("readFile", func(path string, opts ...interface{}) (vm.Value, error) {
 			fsTouch("read", path)
 			b, err := os.ReadFile(path)
 			if err != nil {
-				return "", wrapFsErr(vmInst, "open", path, err)
+				return vm.Undefined, wrapFsErr(vmInst, "open", path, err)
 			}
-			return string(b), nil
+			// Same fix as fs.go's readFileSync (Round 88,
+			// docs/real-node-plan.md): real Node's fs.promises.readFile
+			// returns a Buffer by default, only decoding to a string
+			// when an explicit encoding was given.
+			encoding, hasEncoding := fsReadEncoding(opts)
+			if !hasEncoding {
+				return wrapBuffer(vmInst, b), nil
+			}
+			return vm.NewString(encodeBufferBytes(b, encoding)), nil
 		})
-		m.AsyncFunction("writeFile", func(path string, data string, _ ...interface{}) (interface{}, error) {
-			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, []byte(data), 0644))
+		m.AsyncFunction("writeFile", func(path string, data vm.Value, _ ...interface{}) (interface{}, error) {
+			// Same fix as fs.go's writeFileSync: accept a real
+			// Buffer/TypedArray `data` argument (not just a string) and
+			// write its raw bytes.
+			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, valueToBytes(vmInst, data), 0644))
 		})
 		m.AsyncFunction("mkdir", func(path string, opts map[string]interface{}) (interface{}, error) {
 			mkdirFn := os.Mkdir

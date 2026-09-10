@@ -10334,3 +10334,51 @@ inline.
 'TestEventsAddAbortListener'`) green in ~8.6s, including the four new
 tests above and every pre-existing `fs`-related test unchanged in
 behavior.
+
+## Round 89: the Round 88 follow-up closed - `fs/promises`' `readFile`/`writeFile` fixed identically
+
+Closed the one item Round 88 explicitly left out of scope: `fs/promises`'
+own `readFile`/`writeFile`
+([fspromises.go](../internal/host/fspromises.go)) had the exact same bug
+pattern as the sync API Round 88 fixed - `readFile` always ran raw bytes
+through Go's `string(b)` regardless of an encoding argument, and
+`writeFile` took `data string`, silently mis-stringifying a real
+Buffer/Uint8Array argument instead of writing its raw bytes.
+
+**Fix**, identical in shape to Round 88's: `readFile` now takes
+`(path string, opts ...interface{}) (vm.Value, error)` and reuses
+`fsReadEncoding` (`fs.go`) to decide between `wrapBuffer(vmInst, b)` (no
+encoding - the real Node default) and `encodeBufferBytes` into a string
+(encoding given). `writeFile` now takes `data vm.Value` and extracts
+bytes via `valueToBytes` (`net.go`), same as `writeFileSync`. Both are
+declared with `m.AsyncFunction`, which shares the same underlying
+Go-value/`vm.Value` conversion path as `m.Function` (confirmed by
+reading `pkg/driver/native_module.go`'s `goFunctionToVM`/
+`wrapNativeAsAsync`), so the `vm.Value`-typed parameter and return
+work identically to their sync counterparts - no separate conversion
+logic needed.
+
+**New tests** in
+[`fspromises_test.go`](../internal/host/fspromises_test.go), mirroring
+Round 88's `fs_test.go` additions one for one:
+`TestFSPromisesReadFileDefaultsToBuffer` (full 0-255 byte round-trip
+through `readFile()` with no encoding, checking
+`Buffer.isBuffer`/`instanceof Uint8Array`/byte-for-byte match) and
+`TestFSPromisesWriteFileAcceptsBuffer` (writes the full 256-byte range
+via `writeFile` given a real `Buffer`, reads it back with `readFile`'s
+own Buffer default). The pre-existing `TestFSPromisesReadWrite` was
+updated to pass `"utf8"` explicitly, same reasoning as Round 88's
+`TestFSWriteReadRoundtrip` update - it checks `readFile`'s resolved
+value directly via `val.ToString()` rather than through a JS
+expression that would coerce it anyway.
+
+**Branch note**: this and Round 88's commit were originally made on
+`feat/375-webassembly-wazero`, which by this round had already been
+merged and closed - both landed on `main` instead (Round 88's commit
+cherry-picked over after the fact, this one committed directly).
+
+**Verification**: `go build ./...`/`go vet ./...` clean. Full
+`internal/host` suite (`go test ./internal/host/... -skip
+'TestEventsAddAbortListener'`) green in ~9.2s, including the two new
+tests above and every pre-existing `fs/promises`-related test
+unchanged in behavior.
