@@ -131,6 +131,29 @@ type socketState struct {
 	// Round 76/77) before writing this fix.
 	extRT       runtime.AsyncRuntime
 	extOpActive bool
+	// extOpFinal is set exactly once, inside endTrackedExternalOp().
+	// Found by code inspection (round 82, docs/real-node-plan.md) while
+	// investigating a real-undici E2E hang - NOT itself confirmed to be
+	// the cause of that hang; a live pprof goroutine dump taken during
+	// that specific hang showed every socket's reader/writer loops
+	// still genuinely alive and idle, not orphaned, so this gap wasn't
+	// what was actually observed there. It's a real, separate hole,
+	// defensible on its own: setExternalOpActive's active/inactive
+	// flip-flop is only balanced for unref()/ref() sequences that land
+	// *while the connection is still alive*. The one goroutine that
+	// ever calls endTrackedExternalOp() (doNetConnect/doTLSConnect's
+	// `go func() { wg.Wait(); s.endTrackedExternalOp() }()`) runs
+	// exactly once, when the reader+writer loops actually finish. A
+	// ref() call landing *after* that goroutine has already released
+	// its EndExternalOp (e.g. a pool tries to reuse a connection just
+	// as it's dying) would otherwise issue a fresh BeginExternalOp()
+	// that nothing remains alive to ever match with an EndExternalOp() -
+	// a real, if not yet directly observed, leak of the pending-op
+	// count. extOpFinal closes that window: once the one-shot teardown
+	// has run, every later ref() is a permanent no-op, matching what
+	// real Node does anyway (ref()/unref() on an already-destroyed
+	// socket has no observable effect).
+	extOpFinal bool
 }
 
 // beginTrackedExternalOp records that the caller (doNetConnect/
@@ -159,6 +182,18 @@ func (s *socketState) setExternalOpActive(active bool) {
 	if s.extRT == nil || s.extOpActive == active {
 		return
 	}
+	// A ref() (active=true) arriving after the one-shot teardown
+	// goroutine already ran must not issue a fresh BeginExternalOp() -
+	// see the extOpFinal field comment above for why: nothing is left
+	// alive to ever call the matching EndExternalOp(), which would leak
+	// the pending-op count and hang DrainUntilIdle forever. A late
+	// unref() (active=false) is always safe to let through as a no-op
+	// here - extOpActive is already false past teardown (endTracked-
+	// ExternalOp sets it), so the s.extOpActive == active check above
+	// already short-circuits that case.
+	if active && s.extOpFinal {
+		return
+	}
 	s.extOpActive = active
 	if active {
 		s.extRT.BeginExternalOp()
@@ -170,9 +205,14 @@ func (s *socketState) setExternalOpActive(active bool) {
 // endTrackedExternalOp is called exactly once, when the connection's own
 // writer+reader goroutines actually finish, to release whichever
 // external-op registration is still outstanding - a no-op if unref()
-// already released it earlier.
+// already released it earlier. Also latches extOpFinal so any ref()
+// call arriving after this point can never re-open a registration that
+// nothing remains alive to close.
 func (s *socketState) endTrackedExternalOp() {
 	s.setExternalOpActive(false)
+	s.mu.Lock()
+	s.extOpFinal = true
+	s.mu.Unlock()
 }
 
 func newSocketState(hwm int) *socketState {
