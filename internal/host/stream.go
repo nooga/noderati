@@ -75,6 +75,7 @@ class Readable extends EventEmitter {
     this._error = null;
     this._waiters = [];
     this._disturbed = false;
+    this.destroyed = false;
   }
   _settleWaiters() {
     while (this._waiters.length && (this._queue.length || this._ended || this._error)) {
@@ -102,6 +103,30 @@ class Readable extends EventEmitter {
     return true;
   }
   destroy(err) {
+    // Missing re-entrancy guard - found the hard way while stress-
+    // testing real undici's fetch() past its first success (round 81,
+    // docs/real-node-plan.md): real undici's own onError(error) handler
+    // does "this.body?.destroy(error)" AND is itself registered as an
+    // 'error' listener on that same body ("this.body.on('error',
+    // onError)") - a real, unavoidable pairing, not a hypothetical one.
+    // Without this guard, every destroy(err) call unconditionally
+    // re-emitted 'error', which re-invoked onError, which called
+    // destroy(err) again - genuine infinite recursion, a VM stack
+    // overflow that (unlike a caught JS exception) never actually
+    // stopped script execution on its own. Real Node's own
+    // Readable.destroy() has exactly this guard (a destroyed flag
+    // that makes every call after the first a no-op for emission
+    // purposes) for precisely this reason - a stream's own error/close
+    // handling calling destroy() again on an already-destroyed stream
+    // is a normal, expected pattern, not misuse.
+    //
+    // Only this class (Readable) has a destroy() at all - Writable and
+    // Transform don't define one here. Real undici's own onError only
+    // ever calls it on a response body, which is always a Readable, so
+    // that's not a gap this round hit - noted for whoever adds one to
+    // either of those classes next: match this same guard.
+    if (this.destroyed) return this;
+    this.destroyed = true;
     if (err) {
       this._error = err;
       this.emit("error", err);

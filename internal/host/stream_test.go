@@ -90,6 +90,46 @@ func TestStreamPipelineRejectsOnError(t *testing.T) {
 	}
 }
 
+// TestReadableDestroyIsReentrancySafe guards the exact real shape
+// found while stress-testing real undici's fetch() past its first
+// success (round 81, docs/real-node-plan.md): real undici's own
+// lib/web/fetch/index.js registers a body's own error handler as
+// "this.body.on('error', onError)", where onError itself calls
+// "this.body.destroy(error)" - so destroy(err) is expected to be
+// called again from within a listener that its own first call to
+// destroy() invoked. Without a re-entrancy guard, destroy(err)
+// unconditionally re-emits 'error' every time it's called, which
+// re-invokes the same listener, which calls destroy(err) again -
+// genuine infinite recursion (a VM stack overflow that, unlike a
+// caught JS exception, never stopped script execution on its own).
+func TestReadableDestroyIsReentrancySafe(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Readable } from "node:stream";
+
+		const r = new Readable();
+		let errorCount = 0;
+		let closeCount = 0;
+		r.on("error", (err) => {
+			errorCount++;
+			// Real undici's own pattern: the 'error' listener itself
+			// calls destroy() again on the same stream.
+			r.destroy(err);
+		});
+		r.on("close", () => { closeCount++; });
+		r.destroy(new Error("boom"));
+		JSON.stringify({ errorCount, closeCount, destroyed: r.destroyed })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"errorCount":1,"closeCount":1,"destroyed":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
 // TestStreamTransformSubclassable drives the exact real requirement
 // found while probing undici: real undici's own
 // lib/web/eventsource/eventsource-stream.js does
