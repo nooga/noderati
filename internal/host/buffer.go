@@ -458,6 +458,26 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 		props.Properties.SetOwn("isBuffer", isBufferFn)
 		props.Properties.SetOwn("byteLength", byteLengthFn)
 		props.Properties.SetOwn("concat", concatFn)
+		// Buffer.prototype's [[Prototype]] was reparented onto
+		// Uint8Array.prototype above (instance-side inheritance - real
+		// indexed access, iteration, toBase64/fromHex, etc.), but the
+		// *constructor's own* [[Prototype]] (the static side: real
+		// Node's `Object.getPrototypeOf(Buffer) === Uint8Array`) was
+		// never set, leaving Buffer statically parentless. A native
+		// function-with-props' static [[Prototype]] lives on its own
+		// Properties table (see pkg/vm/proto.go's TypeNativeFunctionWithProps
+		// case - GetPrototypeOf reads nfp.Properties.GetPrototype()), so
+		// this is the one call needed. Found the hard way: real undici's
+		// client-h1.js reads `Buffer[Symbol.species]` directly
+		// (`const FastBuffer = Buffer[Symbol.species]`) - paserati's
+		// Symbol.species accessor lives on %TypedArray% and is reached
+		// via static inheritance (paserati#381/#383), so without this,
+		// Buffer[Symbol.species] stayed undefined even after #383
+		// landed, and `new FastBuffer(...)` inside a real wasm host
+		// callback threw "undefined is not a constructor" - confirmed
+		// directly via a live real-undici E2E trace before writing this
+		// (docs/real-node-plan.md, Round 79).
+		props.Properties.SetPrototype(uint8ArrayCtorVal)
 	}
 	bufferProto.SetOwnNonEnumerable("constructor", ctor)
 

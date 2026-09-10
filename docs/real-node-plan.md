@@ -9079,3 +9079,185 @@ above) except the same pre-existing, unrelated
 undici copy under the scratchpad used for tracing was diffed back to
 byte-identical with its pre-instrumentation copy before being discarded
 (it was never part of this repo to begin with).
+
+## Round 79: paserati#381 pulled (Symbol.species, via #383) - Buffer's static prototype chain and setImmediate fixed, parser now completes a full response - blocked next on a new engine bug, paserati#384 (filed)
+
+Picked back up exactly where Round 78 left off: paserati#381
+(`Symbol.species` entirely unimplemented on any built-in constructor)
+was fixed upstream by a large merged PR,
+[paserati#383](https://github.com/nooga/paserati/issues/383)
+(`79bcb5fc`), which also fixed subclass static-prototype propagation,
+an `instanceof Function` gap, and Promise resolution/thenable
+assimilation along the way. Pulled the sibling checkout, confirmed
+directly before proceeding: `Uint8Array[Symbol.species] ===
+Uint8Array` now holds and `new FastBuffer(new ArrayBuffer(8), 0, 4)` no
+longer throws in vanilla paserati.
+
+**First surprise: `Buffer[Symbol.species]` was still `undefined` after
+the upstream fix landed.** Not a paserati regression - root-caused
+directly (not assumed) by inspecting `Buffer.__proto__`, which was an
+anonymous function, not `Uint8Array`. `buffer.go` had only ever wired
+the *instance*-side prototype chain (`Buffer.prototype.__proto__ =
+Uint8Array.prototype`, from an earlier round); the *constructor's own*
+static `[[Prototype]]` (real Node's `Object.getPrototypeOf(Buffer) ===
+Uint8Array`) was never set, so `Symbol.species` - inherited via static,
+not instance, prototype chain - had nothing to inherit from. Fixed with
+one call once the right paserati API was found by reading
+`pkg/vm/proto.go`'s `TypeNativeFunctionWithProps` case:
+`props.Properties.SetPrototype(uint8ArrayCtorVal)` on the constructor's
+own `Properties` table (see [buffer.go](../internal/host/buffer.go)).
+Verified directly (`Buffer.__proto__ === Uint8Array` now `true`) before
+moving on.
+
+Worth recording precisely because it's a deliberate non-fix: real
+Node's actual `Buffer[Symbol.species]` is an internal, non-exported
+`FastBuffer extends Uint8Array` class (confirmed directly against real
+Node), not `Buffer` itself. After this fix, noderati's `Buffer`
+inherits the default `%TypedArray%[Symbol.species]` getter (`return
+this`), so `Buffer[Symbol.species] === Buffer` - a known, real semantic
+gap from Node, left open rather than patched, because the actual real
+undici call site (`new FastBuffer(arrayBuffer, offset, length)`, which
+resolves to `new Buffer(...)` under this divergence) was confirmed
+empirically to work fine for the real E2E trace below. Patching this to
+fake a `FastBuffer`-shaped species was considered and rejected for the
+same reason Round 78 rejected doing so before #381 was even filed:
+guessing at a plausible-looking value without a real call site forcing
+the exact right shape risks a subtler break later.
+
+**Second gap: `setImmediate`/`clearImmediate` didn't exist as globals
+at all.** Genuinely absent from paserati (confirmed via grep - unlike
+`setTimeout`/`clearTimeout`, which come from paserati's own
+`HostTimerInitializer`, no such global existed anywhere). Found because
+real undici's `client-h1.js` calls the bare global
+`setImmediate(() => client[kResume]())` directly and unconditionally
+from `onMessageComplete()`, once a response finishes parsing - a real,
+unavoidable call site, reachable for the first time only once the
+Buffer fix above let parsing complete at all. Implemented in the new
+[immediate_object.go](../internal/host/immediate_object.go) on top of a
+paserati primitive that already existed but noderati had never used:
+`AsyncRuntime.ScheduleMacrotask()`/`RunMacrotasks()`, already driven by
+`DrainUntilIdle` internally. `clearImmediate()` uses the standard
+cancelled-flag technique, since `ScheduleMacrotask` has no native
+cancel. `timers.go`'s `node:timers` shim now re-exports both real
+functions instead of the stale gap it used to document. Two new tests
+in
+[immediate_object_test.go](../internal/host/immediate_object_test.go)
+guard the callback/args/cancellation contract without over-pinning the
+one ordering real Node itself doesn't guarantee outside an I/O callback
+(`setTimeout(fn,0)` vs `setImmediate()` from top-level scope) - the
+first version of this test asserted an exact interleaving and failed
+nondeterministically for exactly that reason; rewritten once diagnosed
+to assert only what's actually guaranteed.
+
+**Third gap, found immediately after: `Readable.push()`/`destroy()`/
+`[Symbol.asyncIterator]` didn't exist on this codebase's own
+`stream.js` shim's `Readable`.** Real undici's own
+`lib/web/fetch/index.js` builds every fetch() response body as `new
+Readable({ read: resume })`, pushes bytes into it directly from the
+dispatch handler's `onData`/`onComplete` callbacks
+(`this.body.push(bytes)` / `this.body.push(null)`), and consumes it via
+`body[Symbol.asyncIterator]()` - all real, unavoidable call sites, not
+hypothetical ones. Implemented the standard queue+waiters pattern for a
+push-driven async iterator in [stream.go](../internal/host/stream.go):
+`push()` either hands a chunk straight to a parked `next()` or buffers
+it; `next()` returns a buffered chunk immediately or parks a Promise.
+`'data'`/`'end'` still fire unchanged, so `pipe()` keeps working.
+Deliberately not wired: the constructor's `read` option (real Node's
+pull-based backpressure hook) - every real body exercised so far pushes
+its entire content synchronously before anything awaits a chunk, so
+there's never yet been a real gap to pull against; flagged honestly as
+a known limit rather than glossed over.
+
+**Verified against the real thing**: with `declareUndici()` disabled
+per the Round 77 trap and a fresh, unmodified real undici@7.11.0
+(`client-h1.js` traced via temporary `console.error` instrumentation,
+restored byte-identical afterward - confirmed via `diff` against the
+saved pre-instrumentation copy), the same repro that's been climbing
+one layer per round since Round 76 got further than ever before: full
+response parsing now genuinely completes -
+`onHeadersComplete(200, false, true)` -> `onBody(len=49)` ->
+`onMessageComplete()` -> `llhttp_execute returned 0` - the first time
+in this entire investigation chain that a real HTTP response has been
+fully parsed end-to-end by real undici's own wasm llhttp against
+noderati.
+
+**The next blocker: a genuine Go-level VM panic, not a JS-catchable
+exception.** Immediately after the parse completed,
+`events.go`'s own `EventEmitter.emit()` shim
+(`for (const fn of list.slice()) fn.call(this, ...args);`, reached from
+`onMessageComplete`'s listener dispatch) crashed the interpreter:
+```
+[VM PANIC] recovered: runtime error: index out of range [143] with length 35
+```
+recovered by the VM's own top-level `recover()` at `pkg/vm/vm.go:1591`,
+originating at `pkg/vm/vm.go:1818`. This is a qualitatively different
+class of bug from every other finding in this whole investigation - a
+Go-level crash inside the interpreter (recovered, not a catchable JS
+`TypeError`), in a frame with `RegisterSize=35`, crashing during the
+for-of loop's exception-cleanup path (`OpIteratorCleanupAbrupt`/
+`OpHandlePending`, `Handler 0: TryStart=155, TryEnd=189, HandlerPC=197`).
+
+Rather than guess at the cause from this one large, deeply-nested
+trace, isolated it methodically per advisor review, minimizing one
+variable at a time until only the essential shape remained:
+- A `for...of` + `.call(this, ...args)` + throwing-listener repro,
+  first tried standalone in vanilla paserati - propagated as a normal
+  catchable `PS4001 VM exception`, no panic, no swallow. Not it alone.
+- The same shape wrapped in an outer `try/catch` and driven through
+  `setImmediate` (matching the real call chain's Go->VM re-entry via
+  `vmInst.Call` from a macrotask closure) - the `catch` block never
+  ran, and *nothing* printed afterward: no panic, no exit code, no
+  error, just silent truncation of everything after the throw.
+- Reproduced identically via plain `Promise.resolve().then(...)`
+  instead of `setImmediate` - ruling out anything specific to this
+  round's own new `setImmediate` implementation.
+- Reproduced identically in vanilla `paserati -no-typecheck`, no
+  noderati involved at all.
+- Stripped the `for...of` loop entirely, then the microtask/Promise
+  context entirely - both fell away without affecting the outcome.
+- Landed on a 6-line minimal repro: a bare top-level `try { fn.call(null,
+  ...args); } catch (e) { ... }`, where `fn` throws and `args` is a
+  spread array, **never enters the `catch` block at all** - the
+  exception escapes past a handler whose try-range provably contains
+  the throwing call site (confirmed directly from the `-bytecode`
+  dump's own exception table). Bisected the exact trigger by toggling
+  one dimension at a time: `.call(null)` (no args), `.call(null, 1)`
+  (literal arg), `.apply(null, args)` (spread via apply instead of
+  call), and `obj.method(...args)` (spread method call, non-`.call`
+  form) **all catch correctly** - only the `.call(receiver,
+  ...spreadArgs)` combination specifically breaks. Checked for a #383
+  regression by checking out the commit immediately before it
+  (`c6a66eda`) and rebuilding: reproduces there too, so this is a
+  longstanding, pre-existing engine bug, not something #383 introduced.
+
+Filed as
+[paserati#384](https://github.com/nooga/paserati/issues/384) with the
+minimal repro, the full bisection table, the bytecode/exception-table
+evidence, and a flagged (not asserted) hypothesis connecting it to the
+larger Go panic: both involve `OpSpreadCallMethod` throwing from inside
+a call reached via this opcode, inside a live try range; the minimal
+repro's smaller frame just skips the handler cleanly where the larger,
+more complex real-world frame (for-of iterator state, abrupt-completion
+cleanup) apparently corrupts a register index instead. Not asserted as
+proven, since the panic hasn't itself been minimized to the same degree
+- flagged honestly as a plausible shared root cause for the maintainer
+to weigh, not stated as fact.
+
+**Status**: real undici's own parser now genuinely completes a full
+response parse against noderati for the first time ever, closing the
+Readable-protocol and Symbol.species gaps this whole chain (Round 76 ->
+77 -> 78 -> 79) has been peeling one layer at a time. Full real-undici
+`fetch()` end-to-end remains blocked, now on paserati#384
+(`.call()`+spread exception-handling bug), a clean, filed,
+upstream-owned blocker exactly like #302/#372/#377/#381 before it. Not
+pursued further this round - isolating and filing #384 was this
+round's actual scope.
+
+**Verification**: `go build ./...` clean. Full `internal/host` suite
+green (including the two new `setImmediate` tests) except the same
+pre-existing, unrelated `TestEventsAddAbortListener`.
+`declareUndici()` restored (was temporarily disabled for E2E probing,
+per the Round 77-documented trap); the vendored undici copy under the
+scratchpad used for tracing was diffed back to byte-identical with its
+pre-instrumentation copy before being discarded (it was never part of
+this repo to begin with).

@@ -28,6 +28,7 @@ func New(argv []string) *driver.Paserati {
 	installDOMExceptionGlobal(p)
 	installPromiseWithResolvers(p)
 	installQueueMicrotask(p)
+	installSetImmediate(p)
 	installTimeoutObjects(p)
 	installAssertGlobal(p)
 	installWorkerThreadsExports(p)
