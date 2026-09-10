@@ -9413,3 +9413,157 @@ led to) was this round's actual scope.
 green, same pre-existing unrelated `TestEventsAddAbortListener`
 excluded. `declareUndici()` restored (was temporarily disabled for E2E
 probing, per the Round 77-documented trap).
+
+## Round 81: paserati#388 pulled (fixes #386/#387) - real undici's fetch() works end to end for the first time ever - a new, high-impact engine bug found on the very next probe, paserati#389 (filed)
+
+[paserati#388](https://github.com/nooga/paserati/issues/388) merged,
+fixing both #386 (`new TypedArray(otherTypedArray)` always zero-length)
+and #387 (`JSON.stringify(typedArray)` always `null`) in one PR. Pulled
+the sibling checkout (`0522531c` -> `07014ab3`) and verified both fixes
+directly against last round's own stored minimal repros before doing
+anything else - both now produce the exact expected output.
+
+**Re-ran the standing E2E probe** (`declareUndici()` disabled per the
+Round 77 trap, real unmodified undici@7.11.0) against the local Go test
+server: **`STATUS=200` and the correct response body text** - real
+undici's own `fetch()` now works end-to-end against noderati, for the
+first time in this entire investigation chain (Round 76 -> 77 -> 78 ->
+79 -> 80 -> 81). Every layer this chain has peeled - the Readable
+push-protocol gap, `Symbol.species`, the `.call(...spread)`
+exception-routing bug, the body-read guards, the typed-array-copy
+constructor - was a real, necessary link in the same chain; this is the
+first round where the chain actually completed for a basic request.
+
+**Immediately stress-tested rather than declaring victory on one
+request**: wrote a script covering repeated `GET`s, a 100KB body,
+`res.json()`, and a `POST` with a request body, all against the same
+test server. Execution never reached past the third call in that
+script, though - correcting an overstatement in an earlier draft of
+this entry: only the first two repeated `GET`s are what actually ran
+and succeeded (identically to the first probe) before the third request
+triggered a genuine **new bug** - a VM stack overflow, thousands of
+frames deep, every frame named `clearTimeout` at the exact same source
+line (undici's own `lib/util/timers.js:361`). The 100KB body,
+`res.json()`, and `POST`-with-body cases were written but not yet
+exercised by that run; each is a distinct code path that could hide its
+own blocker the same way `isDisturbed`/#386/#389 each hid behind the
+one before it, so none of the three should be assumed clear until
+checked directly (they are, below).
+
+**Traced (not assumed) straight to the real source line**, then
+isolated methodically rather than guessed at:
+
+```js
+// undici's own lib/util/timers.js, module.exports:
+clearTimeout (timeout) {
+  if (timeout[kFastTimer]) {
+    timeout.clear()
+  } else {
+    clearTimeout(timeout) // intends the OUTER/global clearTimeout
+  }
+}
+```
+
+This is an ES6 object-literal **shorthand method** named `clearTimeout`
+whose body calls the bare identifier `clearTimeout` as a deliberate
+fallback to the real global timer function - a shorthand method has no
+self-binding by spec (unlike a *named* function expression, which
+does), so this bare reference should skip right past this method and
+reach the actual global. Reproduced the exact shape standalone in
+vanilla `paserati`, no undici/noderati involved:
+
+```js
+function foo(x) { return "outer foo called with " + x; }
+const obj = { foo(x) { return foo(x); } }; // should call the OUTER foo
+obj.foo(42); // hangs - infinite recursion into itself instead
+```
+
+Bisected against the two other property-value forms that could
+plausibly carry the same self-binding behavior: a regular (non-arrow,
+non-shorthand) `function` expression assigned as a property value, and
+an arrow function assigned as a property value. Both correctly throw
+`ReferenceError: foo is not defined` when no real outer `foo` exists -
+proving the compiler does *not* generally invent a self-binding for a
+property's own name in those forms. Only the ES6 shorthand-method
+syntax specifically does it wrongly. Filed as
+[paserati#389](https://github.com/nooga/paserati/issues/389) with the
+full bisection and the real undici call site - flagged as likely to
+affect other real npm packages too, since "a shorthand method that
+falls back to an outer/global function of the same name" (exactly
+undici's own pattern here) is a common, unremarkable idiom, not
+something unusual to this one file.
+
+**Checked the three not-yet-exercised cases directly** (per advisor
+review of an earlier draft, rather than leaving them as an assumption):
+ran `/big`, `/json`, and the `POST`-with-body case each as its own
+single-request process (isolating them from whatever accumulated state
+across requests made `clearTimeout`'s bad branch reachable only on the
+third `GET`). `/big` and `/json` didn't just avoid #389's bad branch -
+they hit a **second, different infinite recursion**, this time
+genuinely noderati's own bug, not paserati's: a VM stack overflow with
+every frame alternating `emit` -> `destroy` -> `onError`. Traced to
+real undici's own `lib/web/fetch/index.js`, which registers a body's
+own error handler as `this.body.on('error', onError)`, where `onError`
+itself calls `this.body.destroy(error)` - a real, unavoidable pairing.
+This project's own `Readable.destroy()`
+([stream.go](../internal/host/stream.go)) had no re-entrancy guard:
+every call unconditionally re-emitted `'error'`, which re-invoked the
+very listener that had just called `destroy()`, which called it again
+- forever. Real Node's own `Readable.destroy()` has exactly this guard
+(a `destroyed` flag that makes every call after the first a no-op for
+emission purposes) for exactly this reason - a stream's own error/close
+handling calling `destroy()` again on an already-destroyed stream is
+normal, expected usage, not misuse. Fixed directly (this is noderati's
+own code, not an engine bug) with a `destroyed` flag, and added
+[`TestReadableDestroyIsReentrancySafe`](../internal/host/stream_test.go)
+driving the exact real shape (a listener that calls `destroy()` again
+from inside the handler `destroy()` itself invoked) with a hard test
+timeout, so a regression here fails loudly instead of hanging the
+suite.
+
+With that fixed, `/big` and `/json` (as isolated single-request
+processes) now both genuinely pass: the 100KB body round-trips byte-for
+-byte (`len=100000`, content verified, not just length), and
+`res.json()` correctly parses a real JSON response body. The `POST`
+-with-body case hit a **third, distinct blocker** - not a noderati bug
+this time: `e.cause.message` traced directly to `TypeError: undefined
+is not a function` at undici's own `cloneBody` (`body.js:294`,
+`body.stream.tee()`), called from `cloneRequest`, which
+`httpNetworkOrCacheFetch` runs on every real fetch() carrying a request
+body. Confirmed directly and minimally in vanilla `paserati`:
+`ReadableStream.prototype.tee` doesn't exist at all - `typeof
+rs.tee === "undefined"` on any instance, not a subtle behavioral gap
+like every other finding this investigation has hit, just an entirely
+unimplemented spec method. Filed as
+[paserati#390](https://github.com/nooga/paserati/issues/390).
+
+**Status**: a genuine end-to-end milestone this round - real undici's
+`fetch()` completing a full request/response cycle against noderati for
+the first time. Two *independent* bugs were found by deliberately
+stress-testing past that first success rather than stopping there, and
+they don't compose the way an earlier draft of this entry implied - the
+`destroy()` fix did not "clear a path blocked by #389"; the two are
+unrelated bugs on different code paths that happened to both be
+reachable from this round's stress script. Precisely, as of this
+round's end: a single-request `/big` fetch (100KB, content-verified)
+and a single-request `/json` fetch both now genuinely work, thanks to
+this round's own `destroy()` fix. Sending a request body is blocked on
+paserati#390 (`ReadableStream.tee()`, unimplemented). Repeated
+sequential requests *within one process* are separately blocked on
+paserati#389 (`clearTimeout` self-recursion, filed, not yet fixed) -
+the third of three sequential `GET`s in one process still overflows;
+this was not resolved by anything done this round. Deliberately
+stress-tested past the first success and past an inaccurate first draft
+of this very entry (corrected here, and via a follow-up comment on
+#389 itself, after advisor review caught both), in the same "verify
+against the real thing, not just the first result" spirit every round
+in this chain has used.
+
+**Verification**: `go build ./...` clean. Full `internal/host` suite
+green (including the new re-entrancy test, timeout-guarded), same
+pre-existing unrelated `TestEventsAddAbortListener` excluded.
+`declareUndici()` restored (was temporarily disabled for E2E probing,
+per the Round 77-documented trap). One real noderati-side fix this
+round (`Readable.destroy()`'s re-entrancy guard); two upstream paserati
+bugs found and filed (#389, #390); the pull of #388 itself needed no
+downstream adjustment.
