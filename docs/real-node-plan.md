@@ -9567,3 +9567,125 @@ per the Round 77-documented trap). One real noderati-side fix this
 round (`Readable.destroy()`'s re-entrancy guard); two upstream paserati
 bugs found and filed (#389, #390); the pull of #388 itself needed no
 downstream adjustment.
+
+## Round 82: paserati#391 pulled (fixes #389), later #392 also merged and pulled (fixes #390) - sequential GET/big-body/JSON requests now reliably pass together - a real, non-deterministic hang was found in that same stretch before #392, then a *different*, deterministic stall appeared once POST/tee() actually started executing - neither is resolved yet
+
+Asked to pull "391 and 392" as merged - checked both directly before
+pulling anything, rather than assuming the request was accurate: #391
+(fixing #389, the shorthand-method self-binding bug) was genuinely
+merged, but #392 (`ReadableStream.prototype.tee()`, fixing #390) was
+still an **open** PR at the time (`gh pr view 392` showed `state: OPEN`,
+opened ~20 minutes after #391 merged, no merge timestamp) - flagged
+this discrepancy rather than silently proceeding as if both had landed,
+and continued with #391 only. Pulled the sibling checkout (`07014ab3`
+-> `08e992a6`) and verified its fix directly against last round's own
+exact minimal repro before doing anything else - `obj.foo(42)` now
+correctly reaches the outer `foo` instead of recursing.
+
+**Re-ran the full stress probe** (`declareUndici()` disabled per the
+Round 77 trap): three sequential `GET`s, a 100KB body, and `res.json()`
+- all four, in the same process, in sequence - passed on the first run.
+This is the exact scenario that stopped at `GET#2` last round; #391's
+fix cleared it cleanly on that run. The 100KB body was content-verified
+(not just length), and `res.json()` parsed correctly, both as later
+steps in the same multi-request script rather than only as isolated
+single-request processes (which is all last round had actually
+confirmed for the `destroy()` fix specifically).
+
+**Repeating that same run surfaced a genuine, separate, non-deterministic
+hang**, though - across ~8-10 repeats, most runs completed cleanly but
+at least one hung partway through the GET/BIG/JSON stretch itself, at a
+*different* point each time (once right after `GET#2`, before `BIG` even
+started). Caught it live with `NODERATI_PPROF` + a goroutine dump: the
+main VM goroutine was parked in `DefaultAsyncRuntime.WaitForExternalOp()`
+forever - but, same as the `POST` dump described below, every socket's
+reader/writer loops were still genuinely alive and idle, not orphaned,
+so whether the pending-op count was a real leak or legitimately-ref'd
+idle sockets undici simply hadn't released yet is undetermined from
+this dump alone, not established fact. Went looking anyway, by code
+inspection, for a plausible real hole in `net.go`'s ref-count-style
+tracking of
+`Socket.ref()`/`.unref()` against the connection's one-shot teardown
+goroutine: `setExternalOpActive`'s active/inactive flip-flop is only
+provably balanced for `unref()`/`ref()` sequences that land *while the
+connection is still alive* - the single goroutine that ever calls
+`endTrackedExternalOp()` runs exactly once, when the reader+writer
+loops finish, and a `ref()` call landing after that point (undici's own
+pool reusing a connection right as it's dying is a plausible real
+trigger) would issue a fresh `BeginExternalOp()` that nothing remains
+alive to ever match with an `EndExternalOp()`. Added an `extOpFinal`
+latch ([net.go](../internal/host/net.go)) closing that window - real
+and defensible on its own terms, but **not confirmed to be what this
+round's specific hang actually was**: the goroutine dump for *that*
+hang showed genuinely live, idle reader/writer loops, not orphaned
+ones, which doesn't match this fix's own failure shape. Recorded
+honestly as an inspection finding rather than a confirmed fix - the
+original non-deterministic hang was not caught again afterward, but the
+sample size (a handful of runs) is too small to call it resolved.
+
+**Then #392 (`ReadableStream.prototype.tee()`) was merged upstream** -
+pulled (`08e992a6` -> `5c498aa3`) and verified directly (`typeof
+rs.tee === "function"` on a fresh instance, previously `"undefined"`)
+before proceeding. Re-ran the full six-step stress probe including the
+`POST`-with-body step for the first time with `tee()` actually present.
+The GET/BIG/JSON stretch now passed reliably across every repeat (8/8) -
+the earlier non-deterministic hang did not recur in this batch, though
+see above on why that isn't proof it's gone. `POST` itself, however,
+now **deterministically** stalls: `fetch()` for the `POST` request is
+reached and invoked (confirmed via an added `console.log("about to
+POST")` immediately beforehand, which does print) but never returns.
+Caught with another live pprof dump: two full socket connections alive
+and idle (reader loops parked in a live `conn.Read`, writer loops
+parked waiting for something to write) - a *second* connection was
+opened for this request rather than reusing the pooled one, and its
+writer never received anything to send. No Go-side `tee()`/goroutine-fed
+machinery (`pkg/builtins/readable_stream_init.go`'s `goPull` hooks)
+appears anywhere in the dump at all, which argues against a Go-level
+deadlock in that new code - #392's own tests specifically exercise a
+Go-goroutine-*fed* `ReadableStream`, but the body here is built through
+`extractBody`'s plain JS-`pull()`-driven byte stream (a string body),
+which is a different shape not covered by that test. The evidence
+points at a stall somewhere in undici's own body-read-for-write chain
+before the socket write ever gets queued, most likely in how a
+`pull()`-driven (non-goroutine-fed) `ReadableStream`'s `.tee()`'d output
+gets consumed for writing - not yet root-caused precisely enough to
+file upstream or fix.
+
+The concrete next check for Round 83, narrower than "trace the pull
+chain": the second-connection observation itself constrains the
+hypothesis more than the prose above does on its own. A same-origin
+request opening a *new* connection after five successful ones on the
+pool means either undici's pool declined to reuse the existing one, or
+considered it unusable at that moment - both checkable from undici's
+own side (`kSize`/pool state right before the `POST` dispatch) without
+touching any Go code, and would say whether this is upstream of the
+write-queue symptom or a separate consequence of it. Do that before
+tracing the `pull()`/`tee()` chain itself.
+
+**Status**: every previously-confirmed blocker for a GET-style `fetch()`
+remains cleared. Sending a request body is unblocked at the JS-API
+level (`tee()` exists, real undici's `cloneBody`/`cloneRequest` no
+longer throw), but the actual `POST` now hangs deterministically before
+the request ever reaches the wire - a new, more precisely evidenced
+blocker than "waiting on #392," not yet root-caused. Separately, a real,
+rare, non-deterministic hang in the plain GET/BIG/JSON path was found,
+partially addressed by a real (if not confirmed-relevant) fix, and not
+proven resolved. Both are open going into the next round - the `POST`
+stall first, since it's deterministic and has a concrete next check
+(confirm from undici's own pool state whether the second connection was
+a reuse decline or an unusable-pooled-connection situation, before
+tracing the `pull()`/`tee()`-branch chain itself).
+
+**Verification**: `go build ./...` clean. Full `internal/host` suite
+green, same pre-existing unrelated `TestEventsAddAbortListener`
+excluded. `declareUndici()` restored (was temporarily disabled for E2E
+probing, per the Round 77-documented trap). One noderati-side change
+this round (`net.go`'s `extOpFinal` guard) - real and kept, but its
+comment is deliberately honest that it wasn't confirmed to fix the
+hang that motivated writing it. Deliberately shipped without a
+regression test, unlike every other fix landed this session: the
+triggering interleaving (a `ref()` call racing a connection's one-shot
+teardown goroutine) couldn't be reproduced on demand, only reasoned
+about from the code - a test built around a guessed-at trigger would
+verify the guess, not the real race, so none was written rather than
+faking one.
