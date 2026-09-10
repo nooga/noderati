@@ -543,6 +543,31 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 		return vm.NewString(encodeBufferBytes(data[start:end], enc)), nil
 	}))
 
+	// toJSON() was missing entirely - found the hard way while
+	// re-probing real undici's fetch() end to end (round 80,
+	// docs/real-node-plan.md): JSON.stringify({v: someBuffer}) silently
+	// produced {"v":null} instead of real Node's {"type":"Buffer",
+	// "data":[...]} - JSON.stringify calls toJSON() on any value that
+	// has one, and with none defined here it fell back to treating a
+	// Buffer (a typed array) the same way JSON.stringify treats any
+	// other object with only non-enumerable numeric-like internals: as
+	// empty. A real, silent divergence (wrong output, not a throw) that
+	// would corrupt any code logging or serializing a Buffer, not just
+	// a hypothetical one.
+	bufferProto.SetOwnNonEnumerable("toJSON", vm.NewNativeFunction(0, false, "toJSON", func(args []vm.Value) (vm.Value, error) {
+		thisVal := vmInst.GetThis()
+		ta := thisVal.AsTypedArray()
+		data := typedArrayBytes(ta)
+		elems := make([]vm.Value, len(data))
+		for i, b := range data {
+			elems[i] = vm.NumberValue(float64(b))
+		}
+		result := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+		result.SetOwn("type", vm.NewString("Buffer"))
+		result.SetOwn("data", vm.NewArrayWithArgs(elems))
+		return vm.NewValueFromPlainObject(result), nil
+	}))
+
 	// write(string, offset?, length?, encoding?) - and the two-arg
 	// write(string, encoding) overload real Node also accepts.
 	bufferProto.SetOwnNonEnumerable("write", vm.NewNativeFunction(1, true, "write", func(args []vm.Value) (vm.Value, error) {
