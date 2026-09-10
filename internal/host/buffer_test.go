@@ -243,12 +243,15 @@ func TestBufferSubarrayStaysBuffer(t *testing.T) {
 // isBlobLike's own guards could ever catch, since the broken reference
 // was the right-hand side. Confirmed directly against real Node
 // (`node -e`) that node:buffer really does export Blob and File
-// before writing this. Deliberately checks `"x" instanceof Blob`
+// before writing this. Originally checked only `"x" instanceof Blob`
 // (the exact real isBlobLike() usage - a plain string body, not a
-// real Blob) rather than `new Blob(...) instanceof Blob`: constructing
-// a real Blob instance hits a separate, already-filed paserati bug
-// (paserati#395 - `new Blob(...)` doesn't produce a real instance),
-// unrelated to what this test guards.
+// real Blob), deliberately not `new Blob(...) instanceof Blob`:
+// constructing a real Blob instance hit a separate paserati bug
+// (paserati#395 - `new Blob(...)` didn't produce a real instance,
+// always built on ObjectPrototype instead of Blob.prototype). Fixed
+// upstream by paserati#396 (pulled, verified directly against this
+// exact node:buffer-exported Blob before adding the assertion below) -
+// now checks both shapes together.
 func TestBufferModuleExportsBlobAndFile(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
@@ -259,12 +262,13 @@ func TestBufferModuleExportsBlobAndFile(t *testing.T) {
 			fileIsGlobal: File === globalThis.File,
 			bufferIsGlobal: Buffer === globalThis.Buffer,
 			stringInstanceofBlobDoesNotThrow: "x" instanceof Blob,
+			realBlobInstanceofBlob: new Blob(["hi"]) instanceof Blob,
 		})
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	want := `{"blobIsGlobal":true,"fileIsGlobal":true,"bufferIsGlobal":true,"stringInstanceofBlobDoesNotThrow":false}`
+	want := `{"blobIsGlobal":true,"fileIsGlobal":true,"bufferIsGlobal":true,"stringInstanceofBlobDoesNotThrow":false,"realBlobInstanceofBlob":true}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
