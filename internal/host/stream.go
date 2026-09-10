@@ -74,6 +74,7 @@ class Readable extends EventEmitter {
     this._ended = false;
     this._error = null;
     this._waiters = [];
+    this._disturbed = false;
   }
   _settleWaiters() {
     while (this._waiters.length && (this._queue.length || this._ended || this._error)) {
@@ -94,6 +95,7 @@ class Readable extends EventEmitter {
       this.emit("end");
       return false;
     }
+    if (this._events.data && this._events.data.length) this._disturbed = true;
     this._queue.push(chunk);
     this.emit("data", chunk);
     this._settleWaiters();
@@ -113,6 +115,7 @@ class Readable extends EventEmitter {
   [Symbol.asyncIterator]() {
     return {
       next: () => {
+        this._disturbed = true;
         if (this._queue.length) {
           return Promise.resolve({ value: this._queue.shift(), done: false });
         }
@@ -296,8 +299,60 @@ function pipeline(...args) {
   return promise;
 }
 
-export { Readable, Writable, Transform, pipeline, pipelineStreams as _pipelineStreams };
-export default { Readable, Writable, Transform, pipeline };
+// isDisturbed was missing entirely - found the hard way while
+// re-probing real undici's fetch() end to end after paserati#384 was
+// fixed (round 80, docs/real-node-plan.md): real undici's own
+// lib/core/util.js#isDisturbed does
+// "stream.isDisturbed(body) || body[kBodyUsed]" as part of every
+// consumeBody() call (the shared implementation behind
+// response.text()/json()/etc) - a real, unavoidable call site on the
+// very first body read, not a hypothetical one. Missing it entirely
+// threw "undefined is not a function" the instant any fetch() response
+// body was consumed via .text()/.json()/.arrayBuffer()/.blob().
+//
+// Traced (not assumed) which object actually reaches this function on
+// the real fetch()-response path: it's paserati's own built-in WHATWG
+// ReadableStream, not this file's Readable - undici's ReadableStreamFrom
+// wraps a Readable into one before any of this project's own code is
+// reachable again, and consumeBody()/bodyUnusable() both check
+// body.stream (the wrapped web stream), not the original. A bare
+// ReadableStream has no _disturbed property, so this always answers
+// false on that path - which is the correct answer for a body nothing
+// has disturbed yet, and *existence* (returning anything instead of
+// throwing "undefined is not a function") is what actually unblocked
+// consumeBody() this round, not the flag-tracking below.
+//
+// The _disturbed flag on this file's own Readable (set in push()/the
+// async iterator above) isn't dead code, though: extractBody() (used
+// when *constructing* a body from a Readable, e.g. passing one as
+// RequestInit.body) calls util.isDisturbed() on the pre-wrap
+// async-iterable directly, before any ReadableStreamFrom wrapping
+// happens - that path does see this file's real flag. Not exercised by
+// the GET-with-response-body probe that found this gap; left in place
+// on the reasonable expectation that a body-as-request-input path will
+// need it for real, correctly, the same way every other "flagged, not
+// glossed over" gap in this file is - rather than ripped out for only
+// covering half the real isDisturbed() call sites today.
+function isDisturbed(stream) {
+  return !!(stream && stream._disturbed);
+}
+
+// isErrored: same real call site as isDisturbed above
+// (undici's core/util.js does "const { isErrored, isDisturbed } =
+// require('node:stream')"), found in the same pass rather than waiting
+// to hit it as a separate gap later - real undici's own
+// extractBody()'s ReadableStream pull() checks "!isErrored(stream)"
+// before every enqueue. Same _error field this file's Readable already
+// tracks (set by destroy(err)); same caveat as isDisturbed above - the
+// real fetch()-response path checks this against paserati's own
+// built-in WHATWG ReadableStream, not this class, so existence (a
+// safe, consistent "false") is what matters there, not this flag.
+function isErrored(stream) {
+  return !!(stream && stream._error);
+}
+
+export { Readable, Writable, Transform, pipeline, isDisturbed, isErrored, pipelineStreams as _pipelineStreams };
+export default { Readable, Writable, Transform, pipeline, isDisturbed, isErrored };
 `
 
 const streamPromisesShim = `import { _pipelineStreams } from "stream";

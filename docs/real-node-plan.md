@@ -9279,3 +9279,137 @@ per the Round 77-documented trap); the vendored undici copy under the
 scratchpad used for tracing was diffed back to byte-identical with its
 pre-instrumentation copy before being discarded (it was never part of
 this repo to begin with).
+
+## Round 80: paserati#385 pulled (fixes #382/#384) - implemented node:stream's isDisturbed, real undici's fetch() gets past exception handling and body-read guards - blocked next on a core TypedArray engine bug, paserati#386 (filed)
+
+Picked up immediately where Round 79 left off:
+[paserati#385](https://github.com/nooga/paserati/issues/385) merged,
+closing both #382 (async function `[[Prototype]]`, only the
+`.constructor`/`toString` half - the `.caller`/`.arguments`
+compensation was deliberately left as real behavior, not a mask, per
+the PR's own writeup) and #384 (the `.call(receiver, ...spreadArgs)`
+exception-routing bug this project filed last round). Pulled the
+sibling checkout (`79bcb5fc` -> `0522531c`) and verified #384's own
+fix directly before doing anything else: last round's exact 6-line
+minimal repro (`try { fn.call(null, ...args); } catch {...}`, `args` a
+spread array) now correctly reaches its `catch` block.
+
+**Re-ran the standing E2E probe with `declareUndici()` disabled** (per
+the Round 77 trap) against real, unmodified undici@7.11.0: the Go-level
+VM panic from Round 79 is gone, as expected. Progress moved one layer
+further than ever before - the `fetch()` call itself now completes and
+returns a response, and execution reaches `res.text()` before hitting
+the next wall.
+
+**Immediate next gap: `stream.isDisturbed` didn't exist.** Real
+undici's `lib/core/util.js#isDisturbed` does `stream.isDisturbed(body)
+|| body[kBodyUsed]` as part of every `consumeBody()` call (the shared
+implementation behind `.text()`/`.json()`/`.arrayBuffer()`/`.blob()`) -
+a real, unavoidable call on the very first body read. Missing it
+entirely threw `undefined is not a function` immediately. Implemented
+in [stream.go](../internal/host/stream.go): added a `_disturbed` flag
+to this file's own `Readable` class (true once its async iterator has
+actually been consumed, or once a live `'data'` listener was attached
+at push time - not merely once bytes have been buffered), and exported
+a module-level `isDisturbed(stream)` reading that flag. This doesn't
+reproduce real Node's exact `readableDidRead` semantics in every
+corner case, but is correct for every real call site exercised so far
+(`consumeBody` checks it once, before its own read begins, as a guard
+against the body already having been disturbed by something *other*
+than the read it's about to do).
+
+**Next gap after that: response bodies read back empty.** With
+`isDisturbed` in place, `res.text()` no longer threw - but the returned
+text was consistently empty, traced (not assumed) down to
+`ReadableStreamFrom` (undici's own `core/util.js`, used to wrap this
+project's Node-style `Readable` into a real WHATWG `ReadableStream` for
+consumption via `.getReader()`) doing `new Uint8Array(buf)` on each
+chunk read from the async iterator, where `buf` is a `Buffer` (a
+`Uint8Array` subclass). Isolated with a minimal, undici-free,
+noderati-free repro directly in vanilla `paserati`:
+
+```js
+const src = new Uint8Array([1, 2, 3]);
+const copy = new Uint8Array(src);
+console.log(copy.length); // 0 - every engine but this one prints 3
+```
+
+Bisected the same way as #384: this is neither a `Buffer`-specific
+issue nor a `Uint8Array`-specific one - `new
+AnyTypedArray(otherTypedArray)` (same-type *and* cross-type: tried
+`Uint8Array`/`Int8Array`/`Uint16Array`/`Int32Array`/`Float64Array` in
+combination) always returns a zero-length array, while the `number`,
+plain-`Array`, and `ArrayBuffer` constructor overloads all work
+correctly - only the "construct from another typed array" spec
+overload (`%TypedArray%(typedArray)`) is broken. Filed as
+[paserati#386](https://github.com/nooga/paserati/issues/386) with the
+bisection table; flagged in the report as likely to affect anything
+else in this codebase doing ordinary typed-array copying, not just
+this one call site, since it fails silently (empty, not a throw)
+rather than loudly.
+
+**Follow-up checks, done before calling this round closed** (per
+advisor review of the draft above):
+
+1. **Which object actually reaches `isDisturbed` on the real path -
+   traced, not assumed.** Temporarily logged the argument's
+   `constructor.name`: on the real `fetch()`-response path it's
+   paserati's own built-in WHATWG `ReadableStream`, not this file's
+   `Readable` - undici's `ReadableStreamFrom` wraps a `Readable` into
+   one before any of this project's own code sees it again, and
+   `consumeBody()`/`bodyUnusable()` both check the wrapped web stream.
+   A bare `ReadableStream` has no `_disturbed` property, so the
+   function always answers `false` there - the right answer for an
+   undisturbed body, but it means *existence* of the function is what
+   actually unblocked `consumeBody()` this round, not the flag-tracking
+   logic. That logic isn't dead code, though: `extractBody()` (building
+   a body *from* a `Readable`, e.g. as `RequestInit.body`) checks the
+   pre-wrap async-iterable directly, which does see this file's real
+   flag - not exercised by this round's GET-only probe, left in place
+   for that real, just not-yet-hit, call site. Corrected the code
+   comment in [stream.go](../internal/host/stream.go) to say this
+   precisely instead of implying both paths were verified.
+2. **`isErrored` was the other half of the same `require('node:stream')`
+   destructure** (`const { isErrored, isDisturbed } =
+   require('node:stream')` in undici's own `core/util.js`) - not yet
+   hit (paserati#386 blocks first), but the same class of gap one step
+   ahead. Added alongside `isDisturbed` rather than waiting to
+   rediscover it in Round 81.
+3. **`.set()`/`.slice()` checked against paserati#386's typed-array-copy
+   bug**, since they're the same "read elements out of a typed-array
+   source" operation as the broken constructor overload - both work
+   correctly. Confirmed the bug is narrowly scoped to the constructor
+   overload and recorded that on the issue.
+4. **A real diagnostic side-finding, chased down rather than left as a
+   loose end**: `JSON.stringify({v: someBuffer})` was silently
+   producing `{"v":null}` instead of real Node's `{"v":{"type":"Buffer",
+   "data":[...]}}`. Discriminated which repo owns it with one command
+   (`typeof buf.toJSON`): `undefined` - a genuine noderati gap, `Buffer`
+   never had a `toJSON()` at all. Fixed directly in
+   [buffer.go](../internal/host/buffer.go) (matches real Node's
+   `{type: "Buffer", data: [...]}` shape exactly). But `toJSON()`
+   existing wasn't enough - `JSON.stringify({v: bufferWithToJSON})`
+   *still* printed `null` even with a real `toJSON()` defined, which
+   moved the question upstream: verified directly against real Node
+   (`node -e`) that a typed array both without `toJSON()` (serializes
+   by its own indexed properties, `{"0":1,"1":2,...}`) and with one
+   (calls it, like any other object) behave nothing like paserati's
+   `null` in either case, and confirmed in vanilla `paserati` this
+   isn't Buffer-specific - `JSON.stringify()` on any typed array
+   (subclass or not) always returns `null`, ignoring `toJSON()`
+   entirely. Filed as
+   [paserati#387](https://github.com/nooga/paserati/issues/387).
+
+**Status**: two more real layers of the same onion peeled this round -
+exception handling through spread `.call()` and the body-read
+disturbed-check guard are both now correct against real undici. Full
+real-undici `fetch()` end-to-end remains blocked, now on paserati#386
+(typed-array copy constructor), a clean, filed, upstream-owned blocker
+exactly like #302/#372/#377/#381/#384 before it. Not pursued further
+this round - isolating and filing #386 (plus the #387 side-finding it
+led to) was this round's actual scope.
+
+**Verification**: `go build ./...` clean. Full `internal/host` suite
+green, same pre-existing unrelated `TestEventsAddAbortListener`
+excluded. `declareUndici()` restored (was temporarily disabled for E2E
+probing, per the Round 77-documented trap).
