@@ -10256,3 +10256,81 @@ level `netTrace`/`netTraceSeq` and a per-socket `traceID` field) -
 kept rather than stripped: it's what proved the socket layer innocent
 this round (the same role `NODERATI_PPROF` already plays), and it
 costs nothing when unset.
+
+## Round 88: the Round 87 spin-off closed - `fs.readFileSync()` now returns a real Buffer by default, matching real Node
+
+Picked up the one open item Round 87 spun off rather than fixed
+inline: [`fs.go`](../internal/host/fs.go)'s `readFileSync` always ran
+the file's raw bytes through Go's `string(b)` and returned that,
+regardless of whether a JS caller ever asked for a decoded string.
+Real Node's `fs.readFileSync(path)` returns a `Buffer` by default and
+only decodes to a string when an explicit `encoding` is given (a bare
+string shorthand, or an `{encoding}` options object) - unconditionally
+stringifying instead silently corrupts any binary read the moment the
+bytes aren't valid UTF-8.
+
+**Confirmed directly**, same way Round 87 first found it: reading the
+real `llhttp-real.wasm` fixture
+(`internal/host/testdata/llhttp-real.wasm`, 52042 bytes) via
+`readFileSync()` and checking the result showed `Buffer.isBuffer(result)
+=== false`, `result instanceof Uint8Array === false`, and `new
+Uint8Array(result)` producing a 0-length array instead of the real
+bytes - the same three-way failure signature Round 87's doc entry
+recorded.
+
+**Fix**: `readFileSync` now inspects its variadic options argument (a
+string encoding shorthand or an `{encoding, flag}` object, mirroring
+real Node's own signature) via a new `fsReadEncoding` helper. With no
+encoding (or `encoding: null`), it returns a real Buffer built with
+`wrapBuffer(vmInst, b)` - the same helper `net.go`/`crypto.go`/`zlib.go`
+already use to hand real bytes to JS without a string round-trip. With
+an encoding given, it decodes via the existing `encodeBufferBytes`
+(`buffer.go`) and returns a JS string, unchanged from before.
+
+Checked the mirror-image direction while in the area, per the task
+that picked this item back up: `writeFileSync`/`appendFileSync` took
+`data string` and silently mis-stringified a real Buffer/Uint8Array
+argument (JS `+`/string-coercion of an object, not its bytes) rather
+than writing its raw bytes - real Node's own `writeFileSync`/
+`appendFileSync` accept both a string and a Buffer/TypedArray/DataView
+for `data`. Both now take `data vm.Value` and extract bytes via
+`valueToBytes` (`net.go`) - already shared by socket writes for the
+identical string-or-real-bytes distinction - so a string still writes
+its UTF-8 bytes exactly as before, and a Buffer now writes its own raw
+bytes instead of being coerced through `ToString()`.
+
+**New tests** in
+[`fs_test.go`](../internal/host/fs_test.go):
+`TestFSReadFileSyncDefaultsToBuffer` (round-trips all 256 byte values
+through a written file and `readFileSync()` with no encoding argument,
+checking `Buffer.isBuffer`/`instanceof Uint8Array`/byte-for-byte
+match - not just an ASCII sample, so a signedness or truncation bug in
+the byte path can't hide behind one), `TestFSReadFileSyncUtf8ReturnsString`
+and `TestFSReadFileSyncEncodingObject` (both the string-shorthand and
+`{encoding}`-object forms still decode to a real string), and
+`TestFSWriteAppendFileSyncAcceptBuffer` (writes half the 0-255 byte
+range with `writeFileSync` and the other half with `appendFileSync`,
+both given real `Buffer` values, then reads the whole 256 bytes back).
+The pre-existing `TestFSWriteReadRoundtrip` was updated to pass
+`"utf8"` explicitly, since it exercises `readFileSync`'s Go-level
+return value directly (`val.ToString()` on the raw `vm.Value`) rather
+than through a JS expression - the other pre-existing round-trip test
+(`TestFSAppendCopyRenameRm`, `readFileSync(a) + readFileSync(b)`)
+needed no change at all, since JS's own `+` operator still triggers
+`Buffer.prototype.toString()` (defaults to utf8) on each Buffer through
+normal `ToPrimitive` coercion - confirming the fix is transparent to
+any real code that already treats `readFileSync`'s result as
+`ToString`-coercible text rather than assuming a raw string type.
+
+**Also noted, not fixed here**: `fs/promises`' own `readFile`/
+`writeFile` ([fspromises.go](../internal/host/fspromises.go)) have the
+identical bug pattern (`string`-typed return/argument, no Buffer path)
+- out of scope for this round, which stayed focused on the `fs.go`
+sync API the spin-off named; flagged as a follow-up rather than fixed
+inline.
+
+**Verification**: `go build ./...`/`go vet ./...` clean. Full
+`internal/host` suite (`go test ./internal/host/... -skip
+'TestEventsAddAbortListener'`) green in ~8.6s, including the four new
+tests above and every pre-existing `fs`-related test unchanged in
+behavior.

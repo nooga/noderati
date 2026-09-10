@@ -111,6 +111,31 @@ func fsClose(fd int64) error {
 	return v.(*os.File).Close()
 }
 
+// fsReadEncoding reads the encoding out of readFileSync's variadic options
+// argument, matching real Node's own two accepted shapes: a bare string
+// encoding shorthand (readFileSync(path, "utf8")), or an
+// {encoding, flag} object (readFileSync(path, {encoding: "utf8"})). The
+// bool return distinguishes "no encoding requested" (opts empty, or an
+// options object with no/null encoding - real Node's own default) from
+// "encoding requested" so the caller can return a real Buffer in the
+// former case rather than guessing from an empty string.
+func fsReadEncoding(opts []interface{}) (string, bool) {
+	if len(opts) == 0 {
+		return "", false
+	}
+	switch v := opts[0].(type) {
+	case string:
+		return v, true
+	case map[string]interface{}:
+		if raw, ok := v["encoding"]; ok {
+			if s, ok := raw.(string); ok {
+				return s, true
+			}
+		}
+	}
+	return "", false
+}
+
 func fsWrite(fd int64, data string) (int64, error) {
 	v, ok := fsFDs.Load(fd)
 	if !ok {
@@ -123,24 +148,45 @@ func fsWrite(fd int64, data string) (int64, error) {
 func declareFS(p *driver.Paserati) {
 	vmInst := p.GetVM()
 	p.DeclareModule("fs", func(m *driver.ModuleBuilder) {
-		m.Function("readFileSync", func(path string, _ ...interface{}) (string, error) {
+		m.Function("readFileSync", func(path string, opts ...interface{}) (vm.Value, error) {
 			fsTouch("read", path)
 			b, err := os.ReadFile(path)
 			if err != nil {
-				return "", wrapFsErr(vmInst, "open", path, err)
+				return vm.Undefined, wrapFsErr(vmInst, "open", path, err)
 			}
-			return string(b), nil
+			// Real Node's fs.readFileSync(path) returns a Buffer by
+			// default and only decodes to a string when an explicit
+			// encoding was given (a string shorthand, or an
+			// {encoding} object) - matching readFile/readFileSync's
+			// documented "no encoding is specified... Buffer object"
+			// behavior. Previously this always ran raw bytes through
+			// Go's string(b), which corrupts any binary read (e.g. a
+			// .wasm file) the moment those bytes aren't valid UTF-8:
+			// round-tripping through paserati's own JS string
+			// representation and back out as a Uint8Array produced
+			// truncated/garbled bytes, not the original file.
+			encoding, hasEncoding := fsReadEncoding(opts)
+			if !hasEncoding {
+				return wrapBuffer(vmInst, b), nil
+			}
+			return vm.NewString(encodeBufferBytes(b, encoding)), nil
 		})
-		m.Function("writeFileSync", func(path string, data string, _ ...interface{}) (interface{}, error) {
-			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, []byte(data), 0644))
+		m.Function("writeFileSync", func(path string, data vm.Value, _ ...interface{}) (interface{}, error) {
+			// Real Node's fs.writeFileSync accepts a string or a real
+			// Buffer/TypedArray `data` argument and writes its raw
+			// bytes either way. valueToBytes (net.go) already draws
+			// that same string-or-real-bytes distinction for socket
+			// writes, reused here rather than assuming (and silently
+			// mis-stringifying) a JS string as this used to.
+			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, valueToBytes(vmInst, data), 0644))
 		})
-		m.Function("appendFileSync", func(path string, data string) (interface{}, error) {
+		m.Function("appendFileSync", func(path string, data vm.Value) (interface{}, error) {
 			f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err != nil {
 				return nil, wrapFsErr(vmInst, "open", path, err)
 			}
 			defer f.Close()
-			_, err = f.WriteString(data)
+			_, err = f.Write(valueToBytes(vmInst, data))
 			return nil, wrapFsErr(vmInst, "write", path, err)
 		})
 		m.Function("existsSync", func(path string) bool {
