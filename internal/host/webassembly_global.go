@@ -391,11 +391,46 @@ func newWasmMemoryBridge(mem api.Memory) *wasmMemoryBridge {
 	return &wasmMemoryBridge{mem: mem, abVal: vm.Undefined}
 }
 
+// syncIn must never push a *dirty* cached buffer into wasm memory - a
+// real, confirmed bug (round 87, docs/real-node-plan.md) fixed here:
+// dirty means "wasm may have written to memory more recently than this
+// cache reflects", so the cache is stale relative to real memory by
+// definition, and blindly writing it back would roll back whatever
+// wasm itself wrote in between, discarding real progress rather than
+// committing a pending JS write. This bit real undici's own
+// llhttp_execute/malloc/free/llhttp_execute pattern (routine for any
+// response whose body needs a bigger scratch buffer mid-stream, i.e.
+// almost every response above the initial ~4KB default): the first
+// execute() call updates the parser's own internal state directly in
+// wasm memory and leaves the bridge dirty; free()+malloc() are two
+// more exported calls that run *without* JS ever touching `.buffer`
+// in between (buffer growth only re-touches `.buffer` afterward, to
+// write the next chunk) - so under the old code, each of those two
+// calls' own syncIn() re-pushed the *pre-first-execute* stale
+// snapshot, silently resetting the parser's progress. The second
+// execute() call then ran against a wasm-memory image that looked
+// like the parser had never processed the first chunk at all -
+// confirmed directly via a minimal, undici-free repro (two
+// llhttp_execute() calls on one parser, split response, a free()+
+// malloc() growth cycle between them): llhttp incorrectly re-fired
+// on_message_begin and returned a parse error on the second call,
+// while the exact same two-call split with no malloc/free growth in
+// between (a single, sufficiently-large buffer allocated once)
+// completed correctly (on_body + on_message_complete as expected).
+// This is what silently hung real undici's fetch() for any GET/POST
+// whose body arrived in more than one physical socket read once it
+// exceeded the scratch buffer's current size - see Round 87's entry
+// for the full diagnosis chain (net.go's own paused-mode Readable
+// delivery was fully exonerated first, via a separate trace, before
+// landing here).
 func (b *wasmMemoryBridge) syncIn() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.ab == nil {
-		return // JS never touched .buffer - nothing to push into wasm
+	if b.ab == nil || b.dirty {
+		return // no cached buffer, or the cache is already known-stale
+		// relative to wasm's own more recent writes - nothing here is a
+		// genuine pending JS write to commit; the bug above (a stale
+		// dirty cache being pushed anyway) is exactly what this guards.
 	}
 	data := b.ab.GetData()
 	if len(data) > 0 {

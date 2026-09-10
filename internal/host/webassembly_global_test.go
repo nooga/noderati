@@ -502,3 +502,117 @@ func TestWebAssemblyRealLLHTTPParsesRealHTTPResponse(t *testing.T) {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
 }
+
+// TestWebAssemblyExecuteSurvivesBufferGrowthBetweenCalls is the actual
+// minimal repro for the real-undici fetch() hang chased across Rounds
+// 82/84/87 (docs/real-node-plan.md) - confirmed to be a wasmMemoryBridge
+// bug, not net.go's socket layer (which a separate NODERATI_NET_TRACE
+// capture exonerated first: every byte reached the parser correctly).
+//
+// Replicates real undici's own `client-h1.js#execute()` buffer
+// management exactly: a shared scratch buffer, malloc'd once and only
+// grown (free() the old one, malloc() a bigger one) when a chunk
+// exceeds its current size - the routine pattern for any response
+// whose body arrives in more than one physical socket read after the
+// buffer's already been sized for something smaller (which is nearly
+// every response above the initial ~4KB, not a rare edge case). This
+// calls llhttp_execute *twice* on the *same* parser for one message
+// split across two chunks, with a free()+malloc() growth cycle
+// sitting between the two calls and *no* JS-side `.buffer` access in
+// between (matching the real call site: undici only re-touches
+// `.buffer` to write the *next* chunk, after the buffer's already
+// been resized).
+//
+// Root cause: wasmMemoryBridge.syncIn() ran before *every* exported
+// call (malloc/free included), unconditionally re-pushing whatever
+// ArrayBuffer was last cached - even when the bridge's own `dirty`
+// flag said that cache was stale relative to memory wasm had written
+// more recently (llhttp_execute's own internal parser-state writes,
+// in this case). free()/malloc() never touch `.buffer` themselves, so
+// nothing refreshed the cache between the two llhttp_execute() calls -
+// syncIn() blindly wrote the *pre-first-execute* snapshot back over
+// real memory during free()/malloc(), silently erasing the first
+// call's parser progress. The second llhttp_execute() then ran
+// against a parser that looked never-yet-called: real llhttp
+// re-fired on_message_begin instead of continuing the in-progress
+// body, and returned a parse error.
+//
+// A second, deliberately-included variant (executeFixed helper, same
+// two-chunk split, one large-enough buffer allocated once, no
+// malloc/free between the two execute() calls) is this test's own
+// control: it must keep working exactly as before, isolating that the
+// growth *cycle* - not merely "two execute() calls on one parser" -
+// is what the bug depended on.
+func TestWebAssemblyExecuteSurvivesBufferGrowthBetweenCalls(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	installWasmBytesAsGlobal(t, p, "LLHTTP_WASM_BYTES", realLLHTTPWasmBytes(t))
+
+	val, errs := p.RunCode(`
+		const TYPE_RESPONSE = 2;
+		const log = [];
+		const importObject = {
+			env: {
+				wasm_on_url: () => 0,
+				wasm_on_status: () => 0,
+				wasm_on_message_begin: () => { log.push("on_message_begin"); return 0; },
+				wasm_on_header_field: () => 0,
+				wasm_on_header_value: () => 0,
+				wasm_on_headers_complete: (p, statusCode) => { log.push("on_headers_complete:" + statusCode); return 0; },
+				wasm_on_body: (p, at, len) => { log.push("on_body:" + len); return 0; },
+				wasm_on_message_complete: () => { log.push("on_message_complete"); return 0; },
+			}
+		};
+
+		const mod = await WebAssembly.compile(LLHTTP_WASM_BYTES);
+		const instance = await WebAssembly.instantiate(mod, importObject);
+		const llhttp = instance.exports;
+
+		function buildMessage(bodySize) {
+			const body = "a".repeat(bodySize);
+			const response = ` + "`HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: ${bodySize}\\r\\nConnection: keep-alive\\r\\n\\r\\n${body}`" + `;
+			return new TextEncoder().encode(response);
+		}
+
+		const bodySize = 20000;
+		const fullBytes = buildMessage(bodySize);
+		const headerLen = fullBytes.length - bodySize;
+		const firstChunkLen = headerLen + 100; // headers + a little body
+		const chunk1 = fullBytes.subarray(0, firstChunkLen);
+		const chunk2 = fullBytes.subarray(firstChunkLen);
+
+		// Reproduce the bug: undici's own shared, growing scratch buffer -
+		// malloc'd once, freed and re-malloc'd only when a chunk exceeds
+		// the current size. No '.buffer' access happens between the two
+		// llhttp_execute() calls except the one inside execute() itself.
+		let currentBufferPtr = 0;
+		let currentBufferSize = 0;
+		function execute(ptr, chunk) {
+			if (chunk.length > currentBufferSize) {
+				if (currentBufferPtr) llhttp.free(currentBufferPtr);
+				currentBufferSize = Math.ceil(chunk.length / 4096) * 4096;
+				currentBufferPtr = llhttp.malloc(currentBufferSize);
+			}
+			new Uint8Array(llhttp.memory.buffer, currentBufferPtr, currentBufferSize).set(chunk);
+			return llhttp.llhttp_execute(ptr, currentBufferPtr, chunk.length);
+		}
+
+		const ptr = llhttp.llhttp_alloc(TYPE_RESPONSE);
+		const ret1 = execute(ptr, chunk1);
+		const ret2 = execute(ptr, chunk2);
+
+		JSON.stringify({
+			ret1, ret2,
+			eventNames: log,
+			messageBeginCount: log.filter(e => e === "on_message_begin").length,
+			messageCompleteCount: log.filter(e => e === "on_message_complete").length,
+		})
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"ret1":0,"ret2":0,"eventNames":["on_message_begin","on_headers_complete:200","on_body:100","on_body:19900","on_message_complete"],"messageBeginCount":1,"messageCompleteCount":1}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}

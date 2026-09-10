@@ -9676,6 +9676,17 @@ stall first, since it's deterministic and has a concrete next check
 a reuse decline or an unusable-pooled-connection situation, before
 tracing the `pull()`/`tee()`-branch chain itself).
 
+**Update (Round 87)**: the non-deterministic GET/BIG/JSON hang this
+round found and partially addressed has since been root-caused to a
+completely different subsystem - a `wasmMemoryBridge.syncIn()` bug in
+`internal/host/webassembly_global.go`, unrelated to sockets or
+ref-counting at all. This doesn't make the `extOpFinal` guard below
+wrong - it's still a real, defensible fix for a genuine hole in
+`Socket.ref()`/`.unref()` bookkeeping - but it should no longer be
+read as "the fix for that hang": it stands on its own inspection-based
+merits only, still unconfirmed by any observed failure, exactly as
+this entry originally, honestly described it.
+
 **Verification**: `go build ./...` clean. Full `internal/host` suite
 green, same pre-existing unrelated `TestEventsAddAbortListener`
 excluded. `declareUndici()` restored (was temporarily disabled for E2E
@@ -10040,3 +10051,208 @@ un-root-caused issues from Round 82/84 (the non-deterministic
 GET-path hang, and the separate process-won't-exit-after-success case,
 both suspected around idle keep-alive socket lifecycle) are unrelated
 to Blob and remain exactly as they were - not touched by this round.
+
+## Round 87: both Round 82/84 hangs root-caused and fixed - a real wasmMemoryBridge bug (noderati's own WebAssembly bridge, not paserati) and a real timer .ref()/.unref() no-op (also noderati's own)
+
+Picked up the two still-open, un-root-caused issues from Round 82/84 -
+the non-deterministic "script never finishes" GET-path hang and the
+separate "process finished successfully but wouldn't exit" case - at
+the user's direction, after presenting the current state of the
+`feat/375-webassembly-wazero` branch/PR and asking which of several
+directions to pursue next.
+
+**The GET-path hang, root-caused**: added a temporary, opt-in
+diagnostic (`NODERATI_NET_TRACE=1`, `net.go` - off by default, kept
+rather than stripped, see "Verification" below) tracing every socket's
+full lifecycle (connect/read/readable/read()/ref/unref/destroy) with a
+per-socket sequence id, and looped the Round 84 six-step probe until it
+caught a live hang. The trace showed every byte of the stalled
+response (a 100KB body split across three physical TCP reads)
+correctly reaching the socket's paused-mode `read()` calls and being
+fully drained - exonerating `net.go`'s own Readable delivery mechanism
+directly, for the first time, rather than continuing to suspect it
+by default. A live pprof goroutine dump taken during the same hang
+confirmed this from the other side: every reader/writer loop was
+genuinely idle (blocked on a live `conn.Read`/waiting for a write),
+not orphaned, and the main goroutine was parked in
+`WaitForExternalOp` with nothing left scheduled - consistent with
+"the completion callback that should have run simply never got
+scheduled," not a byte-delivery problem.
+
+Advisor-suggested next check (a real course-correction, not a
+rubber stamp): patch the *vendored undici copy* temporarily (restored
+byte-for-byte after, confirmed with `diff` - the same discipline this
+file has used for prior vendored-package instrumentation) to log entry/
+exit/throw around `wasm_on_body` and `Parser.onMessageComplete`. This
+caught the exact failure shape: the first `wasm_on_body` call for the
+BIG response's *first* physical chunk fires and exits cleanly, but the
+*second* `llhttp_execute()` call - continuing the same in-progress
+message with the rest of the body, after undici's own scratch buffer
+had to `free()` the old (small) buffer and `malloc()` a much bigger one
+in between - fires **no further callbacks at all**, not even a
+re-entry. Isolated this to a minimal, undici-free repro: one llhttp
+parser, one message split across two `llhttp_execute()` calls, with a
+`free()`+`malloc()` growth cycle sandwiched between them (mirroring
+undici's own `client-h1.js#execute()` buffer-reuse logic exactly) -
+the second call incorrectly re-fired `on_message_begin` (as if parsing
+a brand-new message) and returned a parse error, while the *same*
+two-call split against a single, sufficiently-large buffer allocated
+once (no growth cycle) worked correctly.
+
+**Root cause**: `wasmMemoryBridge.syncIn()`
+([webassembly_global.go](../internal/host/webassembly_global.go)) ran
+before *every* exported wasm function call, unconditionally re-pushing
+whichever `ArrayBuffer` was last cached from a `.buffer` access - even
+when the bridge's own `dirty` flag said that cache was already stale
+relative to memory wasm had written more recently. `free()`/`malloc()`
+are themselves exported calls that never touch `.buffer`, so nothing
+refreshed the cache between the two `llhttp_execute()` calls;
+`syncIn()` silently wrote the *pre-first-execute* snapshot back over
+real memory during `free()`/`malloc()`, erasing the first call's own
+internal parser-state writes. The second `llhttp_execute()` then ran
+against a wasm memory image that looked like the parser had never been
+called at all. This is a **noderati-only bug** - `internal/host` is
+where the wazero-backed WebAssembly bridge lives (per
+[paserati#375](https://github.com/nooga/paserati/issues/375)'s own
+resolution, confirmed in Round 85/86's docs and this branch's own PR
+description: the whole bridge was built entirely on noderati's side,
+no paserati changes needed) - not something to file upstream.
+
+**Fix**: `syncIn()` now skips entirely when `dirty` is true - a dirty
+cache is, by definition, known-stale relative to wasm's more recent
+writes, so there is nothing safe to push back from it; only an
+*undirtied* cache (meaning nothing has crossed into wasm since it was
+last vended, so any bytes written into it via JS `.set()` are a
+genuine pending write) is ever synced in. This is a **general** fix,
+not llhttp-specific: it changes the behavior of every exported-function
+call on every `WebAssembly.Instance` this bridge builds, for any wasm
+module that reads `.buffer`, calls into wasm, and calls in again
+without re-touching `.buffer` in between - not only llhttp's own
+buffer-growth pattern. The full `TestWebAssembly*` suite (unaffected
+call shapes included) stayed green throughout.
+
+**Verified three ways**:
+1. The minimal two-call-with-growth repro, fixed: `on_body`+
+   `on_message_complete` now fire correctly for the continuation
+   chunk, `llhttp_execute` returns 0 both times.
+2. New regression test
+   [`TestWebAssemblyExecuteSurvivesBufferGrowthBetweenCalls`](../internal/host/webassembly_global_test.go)
+   - confirmed to actually catch the bug by reverting just this one
+   fix (`git stash` on `webassembly_global.go` alone) and re-running:
+   fails exactly as expected (`on_message_begin` re-fires,
+   `ret2:8`) without the fix, passes with it.
+3. The real six-step undici E2E probe, run **70 times** across this
+   round (not once) against the real vendored undici@7.11.0 with the
+   fake still gone (Round 85): **70/70 clean**, zero hangs - a
+   dramatic change from the previously observed ~1-in-8 to 3-in-10
+   failure rate across Rounds 82/84/86.
+
+**The separate "process won't exit" case, root-caused and fixed
+too**: while timing the fixed E2E probe, found the process now took a
+*consistently reproducible* ~4.14 seconds to exit after printing "ALL
+DONE" - not flaky at all, unlike the GET-path hang. Isolated with a
+minimal, undici-free script
+(`setTimeout(fn, 4000).unref(); console.log("done")`) run directly:
+noderati blocked for the full 4 seconds *and* still fired the
+callback - real Node does neither for a genuinely unref'd timer with
+nothing else outstanding (confirmed directly via `node -e` on this
+machine: exits in well under a second, callback never runs).
+
+**Root cause**: [`internal/host/timeout_object.go`](../internal/host/timeout_object.go)'s
+`.ref()`/`.unref()` on the wrapped `Timeout` object were pure no-ops,
+with a comment explaining why: "paserati's timer initializer has no
+ref-counted keep-alive concept to hook into." That turned out to be
+wrong - `pkg/runtime.AsyncRuntime` already exports
+`ScheduleUnrefTimer` (a timer excluded from
+`HasPendingWork`/`HasPendingTimers` while pending, so a drain loop with
+nothing else outstanding doesn't wait it out) - it was simply never
+wired up to the JS-visible `.unref()`/`.ref()` pair. Real undici's own
+idle keep-alive machinery calls `.unref()` on exactly this kind of
+timer (`lib/util/timers.js`), expecting it to actually work.
+
+**Fix**: `.ref()`/`.unref()` now reschedule the *same* callback and
+*remaining* delay directly through `rt.ScheduleTimer`/
+`rt.ScheduleUnrefTimer` (bypassing the always-ref'd, JS-level
+`realSetTimeout` global for this), canceling whichever timer id is
+currently outstanding first;
+[`pkg/driver/host_timers.go`](https://github.com/nooga/paserati/blob/main/pkg/driver/host_timers.go)'s
+own `clearTimeout` is a plain `rt.CancelTimer(id)` on the same id
+space both `ScheduleTimer`/`ScheduleUnrefTimer` hand out, so this
+stays compatible with `.close()`/`clearTimeout()` regardless of which
+scheduled it most recently. `.hasRef()` now reports the real current
+state instead of always `true`. Only wired up when the timer's first
+argument is actually callable, matching real `setTimeout`'s own
+contract - falls back to the pre-existing no-op behavior otherwise,
+since there's no real callback to safely reschedule.
+
+**A real self-correction while writing this fix's tests, worth
+recording honestly**: initially misread a *second* apparent bug -
+canceling a long, ref'd timer from a *separate* `RunCode` call after
+scheduling it in an earlier one appeared to hang for the timer's full
+remaining delay, even after explicit cancellation, and was briefly
+believed to be a distinct pre-existing paserati defect. Closer
+analysis (isolating with `installTimeoutObjects` disabled entirely,
+timing raw `AsyncRuntime.ScheduleTimer`/`CancelTimer` calls directly,
+and testing schedule-then-cancel within one script vs. across two)
+showed this was not a bug at all: `RunCode`/`runAsModule` correctly
+drains to real idle before returning, the same way a real `node
+script.js` invocation drains its own event loop - a genuinely ref'd,
+uncanceled-at-that-point timer left dangling by an *earlier, already-
+returned* `RunCode` call is legitimately real outstanding work for a
+*later* one to wait for. The actual lesson: testing "does `.unref()`
+correctly exclude a timer" needs to observe *timing* (does `RunCode`
+itself return fast), not a value read from the script's own
+synchronous return expression (evaluated before any timer could ever
+fire, regardless of ref state) or `HasPendingWork()` polled *after*
+`RunCode` has already fully drained one way or the other. No paserati
+issue filed - there was nothing to file.
+
+**Verified three ways**:
+1. The minimal `setTimeout(...).unref()` script, fixed: exits in well
+   under a second, matching real Node's own measured behavior for the
+   identical script.
+2. New regression tests in
+   [`timeout_object_test.go`](../internal/host/timeout_object_test.go)
+   (`TestTimeoutObjectUnrefExcludesFromPendingWork`,
+   `TestTimeoutObjectRefRestoresPendingWork`,
+   `TestTimeoutObjectHasRefReflectsRealState`,
+   `TestTimeoutObjectUnrefTimerStillFiresIfLoopStaysAlive`) - timing-
+   based for the ref/unref-exclusion pair (per the self-correction
+   above), behavioral for the other two. All fast (well under 100ms
+   combined), all green.
+3. The full six-step E2E probe now completes end-to-end, script exit
+   included, in **~0.15 seconds** - down from the previous
+   consistent ~4.14 seconds, with identical correct output.
+
+**Also noted, spun off rather than fixed inline**: while building the
+first WASM repro, found `fs.readFileSync()`
+([fs.go](../internal/host/fs.go)) always returns a Go `string`,
+never a real `Buffer`, even with no `encoding` argument - corrupting
+any binary file read (confirmed directly: reading the real
+`llhttp-real.wasm` fixture came back with `Buffer.isBuffer() ===
+false`, `instanceof Uint8Array === false`, and `new
+Uint8Array(result)` producing a 0-length array instead of the real
+52042 bytes). Real Node returns a `Buffer` by default. Flagged as a
+separate background task rather than fixed here, to keep this round's
+diff focused on the two hangs it set out to close.
+
+**Status**: both issues this round set out to chase are fixed,
+verified against the real end-to-end scenario (not just isolated
+repros), and covered by new regression tests. The
+`feat/375-webassembly-wazero` branch's real undici `fetch()` milestone
+is now not just "works" but "works fast and reliably" - 70/70 clean
+E2E runs, ~0.15s total script-to-exit time, matching what a real,
+lightweight Node program would look like. No paserati issues filed
+this round - both root causes were noderati's own code. Open item:
+`fs.readFileSync`'s Buffer bug, spun off separately, not blocking
+anything currently exercised.
+
+**Verification**: `go build ./...`/`go vet ./...` clean. Full
+`internal/host` suite green in ~9s (same pre-existing unrelated
+`TestEventsAddAbortListener` excluded), including the two new
+regression tests above. `NODERATI_NET_TRACE` is a new, opt-in,
+off-by-default diagnostic in `net.go` (~15 call sites plus a package-
+level `netTrace`/`netTraceSeq` and a per-socket `traceID` field) -
+kept rather than stripped: it's what proved the socket layer innocent
+this round (the same role `NODERATI_PPROF` already plays), and it
+costs nothing when unset.
