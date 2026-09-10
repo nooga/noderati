@@ -3,8 +3,10 @@ package host
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +44,28 @@ var (
 	socketRegistry sync.Map // id(uint64) -> *socketState
 	socketRegSeq   atomic.Uint64
 )
+
+// TEMP diagnostic instrumentation (docs/real-node-plan.md, Round 87) for
+// chasing the two still-open, un-root-caused hangs first observed in
+// Round 82/84: a non-deterministic "script never finishes" hang (main
+// goroutine parked in WaitForExternalOp, live idle sockets) and a
+// separate "process won't exit after success" case. Off by default
+// (zero cost beyond one bool check per call site) - set
+// NODERATI_NET_TRACE=1 to get a stderr trace of every socket's
+// lifecycle events (connect/read/readable/read()/ref/unref/destroy),
+// each tagged with a per-socket sequence id, to reconstruct exactly
+// what a stalled connection last did. Not wired to any test; remove
+// once the hang is root-caused, or keep if it earns its place
+// alongside NODERATI_PPROF - undecided until then.
+var netTraceEnabled = os.Getenv("NODERATI_NET_TRACE") != ""
+var netTraceSeq atomic.Uint64
+
+func netTrace(id uint64, format string, args ...any) {
+	if !netTraceEnabled {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[net#%d %s] "+format+"\n", append([]any{id, time.Now().Format("15:04:05.000000")}, args...)...)
+}
 
 const socketHandleMarker = "__noderatiSocketHandle"
 
@@ -154,6 +178,11 @@ type socketState struct {
 	// real Node does anyway (ref()/unref() on an already-destroyed
 	// socket has no observable effect).
 	extOpFinal bool
+
+	// traceID is this socket's tag in the NODERATI_NET_TRACE diagnostic
+	// log (see the netTrace doc comment above) - assigned once, in
+	// newSocketState, independent of socketRegistry's own JS-handle id.
+	traceID uint64
 }
 
 // beginTrackedExternalOp records that the caller (doNetConnect/
@@ -180,6 +209,7 @@ func (s *socketState) setExternalOpActive(active bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.extRT == nil || s.extOpActive == active {
+		netTrace(s.traceID, "setExternalOpActive(%v) no-op (extRT-nil=%v already=%v)", active, s.extRT == nil, s.extOpActive == active)
 		return
 	}
 	// A ref() (active=true) arriving after the one-shot teardown
@@ -192,12 +222,15 @@ func (s *socketState) setExternalOpActive(active bool) {
 	// ExternalOp sets it), so the s.extOpActive == active check above
 	// already short-circuits that case.
 	if active && s.extOpFinal {
+		netTrace(s.traceID, "setExternalOpActive(true) blocked by extOpFinal")
 		return
 	}
 	s.extOpActive = active
 	if active {
+		netTrace(s.traceID, "BeginExternalOp()")
 		s.extRT.BeginExternalOp()
 	} else {
+		netTrace(s.traceID, "EndExternalOp()")
 		s.extRT.EndExternalOp()
 	}
 }
@@ -209,6 +242,7 @@ func (s *socketState) setExternalOpActive(active bool) {
 // call arriving after this point can never re-open a registration that
 // nothing remains alive to close.
 func (s *socketState) endTrackedExternalOp() {
+	netTrace(s.traceID, "endTrackedExternalOp (reader+writer loops both finished)")
 	s.setExternalOpActive(false)
 	s.mu.Lock()
 	s.extOpFinal = true
@@ -216,8 +250,9 @@ func (s *socketState) endTrackedExternalOp() {
 }
 
 func newSocketState(hwm int) *socketState {
-	s := &socketState{highWaterMark: hwm}
+	s := &socketState{highWaterMark: hwm, traceID: netTraceSeq.Add(1)}
 	s.cond = sync.NewCond(&s.mu)
+	netTrace(s.traceID, "created hwm=%d", hwm)
 	return s
 }
 
@@ -295,11 +330,14 @@ func (s *socketState) pushReadData(vmInst *vm.VM, obj *vm.PlainObject, chunk []b
 	if s.flowing {
 		encoding := s.encoding
 		s.mu.Unlock()
+		netTrace(s.traceID, "pushReadData n=%d flowing=true -> emit data", len(chunk))
 		emitDataChunk(vmInst, obj, chunk, encoding)
 		return
 	}
 	s.readBuf = append(s.readBuf, chunk...)
+	readBufLen := len(s.readBuf)
 	s.mu.Unlock()
+	netTrace(s.traceID, "pushReadData n=%d flowing=false readBufLen=%d", len(chunk), readBufLen)
 	s.maybeScheduleReadable(vmInst, obj)
 }
 
@@ -317,12 +355,16 @@ func (s *socketState) maybeScheduleReadable(vmInst *vm.VM, obj *vm.PlainObject) 
 	s.readableScheduled = true
 	s.mu.Unlock()
 	if alreadyScheduled {
+		netTrace(s.traceID, "maybeScheduleReadable: already scheduled, coalescing")
 		return
 	}
+	netTrace(s.traceID, "maybeScheduleReadable: scheduling next-tick emission")
 	vmInst.GetAsyncRuntime().ScheduleNextTick(func() {
 		s.mu.Lock()
 		s.readableScheduled = false
+		readBufLen := len(s.readBuf)
 		s.mu.Unlock()
+		netTrace(s.traceID, "emitting readable, readBufLen=%d", readBufLen)
 		emitOnObject(vmInst, obj, "readable")
 	})
 }
@@ -420,6 +462,7 @@ func (s *socketState) writerLoop(vmInst *vm.VM, rt runtime.AsyncRuntime, obj *vm
 		if len(item.data) > 0 {
 			_, writeErr = conn.Write(item.data)
 		}
+		netTrace(s.traceID, "writerLoop wrote n=%d isEnd=%v err=%v", len(item.data), item.isEnd, writeErr)
 		if writeErr == nil && item.isEnd {
 			if cw, ok := conn.(interface{ CloseWrite() error }); ok {
 				_ = cw.CloseWrite()
@@ -496,6 +539,7 @@ func (s *socketState) readerLoop(vmInst *vm.VM, rt runtime.AsyncRuntime, obj *vm
 		}
 
 		n, err := conn.Read(buf)
+		netTrace(s.traceID, "readerLoop conn.Read n=%d err=%v", n, err)
 		if n > 0 {
 			s.mu.Lock()
 			s.bytesRead += int64(n)
@@ -549,6 +593,7 @@ func (s *socketState) readerLoop(vmInst *vm.VM, rt runtime.AsyncRuntime, obj *vm
 // once regardless of which of those raced to get there first.
 func (s *socketState) destroyInternal(vmInst *vm.VM, obj *vm.PlainObject, hadError bool) {
 	s.closeOnce.Do(func() {
+		netTrace(s.traceID, "destroyInternal hadError=%v", hadError)
 		s.mu.Lock()
 		s.closed = true
 		s.destroyed = true
@@ -688,6 +733,7 @@ func buildSocketObject(vmInst *vm.VM, s *socketState) (*vm.PlainObject, vm.Value
 				s.endEmitted = true
 			}
 			s.mu.Unlock()
+			netTrace(s.traceID, "read(size=%d) -> null (buffer empty, shouldEnd=%v)", size, shouldEnd)
 			if shouldEnd {
 				scheduleEmit(vmInst, obj, "end")
 				s.destroyInternal(vmInst, obj, false)
@@ -703,7 +749,9 @@ func buildSocketObject(vmInst *vm.VM, s *socketState) (*vm.PlainObject, vm.Value
 			s.readBuf = s.readBuf[size:]
 		}
 		encoding := s.encoding
+		remaining := len(s.readBuf)
 		s.mu.Unlock()
+		netTrace(s.traceID, "read(size=%d) -> n=%d remaining=%d", size, len(chunk), remaining)
 		return encodeChunkValue(vmInst, chunk, encoding), nil
 	}))
 
@@ -850,10 +898,12 @@ func buildSocketObject(vmInst *vm.VM, s *socketState) (*vm.PlainObject, vm.Value
 	// unref'd it - confirmed via a live pprof goroutine dump during a
 	// real-undici fetch() E2E probe (docs/real-node-plan.md, Round 76/77).
 	obj.SetOwn("ref", vm.NewNativeFunction(0, false, "ref", func(_ []vm.Value) (vm.Value, error) {
+		netTrace(s.traceID, "JS called .ref()")
 		s.setExternalOpActive(true)
 		return self, nil
 	}))
 	obj.SetOwn("unref", vm.NewNativeFunction(0, false, "unref", func(_ []vm.Value) (vm.Value, error) {
+		netTrace(s.traceID, "JS called .unref()")
 		s.setExternalOpActive(false)
 		return self, nil
 	}))
@@ -1036,6 +1086,7 @@ func doNetConnect(vmInst *vm.VM, optsVal vm.Value, connectCb vm.Value) vm.Value 
 	rt := vmInst.GetAsyncRuntime()
 	rt.BeginExternalOp()
 	s.beginTrackedExternalOp(rt)
+	netTrace(s.traceID, "doNetConnect: dialing host=%s port=%s", getStrOpt(opts, "host", getStrOpt(opts, "hostname", "localhost")), portOpt(opts, "0"))
 
 	var wg sync.WaitGroup
 	wg.Add(2) // writer slot + reader slot; reader's Done() fires even on dial failure (see below)
@@ -1045,6 +1096,7 @@ func doNetConnect(vmInst *vm.VM, optsVal vm.Value, connectCb vm.Value) vm.Value 
 	go func() {
 		conn, err := dialTCP(opts)
 		if err != nil {
+			netTrace(s.traceID, "dial failed: %v", err)
 			s.mu.Lock()
 			s.closed = true
 			s.destroyed = true
@@ -1059,6 +1111,7 @@ func doNetConnect(vmInst *vm.VM, optsVal vm.Value, connectCb vm.Value) vm.Value 
 			return
 		}
 
+		netTrace(s.traceID, "dial succeeded, local=%s remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 		s.mu.Lock()
 		s.conn = conn
 		noDelay := s.pendingNoDelay
@@ -1086,6 +1139,7 @@ func doNetConnect(vmInst *vm.VM, optsVal vm.Value, connectCb vm.Value) vm.Value 
 
 	go func() {
 		wg.Wait()
+		netTrace(s.traceID, "reader+writer wg.Wait() returned, tearing down")
 		s.endTrackedExternalOp()
 	}()
 
