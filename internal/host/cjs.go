@@ -34,7 +34,7 @@ var nativeRequireNames = map[string]bool{
 	"fs": true, "path": true, "os": true, "util": true,
 	"assert": true, "url": true, "querystring": true,
 	"child_process": true, "readline": true, "tty": true, "process": true, "buffer": true,
-	"events": true, "stream": true, "crypto": true, "undici": true,
+	"events": true, "stream": true, "crypto": true,
 	"fs/promises": true,
 	"module":      true, "worker_threads": true,
 	"perf_hooks": true, "string_decoder": true,
