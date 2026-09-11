@@ -37,6 +37,59 @@ func TestUtilTypesPredicates(t *testing.T) {
 	}
 }
 
+// TestUtilTextEncoderDecoderAlias confirms real Node's long-standing
+// legacy alias - `require('util').TextEncoder === TextEncoder` is `true`
+// in real Node - holds for both the `require('util')` CJS shape and the
+// `import util from "node:util"` ESM shape. Found the hard way probing
+// real @silvia-odwyer/photon-node: its wasm-bindgen glue does
+// `const { TextEncoder, TextDecoder } = require('util')` at module top
+// level, so a missing pair here threw "undefined is not a constructor"
+// before the module's own WASM instantiation ever ran.
+func TestUtilTextEncoderDecoderAlias(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import util from "node:util";
+		JSON.stringify({
+			sameAsGlobal_encoder: util.TextEncoder === globalThis.TextEncoder,
+			sameAsGlobal_decoder: util.TextDecoder === globalThis.TextDecoder,
+			encoderWorks: new util.TextEncoder().encode("hi").length === 2,
+			decoderWorks: new util.TextDecoder().decode(new util.TextEncoder().encode("hi")) === "hi",
+		})
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"sameAsGlobal_encoder":true,"sameAsGlobal_decoder":true,"encoderWorks":true,"decoderWorks":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestUtilTextEncoderDecoderAliasCJS is the exact real call shape that
+// broke @silvia-odwyer/photon-node's wasm-bindgen glue:
+// `const { TextEncoder, TextDecoder } = require('util')` at CJS module
+// top level.
+func TestUtilTextEncoderDecoderAliasCJS(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := RunCJS(p, `
+		const { TextEncoder, TextDecoder } = require('util');
+		module.exports = JSON.stringify({
+			sameAsGlobal_encoder: TextEncoder === globalThis.TextEncoder,
+			sameAsGlobal_decoder: TextDecoder === globalThis.TextDecoder,
+			decoderWorks: new TextDecoder().decode(new TextEncoder().encode("hi")) === "hi",
+		});
+	`, "/virtual/test.js")
+	if len(errs) > 0 {
+		t.Fatalf("RunCJS: %v", errs[0])
+	}
+	want := `{"sameAsGlobal_encoder":true,"sameAsGlobal_decoder":true,"decoderWorks":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
 // TestUtilTypesSubpathModule drives the exact real call shape from
 // undici's lib/web/websocket/websocket.js and lib/web/fetch/util.js:
 // `require('node:util/types')` as its own distinct module, not

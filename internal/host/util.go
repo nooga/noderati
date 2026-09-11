@@ -246,6 +246,27 @@ func installUtilNatives(p *driver.Paserati) {
 		return wrapped, nil
 	})
 
+	// util.TextEncoder/util.TextDecoder: real Node re-exports the global
+	// WHATWG constructors here too (a long-standing legacy alias -
+	// `require('util').TextEncoder === TextEncoder` is `true` in real
+	// Node), and real code still reaches for them this way rather than
+	// the global. Found the hard way probing real
+	// `@silvia-odwyer/photon-node` (the WASM image-processing package
+	// pi-coding-agent's real image-resize path depends on, per
+	// docs/real-node-plan.md's "WASM-backed image resizing" open item):
+	// its wasm-bindgen-generated glue does
+	// `const { TextEncoder, TextDecoder } = require('util')` at module
+	// top level, so a missing pair here threw "undefined is not a
+	// constructor" before the module's own WASM instantiation ever ran -
+	// the global constructors were never in question, only their
+	// absence from this module's own exports.
+	if te, ok := vmInst.GetGlobal("TextEncoder"); ok {
+		exports["TextEncoder"] = te
+	}
+	if td, ok := vmInst.GetGlobal("TextDecoder"); ok {
+		exports["TextDecoder"] = td
+	}
+
 	proto := vm.Undefined
 	if vmInst != nil {
 		proto = vmInst.ObjectPrototype
