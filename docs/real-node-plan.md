@@ -10917,14 +10917,17 @@ would risk the working, verified undici/llhttp WASM path to unblock one
 image-resize call site that (per Round 67/76's own design) already has a
 documented graceful `null` fallback when image resizing isn't available.
 
-Not pursued further this round: filing this upstream against
-`tetratelabs/wazero` would be cheap and well-scoped (a concrete call
-site - wasm-bindgen-generated bindings, which covers most Rust-to-WASM
-output generally, not just photon-node - plus the exact `// TODO: Table`
-location and the `experimental/table` precedent showing they've thought
-about table access before). That's a third repo, outside this round's
-"noderati roadmap only" scope, and is the user's call to make, not
-something to do unprompted.
+**Already tracked upstream, checked before considering filing anything**:
+[wazero#2461](https://github.com/wazero/wazero/issues/2461), "Expose
+ExportedTable in api.Module to allow host access to tables (externref)",
+opened Jan 6 2026 by an unrelated reporter hitting the identical
+wasm-bindgen/externref-table wall - same root cause (`api.Module` has no
+table accessor), same motivating case (Rust/wasm-bindgen bindings). Open,
+unassigned, no maintainer response yet, no PR. Nothing to file - this
+round's finding is one more confirming data point on an already-open
+issue, not a new one. Not commented on it this round either: that's a
+third repo, outside this round's "noderati roadmap only" scope, and is
+the user's call to make, not something to do unprompted.
 
 **Status**: the "WASM-backed image resizing" ledger item is updated
 above from "never retried" to "retried, and blocked on a specific,
