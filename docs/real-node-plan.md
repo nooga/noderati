@@ -10743,6 +10743,25 @@ this repo's.
 `lib.dom.d.ts` (binder *and* checker, both directions - clean *and*
 error-detecting), and really emits correct output, all under noderati,
 once paserati#403 lands. Not yet attempted: self-hosting (still needs a
-microsoft/TypeScript source checkout), and the separate, unrelated
-`@types/node`/`undici-types` resolution gap noticed in passing above (not
-investigated - out of scope for this verification pass).
+microsoft/TypeScript source checkout).
+
+**The `@types/node`/`undici-types` finding, chased down same-day and closed
+- not a gap at all**: re-ran the exact failing scenario
+(`/tmp/domuse.ts`, no `types: []`) with real Node's own `tsc.js` from the
+same `examples/` cwd. **Byte-for-byte identical output**, same two
+`TS2792: Cannot find module 'undici-types'` diagnostics, same file paths,
+same line/column numbers, same exit code 2 - not merely "the same error
+class," the literal same text. Root cause, confirmed directly: TypeScript's
+own automatic `@types` auto-discovery walks up parent directories from the
+input file and had found an unrelated `@types/node@20.19.37` install inside
+`/Users/nooga/node_modules/.pnpm/` (a pnpm store belonging to some other,
+unrelated project on this machine, well outside this repo) whose own
+`node_modules/` (where pnpm's per-package isolation would normally symlink
+its private `undici-types` dependency) doesn't exist at all -
+`ls /Users/nooga/node_modules/.pnpm/@types+node@20.19.37/node_modules/@types/node/node_modules/`
+→ `No such file or directory`, even though `undici-types@5.26.5`/`@6.21.0`
+both exist as siblings in that same `.pnpm` store. A genuinely broken/
+incomplete pnpm install on this machine, unrelated to noderati or this
+repo, that both real Node and noderati's `tsc.js` discover identically and
+report on identically. This is Node parity, not a gap - closed without any
+code change.
