@@ -148,11 +148,19 @@ not-yet-implemented (or not-yet-verified) engine/host capability, tracked
 in each item's own round rather than in this ledger's four letter groups:
 
 - **Bedrock (AWS provider)** - real `net`/`tls`/`http`/`https` built and
-  verified (rounds 68-70), but a second, un-isolated blocker remains
-  (`@smithy/core/protocols`'s subpath import throws `require is not
-  defined` - a likely CJS/ESM interop gap, not root-caused further) and no
-  AWS credentials were ever available to attempt a real end-to-end call.
-  Last touched Round 72.
+  verified (rounds 68-70). The `@smithy/core/protocols` "`require is not
+  defined`" blocker (round 68) is closed: Round 94 root-caused it to two
+  real resolver bugs (a dynamic `import()` call misdetected as an ESM
+  marker, and a stray self-referential `node_modules/node_modules`
+  symlink defeating the CJS module cache across a circular require) and
+  fixed both, plus a third, independent `stream` gap (`Duplex`/
+  `PassThrough` missing entirely) found immediately after. The dependency
+  chain now reaches a new, smaller, precisely-scoped blocker instead:
+  `node:http2` doesn't exist in noderati at all (only `http2.constants`
+  is actually needed by the real call path, not the full session/
+  connection API) - not yet attempted. No AWS credentials were ever
+  available to attempt a real end-to-end call regardless. Last touched
+  Round 94.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -10934,3 +10942,163 @@ above from "never retried" to "retried, and blocked on a specific,
 external, upstream gap (wazero's missing public `WebAssembly.Table`
 API), not a noderati-side gap." One real, independent `util` bug found
 and fixed along the way.
+
+## Round 94: the Bedrock second blocker - two real resolver bugs found and
+fixed, one real `stream` gap found and fixed, one new blocker reached
+(`node:http2` doesn't exist at all)
+
+Picked up the roadmap's other open, noderati-owned item: the
+`@smithy/core/protocols` "`ReferenceError: require is not defined`"
+blocker Round 68 found and explicitly left unchased ("flagged for
+whoever picks up Bedrock next"). Reproduced directly against the real,
+unmodified `@smithy/core`/`@smithy/node-http-handler` packages inside
+pi-coding-agent's actual global install - `import { NodeHttpHandler }
+from '@smithy/node-http-handler'` alone, no AWS SDK client construction
+needed.
+
+**Bug 1, root-caused and fixed: `shouldWrapCJS` treats a dynamic
+`import(...)` call as proof a file is ESM.** Isolated the repro down
+past `NodeHttpHandler` to the single line that actually throws:
+`import { HttpResponse, buildQueryString } from
+'@smithy/core/protocols'` alone reproduces it. Direct inspection (a
+throwaway Go test calling `NodeModulesResolver.Resolve` and printing
+`rm.Source`, reverted once it had answered the question) showed the
+resolved file - real `@smithy/core`'s own `dist-cjs/submodules/
+protocols/index.js`, correctly selected per Round 68's own already-
+verified conditions logic - coming back as **raw, unwrapped** source,
+despite being unambiguous CommonJS (`'use strict'; var serde =
+require(...)`, no static `import`/`export` anywhere). Grepping the file
+for `\bimport\b` found exactly one hit: `const { EventStreamSerde } =
+await import('@smithy/core/event-streams')` at line 226 - a *dynamic*
+import call, which is legal in CommonJS too (a CJS module can use it to
+pull in an ESM-only dependency), not an ESM marker. `looksLikeESMSource`'s
+blanket word-boundary match on "import" couldn't tell the two apart.
+Confirmed by testing, not just reading: patched a local copy of the
+file with that one call removed (first attempt was contaminated by
+leaving the word "import" in my own explanatory comment, still tripping
+the same regex - caught by re-grepping before trusting the result) and
+watched the file get correctly wrapped and reach a *different*, later
+error. Fixed with a `dynamicImportCallRe` that strips `import(...)`
+occurrences before `looksLikeESMSource` runs its check - a genuine
+static `import ... from`/bare `export ...` still counts.
+
+**Bug 2, root-caused and fixed: a stray, real, self-referential
+symlink defeats the CJS module cache across a circular require.** With
+bug 1 fixed, the same probe advanced further and hit a new, single
+(non-runaway) failure: `TypeError: Class extends value undefined is not
+a constructor or null`. Traced (temporary `fmt.Println` instrumentation
+in `execFile`, logging every specifier/fromFile pair and cache hit-vs-
+miss, reverted once it had answered the question) to something far more
+interesting than a normal bug: every hop across a real, unavoidable
+circular require in `@smithy/core`'s own dist-cjs output
+(`core/protocols` requires `core/serde`, which requires `core/protocols`
+back) resolved to a **longer** absolute path than the last, with an
+extra spurious `/node_modules` segment appended each time - e.g.
+`.../node_modules/node_modules/node_modules/.../@smithy/core/dist-cjs/
+submodules/serde/index.js`. Root cause, found by inspecting the real,
+installed directory tree directly: `@earendil-works/pi-coding-agent`'s
+own global npm install has a **stray, real, self-referential symlink**,
+`node_modules/node_modules -> node_modules`, sitting right inside its
+own `node_modules`. `findPackageDir`'s ancestor walk (Round 64) accepts
+the first ancestor where `<ancestor>/node_modules/<pkgName>` exists on
+disk - and at the ancestor level equal to the real `node_modules`
+directory itself, that self-symlink makes `node_modules/node_modules/
+@smithy/core` resolve successfully (to the *same* real directory,
+content-wise) one level *before* the walk would have reached the
+correct, canonical `<pi-coding-agent>/node_modules/@smithy/core` one
+level up. Since `execFile`'s own module cache is keyed by the literal
+resolved absolute-path string, and each circular-require hop re-derives
+that path from a progressively deeper "current file" starting point, the
+same real file gets a longer, different cache key every time it's
+crossed - defeating cache identity entirely, so a circular require never
+gets the shared, in-progress `module.exports` real Node's own module
+cache (keyed by a `fs.realpath`-canonicalized path, precisely to survive
+exactly this kind of symlink shortcut) would hand back. Something
+reading an export from the wrong, freshly-(re)executing sibling instance
+- `class HttpProtocol extends SerdeContext`-style base-class lookups, in
+this dependency tree - got `undefined` instead of the real, already-
+defined class. Fixed with a new `canonicalPath` helper
+(`filepath.EvalSymlinks`, falling back to plain `filepath.Abs`) applied
+everywhere a resolved path becomes a module cache key or a nested
+require/import's own "from" directory - matching exactly what real
+Node's own resolution algorithm does, and why. One existing test,
+`TestNodeModulesResolverResolveScopedPkg`, had to be fixed alongside
+this: its hardcoded expected path silently assumed `t.TempDir()` itself
+was already symlink-free, which is false on macOS (`/var` ->
+`/private/var`) - the same class of assumption this whole bug was about,
+caught in noderati's own test suite by the very fix meant to catch it
+elsewhere.
+
+Both bugs verified against the real packages (not just synthetic
+repros): `@smithy/core/protocols`'s `HttpResponse`/`buildQueryString`
+now import cleanly and match real Node's own output. Two new regression
+tests added: `TestShouldWrapCJSIgnoresDynamicImportCall` (unit-level,
+both directions - a dynamic-import-only CJS file stays CJS, a genuine
+static-import file stays ESM) and
+`TestNodeModulesResolverCircularRequireThroughSelfSymlink` (reproduces
+the stray self-symlink directly with two minimal packages, no external
+dependency needed, asserting a value set by one side of a real circular
+require is visible via the *same* cached module object to the other
+side).
+
+**A third real, distinct bug found and fixed the same round: `stream`
+was missing `Duplex` and `PassThrough` entirely.** With both resolver
+bugs fixed, the probe advanced past `@smithy/core/protocols` entirely
+and hit a third, unrelated failure at the very next real dependency:
+`@smithy/core`'s own `dist-cjs/submodules/serde/index.js` does `class
+ChecksumStream extends node_stream.Duplex` at Bedrock's real checksum-
+verification call site - the same "Class extends value undefined"
+shape Transform's own missing-entirely gap (Round 73) once produced,
+this time because `stream.go` genuinely never had a `Duplex` at all.
+Confirmed directly: `import stream from 'node:stream'` showed
+`Duplex: undefined` and `PassThrough: undefined` under noderati against
+real Node's `Duplex: function`/`PassThrough: function`. A real Duplex is
+two genuinely independent sides (unlike Transform's write-drives-read
+pipeline) - `ChecksumStream` is piped into from an upstream source
+(driving `_write`, which independently calls `this.push()` for its own
+readable output) and read from separately as a `Readable`. Implemented
+by combining this file's existing `Readable` behavior (`push`/`destroy`/
+the async iterator/`pipe`) with a `Writable`-shaped `write()`/`end()`
+that calls the real per-subclass override points (`_write`, `_final`)
+real Duplex subclasses expect, plus a default no-op `_read(size)`.
+`PassThrough` turned out to be free once `Transform` exists (its default
+`_transform` is already an identity pass-through): `class PassThrough
+extends Transform {}`. Two new tests added -
+`TestStreamDuplexSubclassable` (drives the exact real pipe-in/push-out
+shape `ChecksumStream` uses, including a `_final` override that
+`push(null)`s to end the readable side - real Duplex's two sides don't
+auto-close each other) and `TestStreamPassThroughIsIdentity`.
+
+**Verification for all three fixes together**: `go build ./...`/
+`go vet ./...` clean; full `go test ./... -skip TestEventsAddAbortListener`
+green (that skip is `paserati#372`, explicitly out of this project's own
+scope per the current division of labor - see Round 92's ledger entry);
+`pi --version`/`--help` and the full scoreboard re-run and match baseline
+exactly, confirming these resolver-level changes (which affect *every*
+module resolution, not just this one package) introduced no regressions
+anywhere else in the real dependency tree.
+
+**New blocker reached, not yet chased**: past all three fixes, the same
+probe (`import { NodeHttpHandler } from '@smithy/node-http-handler'`)
+now fails with `Error: No such built-in module: node:http2` -
+`@smithy/node-http-handler`'s own barrel `index.js` re-exports its
+HTTP/2 handler alongside the HTTP/1.1 one Bedrock's default client
+actually uses, and that handler's own file does `import { constants }
+from "node:http2"` at its own top level - just the real `http2.constants`
+object (plain, static values), not any of `http2`'s actual session/
+connection API. `node:http2` doesn't exist in noderati **at all** today
+(confirmed: not in `nativeRequireNames`, no `declareHTTP2`-shaped file
+anywhere in `internal/host`) - a materially bigger, new-builtin-module
+decision than the three bugs above, not a small fix to existing
+machinery, so left for its own round rather than folded in here.
+
+**Status**: Bedrock's second blocker (`@smithy/core/protocols`'s
+"`require is not defined`", flagged unchased since Round 68) is closed -
+both real resolver bugs behind it are fixed and verified against the
+real package, not a synthetic stand-in. A third real, independent
+`stream` gap found immediately afterward is also fixed. Bedrock's
+dependency chain now reaches one new, clearly-scoped, and much smaller
+next blocker (`http2.constants`) instead of the old, vaguer
+"CJS/ESM interop gap, not root-caused further." AWS credentials are
+still not available in this environment to attempt an actual end-to-end
+call regardless of how far the dependency chain itself gets.
