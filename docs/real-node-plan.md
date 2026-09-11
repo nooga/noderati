@@ -10596,6 +10596,19 @@ doesn't have to re-derive them):
    out with the same instrumented rigor as 1-3, but nothing in the code
    read suggests an accounting bug here.
 
+   **Correction (Round 92)**: this was half wrong. The never-shrink policy
+   itself is fine, but it's exactly what made mechanism 2's sibling sites
+   dangerous - and this round's own grep of the four `returningFrameRegSize
+   := ...` sites (`OpReturn` at the time of writing, plus what turned out to
+   be `OpReturnUndefined`/`OpReturnFinally`/`ActionReturn`) had already
+   spotted that only the first used `frame.allocatedRegSize` while the
+   other three used `function.RegisterSize`, flagging it in the moment as
+   "a THIRD potential source of mismatch" - then moving on to test other
+   hypotheses instead of that one. It was the actual bug. Recorded here
+   plainly: the lead was in hand and got set down unfollowed, the same
+   shape as this document's other recorded self-corrections (Round 87's
+   timer investigation, Round 64's stale-plan-note catch).
+
 **A methodology note worth keeping**: a second run, instrumented to fire
 only inside the exact absolute `nextRegSlot`/`frameCount` window the first
 run's `+3` signature had occupied, produced zero hits - even though nothing
@@ -10633,7 +10646,103 @@ under noderati, verified by running the emitted JS and diffing against real
 Node's own output. The wall is a specific, bounded, now-filed engine gap
 (DOM-lib-sized binder workloads only) rather than a fundamental blocker on
 running `tsc` at all. Not yet attempted: self-hosting (compiling tsc's own
-TS source - needs a microsoft/TypeScript checkout this round didn't fetch),
-and finding paserati#399's exact leaking opcode (next round, in either
-repo, using the trigger-relative approach above rather than absolute-value
-windows).
+TS source - needs a microsoft/TypeScript checkout this round didn't fetch).
+paserati#399's exact leaking opcode was found and fixed in Round 92, below
+- rather than needing the trigger-relative instrumentation approach this
+round proposed.
+
+## Round 92: paserati#399 fixed and verified from noderati's side - the real `function.RegisterSize`-vs-`frame.allocatedRegSize` bug, exactly where Round 91 had already looked
+
+User reported a PR up against paserati closing out #399/#400/#401 and asked
+to test it. Fetched, reviewed, and verified
+[paserati#403](https://github.com/nooga/paserati/pull/403) (`fix-b1-register-frame-leaks`,
+commit `e8ea9e8b`) against this repo's own real-world repro - the thing the
+PR's own description says hadn't been done yet ("A real re-run of #399's
+tsc.js/lib.dom.d.ts repro against noderati... #399 stays open until that's
+done").
+
+**The fix, and why it matches Round 91's own numbers exactly**: `OpReturn`
+already reclaimed register space via `frame.allocatedRegSize` (the frame's
+*actual* allocation, which `OpTailCall`'s "never shrink" policy can leave
+larger than the currently-executing function's own `RegisterSize` after a
+tail-call chain). `OpReturnUndefined`, `OpReturnFinally`, and the
+`ActionReturn` pending-action arm all instead used `function.RegisterSize`
+- the *current* function's own size, ignoring any TCO expansion an earlier
+link in the same tail-call chain had already grown the frame to. Every
+implicit return (or return-through-finally, or return-through-pending-
+action) out of a frame that had been expanded by an earlier tail call
+reclaimed too little, permanently - matching Round 91's own instrumented
+numbers precisely (frame sum 2,148 vs. `nextRegSlot` 1,048,575) and its
+`+3`-per-sample, flat-`frameCount=20` growth signature (the *amended*
+reading from Round 91 - "a larger push/pop pair mismatched by 3" - was the
+correct one, not the original "one tiny call, unreclaimed" phrasing).
+Same-shaped separate fixes: the missing `newFrame.allocatedRegSize` at the
+bound-constructor `new` path (#400, exactly as filed), and a real
+implementation of the `ActionReturn` stub (#401), mirroring the
+already-correct `OpHandlePending` arm.
+
+**The self-correction worth recording plainly**: Round 91's own
+investigation, while grepping every `returningFrameRegSize := ...` site
+across the four return-family opcodes, *had already noticed* that only one
+of the four used `frame.allocatedRegSize` while the other three used
+`function.RegisterSize`, and flagged it in the moment as "a THIRD potential
+source of mismatch" - then set it aside to go test other hypotheses (the
+exception-unwind leak, the `ActionReturn` stub's own reachability, the
+bound-constructor site) instead of following up on that one directly. It
+was the actual bug the whole time. No new instrumentation was needed to
+find it this round - just reading `pkg/vm/vm.go`'s PR diff, since the fix's
+own commit message names the exact mechanism. Recorded here so a future
+round internalizes the lesson Round 91's own text didn't quite land on:
+when an audit turns up "N near-identical sites, only one shaped
+differently," that asymmetry is itself the lead, not a side note to record
+and move past.
+
+**Verification, from noderati's side, against the unmerged PR branch**:
+- `git -C ../paserati` on `fix-b1-register-frame-leaks` (`e8ea9e8b`);
+  `go build ./...`/`go vet ./...` clean.
+- Re-ran the exact #399 repro
+  (`examples/tsconfig.dom.json`, `lib: ["es2018", "dom"]`): **clean exit
+  0**, no more `Register stack overflow` - a 100%-reproducible crash on
+  every prior attempt, now gone.
+- `examples/tsconfig.defaultlib.json` (the implicit-DOM default-lib case):
+  clean.
+- The two known-good fixtures (`tsconfig.es5lib.json`,
+  `tsconfig.es2018lib.json`) and `tsc --version`/`--help`: still clean -
+  no regression from the fix.
+- Re-ran the Round 91 multi-file compile-and-run test (`helper.ts`/
+  `main.ts`, `strict: true`, real emit): output (`perimeter: 14`,
+  `distance: 5`) still matches real Node byte-for-byte.
+- **New this round, closing a gap `advisor` caught**: Round 91's fixtures
+  all typecheck a three-line function - DOM types are bound, but the
+  *checker* barely exercises them. Wrote a small program that actually
+  *uses* DOM types (`const el: HTMLElement | null =
+  document.getElementById(...)`, `el.addEventListener("click", (e:
+  MouseEvent) => ...)`) with `types: []` (to avoid an unrelated,
+  pre-existing `@types/node`/`undici-types` resolution gap this test
+  tripped over from auto-discovered `@types` packages elsewhere in the
+  directory tree - noted as a separate, unrelated finding, not chased
+  further here) - clean exit 0. Then broke it on purpose
+  (`e.bogusProperty`) and confirmed the checker genuinely catches it:
+  `error TS2339: Property 'bogusProperty' does not exist on type
+  'MouseEvent'.` - a real, correct diagnostic against the real
+  `lib.dom.d.ts`, not just a binder pass-through.
+- noderati's own `internal/host` suite (`go test ./internal/host/... -skip
+  'TestEventsAddAbortListener'`): green, ~9.6s, unchanged.
+- paserati's own full `go test ./...` on the PR branch, including the two
+  new smoke tests it ships
+  (`tests/scripts/tco_regsize_leak_on_implicit_return.ts`,
+  `tests/scripts/bound_constructor_regsize_leak.ts`): all green.
+
+Posted the full verification as a comment on
+[paserati#403](https://github.com/nooga/paserati/pull/403) rather than
+closing #399 directly - that's the PR author's call to make on merge, not
+this repo's.
+
+**Status**: Phase 6's tsc milestone is now unqualified rather than bounded
+- real, unmodified `tsc.js` parses, really typechecks against the real
+`lib.dom.d.ts` (binder *and* checker, both directions - clean *and*
+error-detecting), and really emits correct output, all under noderati,
+once paserati#403 lands. Not yet attempted: self-hosting (still needs a
+microsoft/TypeScript source checkout), and the separate, unrelated
+`@types/node`/`undici-types` resolution gap noticed in passing above (not
+investigated - out of scope for this verification pass).
