@@ -10495,3 +10495,145 @@ every module `registerJSShim` serves, not just `events`/`stream`, so
 the full suite (not just the two directly-touched files' tests) is
 what actually confirms nothing else depended on the old
 per-specifier-instance behavior.
+
+## Round 91: Phase 6 started - real, unmodified `tsc.js` runs under noderati (parse, real typecheck, real emit all work); hits a real paserati register-stack leak the moment `lib.dom.d.ts` enters the picture, filed as paserati#399
+
+Picked up Phase 6 (real `tsc`) at the user's direction: attempt running the
+real, unmodified npm `typescript@5.8.3` package's `tsc.js` under noderati,
+attempt compiling a real program with it, and attempt running it with
+real typechecking on (not just the `noLib`/`skipLibCheck` shortcuts the
+uncommitted `examples/tsconfig.*.json` fixtures from before this round were
+reaching for).
+
+**`tsc --version`/`--help` and `noLib` emit already worked, unchanged from
+before this round** - `tsc.js -p tsconfig.nolib.json` against `hello-tsc.ts`
+emits correct JS to disk with `noLib: true`. Not the interesting case; real
+typechecking against the actual `lib.*.d.ts` files is.
+
+**Real typechecking works**: `lib: ["es5"]` and `lib: ["es2018"]` (no `dom`)
+both typecheck `hello-tsc.ts` clean (exit 0) with a real, unmodified
+`lib.es5.d.ts`/`lib.es2018.d.ts` bound and checked by tsc's own real binder
+and checker - no shortcuts. Went further than the single-file smoke test:
+wrote a real two-file program (`helper.ts` exporting an `interface`/
+`class`/function, `main.ts` importing and using them, plus a tiny
+`ambient.d.ts` for `console` since Node's globals aren't part of `lib`
+`es2018`/`dom`) with `strict: true`, compiled it with real emit
+(`noEmit: false`), and ran the emitted CommonJS JS under noderati -
+output (`perimeter: 14`, `distance: 5`) matches real Node byte-for-byte.
+This is the "compile a real program with tsc running in noderati" ask,
+satisfied for the emit-and-run half; the third ask (self-hosting - tsc
+compiling *its own* TypeScript source) turned out to be unattemptable as
+literally stated: `examples/node_modules/typescript` ships only the
+compiled `lib/`, no `src/` - fetching a full microsoft/TypeScript checkout
+at the end of this round wasn't attempted (per `advisor`'s pushback against
+a large, unplanned clone this late in a session); recorded as not attempted
+rather than implied covered.
+
+**The wall**: adding `"dom"` to `lib` is the single discriminating variable.
+`lib: ["es2018", "dom"]` (and the plain default lib set for an `es2018`
+target with no explicit `lib`, which implicitly includes DOM) crashes every
+time with a `Register stack overflow` inside the VM itself - not a real
+Node/tsc error, an internal paserati accounting failure. Confirmed
+deterministic: `es5`-only and `es2018`-only clean every run, `dom` added
+crashes every run, same trace shape (`bind`/`bindContainer`/`bindChildren`/
+`bindEachChild`/`forEach` chain, ~71 frames, bottoming out in
+`bindSourceFile`/`createTypeChecker`).
+
+**Root-caused the *mechanism*, not yet the exact opcode**: instrumented
+paserati's VM (`pkg/vm/call.go`, `vm.go`, `vm_init.go` - all instrumentation
+reverted before this round's commit, per the project's standing practice of
+not shipping unverified debug diffs) to dump `vm.frameCount`,
+`vm.nextRegSlot`, and a walk of every live frame's own `RegisterSize` at the
+crash point: `frameCount=71`, `nextRegSlot=1,048,575` (of a
+1,048,576-register file), but the *sum* of the 71 live frames' own
+`RegisterSize` is only **2,148**. A ~1,046,000-register gap unaccounted for
+by anything currently on the call stack - a real register-stack leak, not a
+legitimate depth or sizing problem, and not what the "Register stack
+overflow" message's own framing (which reads like an ordinary
+out-of-space error) suggests at first glance. Sampling `nextRegSlot`
+whenever `frameCount` returned to a shallow value showed the shape clearly:
+a long, perfectly monotonic **`+3` per sample with `frameCount` pinned at
+exactly 20**, sustained over roughly 1,000 consecutive samples late in the
+run. What that `+3` actually is is **not established**: it could be one
+small (`RegisterSize == 3`) call leaking its entire window on return, or a
+larger push/pop pair mismatched by 3. A targeted follow-up gated on
+`requiredRegs == 3` in that exact `frameCount`/`nextRegSlot` band found
+**zero** matching pushes - evidence against the "one tiny call, fully
+unreclaimed" reading, slightly favoring a larger pair off by 3, though the
+window-reproducibility caveat below means this follow-up's null result
+isn't fully conclusive either.
+
+**Four plausible mechanisms instrumented and ruled out** (each fired far
+too little, or not at all, to be this leak - recorded so a future round
+doesn't have to re-derive them):
+1. The already-documented native-boundary exception-unwind leak
+   (`truncateFramesTo`, cross-referenced with paserati#61) - real, but only
+   269 registers total across the whole run (2 events). Not the driver.
+2. `pkg/vm/vm.go`'s `case ActionReturn:` resumption arm is a literal
+   `// TODO: Implement return logic` no-op stub (discards the pending
+   return value, never pops the frame) - a real, separate, confirmed bug,
+   but instrumented to fire **0 times** in this workload; both a plain and
+   a loop-nested `try { return x } finally { ... }` repro executed
+   correctly (the compiler apparently inlines the finally at those exit
+   edges rather than using this runtime path). Worth its own fix, not this
+   leak's cause - filed separately as
+   [paserati#401](https://github.com/nooga/paserati/issues/401).
+3. `new` on a bound constructor (`new (Fn.bind(...))()`) is missing
+   `newFrame.allocatedRegSize = requiredRegs` at its frame-push site
+   (`pkg/vm/vm.go`, the bound-constructor branch around what's currently
+   line ~12710) - the only one of six `newFrame.registers =
+   vm.registerStack[...]` push sites across `call.go`/`op_spreadnew.go`/
+   `vm.go` missing that assignment, confirmed by inspection and by printing
+   the stale value at that exact line. A real latent bug (would leak on
+   every real use of this JS pattern), but fired **0 times** here - not
+   this bug's cause either. Filed separately as
+   [paserati#400](https://github.com/nooga/paserati/issues/400).
+4. `OpTailCall`'s deliberate "never shrink" register-window policy (own
+   comment: "we do NOT shrink! Bytecode may reference registers beyond
+   RegisterSize") - read closely; looks like an internally-consistent
+   design (a tail-call chain's peak usage is reclaimed once, in full, when
+   the reused frame eventually returns via the ordinary path). Not ruled
+   out with the same instrumented rigor as 1-3, but nothing in the code
+   read suggests an accounting bug here.
+
+**A methodology note worth keeping**: a second run, instrumented to fire
+only inside the exact absolute `nextRegSlot`/`frameCount` window the first
+run's `+3` signature had occupied, produced zero hits - even though nothing
+about the leak mechanism should have changed between the two builds. Most
+likely explanation: tsc.js's own execution touches enough object/`Map`
+iteration-order-sensitive code paths that the *exact* numeric trajectory of
+`nextRegSlot` isn't bit-reproducible run to run, even though the qualitative
+bug (and the final crash) is 100% deterministic. Filed this as an explicit
+caveat in the upstream issue: the next attempt at finding the exact opcode
+needs a **trigger-relative** invariant check (record `{funcName,
+allocatedRegSize}` at push, assert the matching amount is reclaimed at pop,
+flag any mismatch immediately with full context) rather than instrumentation
+keyed off absolute register-count windows.
+
+Filed as [paserati#399](https://github.com/nooga/paserati/issues/399), with
+the full repro (a five-line `tsconfig.json` + `hello.ts` against the real,
+unmodified npm package), the frame/register numbers above, the `+3` growth
+signature, and all four ruled-out mechanisms - so the next round (in either
+repo) can start from "here's what it isn't" instead of re-deriving it.
+
+**Fixtures kept** (per this ledger's established practice of keeping the
+artifacts that make a finding reproducible, alongside the pre-existing
+`examples/tsconfig.{connect,libhang,nolib}.json`/`hello-tsc.ts`/
+`lib.stub.d.ts`): `examples/tsconfig.es5lib.json` (clean),
+`examples/tsconfig.es2018lib.json` (clean, no dom),
+`examples/tsconfig.dom.json` (the failing case - `lib: ["es2018", "dom"]`),
+`examples/tsconfig.defaultlib.json` (the plain-default-lib-set case, which
+fails identically since `es2018`'s default lib set implicitly includes
+DOM).
+
+**Status**: this is a real Phase 6 milestone, not a failure - real,
+unmodified `tsc.js` parses, really typechecks (against real `lib.es5.d.ts`/
+`lib.es2018.d.ts`), and really emits correct multi-file CommonJS output
+under noderati, verified by running the emitted JS and diffing against real
+Node's own output. The wall is a specific, bounded, now-filed engine gap
+(DOM-lib-sized binder workloads only) rather than a fundamental blocker on
+running `tsc` at all. Not yet attempted: self-hosting (compiling tsc's own
+TS source - needs a microsoft/TypeScript checkout this round didn't fetch),
+and finding paserati#399's exact leaking opcode (next round, in either
+repo, using the trigger-relative approach above rather than absolute-value
+windows).
