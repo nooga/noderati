@@ -172,6 +172,162 @@ class Writable extends EventEmitter {
   }
 }
 
+// Duplex was missing entirely - found the hard way while chasing the
+// Bedrock "@smithy/core/protocols" blocker's actual next real failure
+// (docs/real-node-plan.md, Round 93): real, unmodified
+// @smithy/core's own dist-cjs submodules/serde/index.js does
+// "class ChecksumStream extends node_stream.Duplex" at real Bedrock's
+// actual checksum-verification call site, not a hypothetical one - a
+// missing Duplex throws "Class extends value undefined is not a
+// constructor or null" immediately at require() time, same failure
+// shape Transform's own missing-entirely gap (above) once did.
+//
+// A real Duplex is genuinely two independent sides - readable and
+// writable - not one side driving the other the way Transform's
+// write->_transform->push pipeline does; ChecksumStream is exactly
+// that shape: an upstream source is .pipe()'d into it (driving _write,
+// which independently calls this.push() to feed its OWN readable
+// side), and something else reads from it as a Readable. So this
+// combines Readable's push()/destroy()/asyncIterator/pipe() (this
+// file's own Readable, above, duplicated rather than shared - matching
+// how Writable/Transform are already each self-contained here) with a
+// Writable-shaped write()/end() that calls the real per-subclass
+// override points (_write, _final) real Duplex subclasses expect,
+// plus a default no-op _read(size) so a subclass that (like
+// ChecksumStream) only reacts to _read for backpressure release still
+// has one to override.
+class Duplex extends EventEmitter {
+  constructor(_opts) {
+    super();
+    this.readable = true;
+    this.writable = true;
+    this._queue = [];
+    this._ended = false;
+    this._error = null;
+    this._waiters = [];
+    this._disturbed = false;
+    this.destroyed = false;
+  }
+  _read(_size) {}
+  _write(chunk, _encoding, callback) {
+    callback();
+  }
+  _final(callback) {
+    callback();
+  }
+  _settleWaiters() {
+    while (this._waiters.length && (this._queue.length || this._ended || this._error)) {
+      const { resolve, reject } = this._waiters.shift();
+      if (this._error) {
+        reject(this._error);
+      } else if (this._queue.length) {
+        resolve({ value: this._queue.shift(), done: false });
+      } else {
+        resolve({ value: undefined, done: true });
+      }
+    }
+  }
+  push(chunk) {
+    if (chunk === undefined || chunk === null) {
+      this._ended = true;
+      this._settleWaiters();
+      this.emit("end");
+      return false;
+    }
+    if (this._events.data && this._events.data.length) this._disturbed = true;
+    this._queue.push(chunk);
+    this.emit("data", chunk);
+    this._settleWaiters();
+    this._read(chunk.length);
+    return true;
+  }
+  destroy(err) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    if (err) {
+      this._error = err;
+      this.emit("error", err);
+    } else {
+      this._ended = true;
+    }
+    this._settleWaiters();
+    this.emit("close");
+    return this;
+  }
+  [Symbol.asyncIterator]() {
+    return {
+      next: () => {
+        this._disturbed = true;
+        if (this._queue.length) {
+          return Promise.resolve({ value: this._queue.shift(), done: false });
+        }
+        if (this._error) {
+          return Promise.reject(this._error);
+        }
+        if (this._ended) {
+          return Promise.resolve({ value: undefined, done: true });
+        }
+        return new Promise((resolve, reject) => {
+          this._waiters.push({ resolve, reject });
+        });
+      },
+    };
+  }
+  write(chunk, encoding, cb) {
+    if (typeof encoding === "function") {
+      cb = encoding;
+      encoding = undefined;
+    }
+    this._write(chunk, encoding, (err) => {
+      if (err) {
+        this.emit("error", err);
+        if (typeof cb === "function") cb(err);
+        return;
+      }
+      if (typeof cb === "function") cb();
+    });
+    return true;
+  }
+  end(chunk, encoding, cb) {
+    if (typeof chunk === "function") {
+      cb = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === "function") {
+      cb = encoding;
+    }
+    const finishUp = (err) => {
+      if (err) {
+        this.emit("error", err);
+        if (typeof cb === "function") cb(err);
+        return;
+      }
+      this.emit("finish");
+      if (typeof cb === "function") cb();
+    };
+    if (chunk !== undefined) {
+      this._write(chunk, encoding, (err) => {
+        if (err) {
+          finishUp(err);
+          return;
+        }
+        this._final(finishUp);
+      });
+    } else {
+      this._final(finishUp);
+    }
+    return this;
+  }
+  pipe(dest) {
+    this.on("data", (chunk) => {
+      if (dest && typeof dest.write === "function") dest.write(chunk);
+    });
+    this.on("end", () => {
+      if (dest && typeof dest.end === "function") dest.end();
+    });
+    return dest;
+  }
+}
+
 // Transform was missing entirely - found the hard way while probing
 // real undici (round 73, docs/real-node-plan.md): real undici's own
 // lib/web/eventsource/eventsource-stream.js does
@@ -251,6 +407,16 @@ class Transform extends EventEmitter {
     return dest;
   }
 }
+
+// PassThrough was missing entirely - found alongside Duplex above,
+// same round, same real @smithy/core/dist-cjs dependency tree
+// (submodules/serde/index.js's own real ChecksumStream usage sits
+// right next to real PassThrough usage elsewhere in that file). Real
+// Node's own PassThrough is exactly this: a Transform with no
+// overrides at all - Transform's own default _transform(chunk, enc,
+// cb) already does the identity pass-through, so there's nothing left
+// to add.
+class PassThrough extends Transform {}
 
 // pipelineStreams was previously a silent no-op (both node:stream and
 // node:stream/promises exported 'async function pipeline(..._streams) {}')
@@ -364,8 +530,8 @@ function isErrored(stream) {
   return !!(stream && stream._error);
 }
 
-export { Readable, Writable, Transform, pipeline, isDisturbed, isErrored, pipelineStreams as _pipelineStreams };
-export default { Readable, Writable, Transform, pipeline, isDisturbed, isErrored };
+export { Readable, Writable, Duplex, Transform, PassThrough, pipeline, isDisturbed, isErrored, pipelineStreams as _pipelineStreams };
+export default { Readable, Writable, Duplex, Transform, PassThrough, pipeline, isDisturbed, isErrored };
 `
 
 const streamPromisesShim = `import { _pipelineStreams } from "stream";

@@ -287,3 +287,77 @@ func TestStreamTransformPipesToDest(t *testing.T) {
 		t.Errorf("got %q, want %q", val.ToString(), "abab")
 	}
 }
+
+// TestStreamDuplexSubclassable drives the exact real shape that
+// surfaced Duplex's absence in the first place (docs/real-node-plan.md,
+// Round 93): real, unmodified @smithy/core's own dist-cjs
+// submodules/serde/index.js's ChecksumStream `extends Duplex`, is
+// .pipe()'d into from an upstream source (driving _write independently
+// of anything reading from it), and separately pushes its own output
+// via this.push() for whatever reads it as a Readable - the two sides
+// genuinely independent, unlike Transform's write-drives-read pipeline.
+func TestStreamDuplexSubclassable(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Duplex, Readable } from "node:stream";
+
+		class Upper extends Duplex {
+			_write(chunk, _encoding, callback) {
+				this.push(String(chunk).toUpperCase());
+				callback();
+			}
+			// A real Duplex's two sides are independent - ending the
+			// writable half doesn't end the readable half on its own
+			// (real Node's own default allowHalfOpen behavior); a
+			// subclass that wants "end write -> end read" has to say so
+			// itself, exactly like real ChecksumStream's own _final does.
+			_final(callback) {
+				this.push(null);
+				callback();
+			}
+		}
+
+		const source = new Readable();
+		const t = new Upper();
+		let result = "";
+		let ended = false;
+		t.on("data", (chunk) => { result += chunk; });
+		t.on("end", () => { ended = true; });
+		source.pipe(t);
+		source.push("hello ");
+		source.push("world");
+		source.push(null);
+		JSON.stringify({ result, ended })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"result":"HELLO WORLD","ended":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestStreamPassThroughIsIdentity checks real Node's own PassThrough
+// contract: a Transform with no overrides at all, passing data through
+// unchanged - not a separate implementation of its own.
+func TestStreamPassThroughIsIdentity(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { PassThrough } from "node:stream";
+		const t = new PassThrough();
+		let result = "";
+		t.on("data", (chunk) => { result += chunk; });
+		t.write("abc");
+		t.end("def");
+		result
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "abcdef" {
+		t.Errorf("got %q, want %q", val.ToString(), "abcdef")
+	}
+}
