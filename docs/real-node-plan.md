@@ -160,9 +160,11 @@ in each item's own round rather than in this ledger's four letter groups:
   concurrency (today's in-process fallback covers the one real consumer,
   so low urgency). Round 67.
 - **WASM-backed image resizing** (`resizeImageInProcess`, real Photon via
-  WebAssembly) - flagged before noderati had WebAssembly at all; Round 76
-  built real WASM support for a different consumer (undici's llhttp
-  parser) and this was never retried against it.
+  WebAssembly) - retried in Round 93 against the real
+  `@silvia-odwyer/photon-node` package. No longer "never retried"; the
+  blocker is now precisely identified as a missing `WebAssembly.Table`
+  in wazero's own public API (see Round 93), not a noderati-side gap
+  that can be closed by more host code.
 - **The stray `"1"` file** pi writes to disk - confirmed real, mechanism
   unconfirmed, cosmetic. Round 67.
 - **Self-hosting `tsc`** (compiling TypeScript's own source with
@@ -10827,3 +10829,105 @@ incomplete pnpm install on this machine, unrelated to noderati or this
 repo, that both real Node and noderati's `tsc.js` discover identically and
 report on identically. This is Node parity, not a gap - closed without any
 code change.
+
+## Round 93: WASM-backed image resizing retried against real Photon - one
+real `util` gap fixed, one hard structural gap identified and root-caused
+in wazero, not noderati
+
+Per the roadmap's "check photon" instruction: retried the "WASM-backed
+image resizing" open item (last touched at "never retried" in Round 76's
+wake) against the actual, real, globally-installed
+`@earendil-works/pi-coding-agent`'s own `@silvia-odwyer/photon-node`
+dependency - a real Rust/wasm-bindgen-generated npm package, not a
+synthetic WASM module.
+
+**Method**: rather than running pi's full TUI/worker stack, extracted a
+minimal probe (`/tmp/photon_test/probe.mjs`) that imports
+`photon_rs.js` (the package's real, unmodified, 4521-line wasm-bindgen
+glue) directly and drives its actual call shape -
+`PhotonImage.new_from_byteslice` -> `resize` -> `.get_bytes()`/
+`.get_bytes_jpeg()` - against a real generated tiny PNG. Confirmed the
+probe works correctly under real Node first (baseline), then ran it
+under noderati.
+
+**Fixed: `require('util').TextEncoder`/`.TextDecoder` were `undefined`.**
+Real Node aliases the global WHATWG constructors onto the `util` module
+too (`require('util').TextEncoder === TextEncoder` is `true` in real
+Node) - a long-standing legacy alias, and real code still reaches for
+them this way. `photon_rs.js` does exactly
+`const { TextEncoder, TextDecoder } = require('util')` at module top
+level, so the missing pair threw `"undefined is not a constructor"`
+before the module's own WASM instantiation ever ran - the global
+constructors were never in question, only this module's own re-export
+of them. Fixed in `internal/host/util.go`'s `installUtilNatives`;
+verified both the ESM (`import util from "node:util"`) and CJS
+(`require('util')`) shapes now alias identically to the globals and
+actually work, with two new tests
+(`TestUtilTextEncoderDecoderAlias`/`TestUtilTextEncoderDecoderAliasCJS`).
+Committed as its own unit (`c9b1317`), independent of whatever this round
+concludes about the deeper WASM gap below.
+
+**Found, and root-caused to wazero itself: no `WebAssembly.Table`
+support.** With the `util` fix in, the probe advances much further into
+the real glue - past `TextEncoder`/`TextDecoder` construction, into the
+module's own WASM instantiation - and then fails at
+`wasm.__wbindgen_export_2.grow(...)`: `TypeError: Cannot read property
+'grow' of undefined`. `__wbindgen_export_2` is wasm-bindgen's generated
+name for the module's exported **externref table** - its whole
+generated-glue pattern for passing JS object references into Rust relies
+on the host exposing a real, mutable `WebAssembly.Table`-like object
+(`.grow(n)`/`.set(i, v)`/`.get(i)`) wrapping the WASM instance's own
+table export.
+
+`internal/host/webassembly_global.go`'s own header comment already
+documents "no `WebAssembly.Table`" as a deliberate Round 76 scoping
+decision - built for exactly what real undici's `lazyllhttp()` needed,
+nothing more. What's new this round is confirming *why that scope can't
+just be widened now*, by checking the actual constraint underneath it:
+
+- noderati's WASM runtime is `github.com/tetratelabs/wazero`, pinned at
+  `v1.12.0` - confirmed, via `go list -m -versions`, to be the latest
+  release available at all.
+- `wazero`'s public `api.Module` interface - the type noderati's bridge
+  is built on - has `ExportedFunction`, `ExportedMemory`, `Memory()`, and
+  a literal `// TODO: Table` comment exactly where an `ExportedTable`
+  accessor would go. Confirmed absent identically across every wazero
+  version cached locally (v1.9.0 through v1.12.0) - this isn't a version
+  lag, it's a genuine, current gap in wazero's own public surface.
+- wazero ships an `experimental/table` subpackage, but it only
+  implements `LookupFunction` (indirect `call_indirect` resolution for a
+  funcref table) - not a general table object with `.grow()`/`.set()`/
+  `.get()`, and not usable for wasm-bindgen's externref pattern at all.
+  Its implementation reaches into wazero's own `internal/wasm` package
+  via a type assertion (`module.(*wasm.ModuleInstance)`) - a pattern
+  Go's own `internal/` visibility rule only permits from within wazero's
+  own module tree. noderati, as an external importer, cannot do the same
+  thing legally.
+
+**Conclusion: this is a real, hard structural gap, and it's upstream in
+wazero, not in noderati or paserati.** There is no viable path today to
+building a spec-shaped, mutable `WebAssembly.Table` on top of wazero
+v1.12.0's public API - not a missing few lines of host glue, but an
+absent capability in the underlying runtime this project has chosen to
+build on. Consistent with this project's own discipline (build the real
+thing a real call site needs, not speculative surface, and don't force a
+fragile workaround), the right move is to record this precisely rather
+than vendor or fork wazero, or reach into its `internal/` package: that
+would risk the working, verified undici/llhttp WASM path to unblock one
+image-resize call site that (per Round 67/76's own design) already has a
+documented graceful `null` fallback when image resizing isn't available.
+
+Not pursued further this round: filing this upstream against
+`tetratelabs/wazero` would be cheap and well-scoped (a concrete call
+site - wasm-bindgen-generated bindings, which covers most Rust-to-WASM
+output generally, not just photon-node - plus the exact `// TODO: Table`
+location and the `experimental/table` precedent showing they've thought
+about table access before). That's a third repo, outside this round's
+"noderati roadmap only" scope, and is the user's call to make, not
+something to do unprompted.
+
+**Status**: the "WASM-backed image resizing" ledger item is updated
+above from "never retried" to "retried, and blocked on a specific,
+external, upstream gap (wazero's missing public `WebAssembly.Table`
+API), not a noderati-side gap." One real, independent `util` bug found
+and fixed along the way.
