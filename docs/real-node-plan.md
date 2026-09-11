@@ -167,12 +167,26 @@ in each item's own round rather than in this ledger's four letter groups:
   [paserati#406](https://github.com/nooga/paserati/issues/406), a real
   engine panic constructing the full `@aws-sdk/client-bedrock-runtime`
   client (independent of transport choice - happens at import time via
-  `@aws-crypto/crc32`). Not noderati's to fix. A full `NodeHttp2Handler`
+  `@aws-crypto/crc32`). Round 97: confirmed fixed upstream, directly
+  against the filed repro, once paserati merged #404/#406/#407 and the
+  B4 register-block redesign. Continuing the same chase past that fix
+  found and fixed two more real, noderati-side resolver bugs - a stale
+  `"module"`-field-over-`"main"` preference dating to this resolver's
+  very first commit, and `require()` of a `.json` file executing its
+  raw text as JS instead of parsing it as JSON - both pre-dating this
+  whole Bedrock investigation. The dependency graph now reaches a
+  single, cleanly-identified upstream gap:
+  [paserati#413](https://github.com/nooga/paserati/issues/413),
+  `TransformStream`/`WritableStream` not existing at all (unlike the
+  already-implemented `ReadableStream`, paserati#205) - real,
+  unconditional real-code needs (`@aws-sdk/middleware-websocket`'s own
+  `class X extends TransformStream`, `@smithy/core`'s real checksum-
+  stream code). Not noderati's to fix. A full `NodeHttp2Handler`
   (Bedrock's real default, no-env-var path) is scoped in Round 95 as a
   bounded, `http.go`-sized JS-shape adapter over Go's already-working
   HTTP/2 transport, not attempted yet. No AWS credentials were ever
   available to attempt a real end-to-end call regardless. Last touched
-  Round 95.
+  Round 97.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -11485,3 +11499,125 @@ maintainer actually picks, which may not match this fork's own `uint64`-
 encoding choice), noderati's `go.mod` should switch back to a stock
 `tetratelabs/wazero` release and this fork should be retired rather than
 carried forward indefinitely.
+
+## Round 97: paserati main pulled forward (#404/#406/#407 + the B4
+register-block redesign) - #406 confirmed fixed, two more real resolver
+bugs found and fixed continuing the Bedrock chase, one real paserati gap
+found and filed (paserati#413)
+
+Picked up where Round 95 left off: paserati had new merges (`go -C
+../paserati log`: #404, #406, #407, and the B4 register-block-directory
+rewrite, all already on `main` locally, nothing to pull). Rebuilt
+noderati against it and picked the Bedrock investigation back up.
+
+**paserati#406 confirmed fixed, directly against the exact filed
+repro.** Re-ran `/tmp/repro.js` (the same-named-inner-function-inside-
+an-IIFE pattern from Round 95) straight against a freshly built
+`paserati` binary: prints `1`, exit 0 - no panic. Full noderati suite
+(`go build`/`go vet`/`go test ./...`, one deliberate `-skip
+TestEventsAddAbortListener` for the still-open, still-not-this-
+project's-concern `paserati#372`) and the scoreboard both clean against
+the new `main`, no regressions.
+
+**Bug found and fixed: the resolver's "prefer `module` over `main`"
+behavior doesn't match real Node at all.** Re-running the full
+`@aws-sdk/client-bedrock-runtime` construction probe past #406's fix
+hit a *different* crash than before - `Cannot read property 'prototype'
+of undefined`-shaped, distinct from the register panic #406 fixed.
+Bisecting which import actually triggered it (temporarily printing
+every `execFile` entry, reverted once it had answered the question)
+showed the package's own `dist-es/index.js` being loaded - not
+`dist-cjs/index.js`. Checked `@aws-sdk/client-bedrock-runtime`'s own
+`package.json` directly: no `"exports"` map at all, just `"main":
+"./dist-cjs/index.js"` and `"module": "./dist-es/index.js"`.
+`resolveMainEntry` (`nodemodules.go`) had preferred `"module"` for ESM
+`import` specifically since this resolver's *very first* commit
+(`09fc9b1`) - apparently never checked against real Node's actual
+behavior. Verified directly (not assumed) with a synthetic package
+carrying both fields and no `"exports"`: real Node's own `import`
+resolves to `"main"`, ignoring `"module"` completely - it's a bundler-
+only (webpack/rollup/esbuild) convention, never part of Node's own
+resolution algorithm. Fixed by dropping the `"module"`-preference
+branch entirely; `import` now uses `"main"` in this shape, exactly like
+`require()` already did. New test:
+`TestResolveMainEntryIgnoresModuleFieldWithoutExports`, asserting both
+conditions resolve to `"main"`.
+
+**A second bug found immediately after, same investigation: `require()`
+of a `.json` file executed its raw text as JS instead of parsing it as
+JSON.** With the resolver now correctly loading `dist-cjs/index.js`
+(matching real Node), hit a real syntax error: `Cannot find module`-
+style bisection (same technique as above) pointed at
+`@aws-sdk/client-bedrock-runtime/package.json` itself being loaded as a
+*module* - `runtimeConfig.js`'s own top line is `require("../package.json")`
+(a real, common CJS pattern - reading a package's own version metadata
+- not synthetic). `require()`'s `execFile` path wrapped *any* resolved
+file's raw text in the CJS function template unconditionally, `.json`
+included, so `{ "name": "...", ... }` got parsed as a JS function body
+- `"name": "..."` isn't a valid label, hence the syntax error. Real
+Node's own CJS loader (`Module._extensions['.json']`) parses a required
+`.json` file's content as JSON and never executes it as JS. Fixed with
+a new `requireJSON`, delegating to the engine's own real `JSON.parse`
+(not a hand-rolled Go-side JSON-to-`vm.Value` converter, so parsing
+semantics can't drift from what parsing the same text in JS would
+produce) - checked, and confirmed the ESM `import x from "./y.json"`
+path was already correct (paserati's own module loader already special-
+cases `.json` there, more leniently than real Node even - accepting the
+import with or without a `with { type: "json" }` attribute, where real
+Node requires it; harmless, since real code either uses the attribute,
+where noderati is fully correct, or doesn't, where being more permissive
+than Node only helps compatibility). Two new tests:
+`TestRequireJSONParsesNotExecutes` and `TestRequireJSONCached` (the
+latter guarding that a second `require()` of the same `.json` file
+returns the identical cached object, matching every other extension's
+caching contract).
+
+Verified directly against the real package for both fixes:
+`require('/path/to/@aws-sdk/client-bedrock-runtime/package.json')`
+returns `{ name: "@aws-sdk/client-bedrock-runtime", version:
+"3.1048.0", ... }` correctly. Full suite/vet/scoreboard clean after
+both fixes.
+
+**Reached the real, current blocker, and it's paserati's: `TransformStream`
+(and `WritableStream`) don't exist at all.** With both resolver bugs
+fixed, the natural, no-workaround `import { BedrockRuntimeClient,
+ConverseCommand } from '@aws-sdk/client-bedrock-runtime'` now fails with
+`ReferenceError: TransformStream is not defined`, traced to
+`@aws-sdk/middleware-websocket`'s own `dist-cjs/index.js`: `class
+EventSigningTransformStream extends TransformStream { ... }` at real
+module-load time, unconditional, not feature-detected - a real,
+unavoidable class declaration in a real Bedrock dependency. `@smithy/
+core`'s own real checksum-stream code separately constructs a genuine
+`new TransformStream({ transform, flush })` and uses `.pipeThrough()`/
+`.readable`. Confirmed via a temporary, test-only `globalThis
+.TransformStream` polyfill (dynamic `import()` used specifically so the
+polyfill assignment actually runs *before* the static import graph
+evaluates - ordinary top-level assignment before a *static* `import`
+doesn't work, since static imports are hoisted and evaluated first,
+which cost one wasted attempt before remembering that) that this really
+is the only thing standing between the current code and further
+progress - past it, execution reaches real, further module-loading work
+with no sign of another resolver-level bug in the way. `ReadableStream`
+already exists as a real paserati builtin (`pkg/builtins/
+readable_stream_init.go`, closed via paserati#205); `TransformStream`/
+`WritableStream` are genuinely, completely absent - confirmed via a
+clean, minimal, paserati-only repro (`class X extends TransformStream`
+fails to compile: `superclass 'TransformStream' is not defined`).
+This is squarely paserati's own domain (Web Streams API globals, the
+same family `ReadableStream` already is), not noderati's to implement -
+filed as
+[paserati#413](https://github.com/nooga/paserati/issues/413) with the
+real call sites, the clean repro, and the concrete spec shape both real
+call sites actually need (`Transformer`'s `start`/`transform`/`flush`,
+paired `.readable`/`.writable`).
+
+**Status**: paserati main is current and confirmed regression-free.
+`paserati#406` is fixed and verified. Two more real, noderati-side
+resolver bugs (both pre-dating this entire Bedrock investigation, one
+since the resolver's very first commit) found and fixed along the way,
+continuing the same chain Round 94/95 started. The Bedrock dependency
+graph now reaches all the way to a single, precisely-identified,
+upstream paserati gap (`TransformStream`/`WritableStream`, filed as
+#413) rather than a noderati-side bug - the cleanest state this
+investigation has been in yet. Updated the top-of-file Bedrock ledger
+bullet to match.
