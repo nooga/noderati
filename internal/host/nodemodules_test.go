@@ -112,6 +112,50 @@ func TestNodeModulesResolverResolveDemoPkg(t *testing.T) {
 	}
 }
 
+// TestResolveMainEntryIgnoresModuleFieldWithoutExports guards a real
+// deviation from Node found chasing the Bedrock investigation
+// (docs/real-node-plan.md, round 96): real, unmodified
+// @aws-sdk/client-bedrock-runtime's own package.json has both "main"
+// and "module" fields and no "exports" map at all - and real Node's own
+// resolution (confirmed directly against a synthetic equivalent
+// package, not assumed) uses "main" for *both* require() and import in
+// that shape, completely ignoring "module" - a bundler-only convention,
+// not part of Node's own algorithm. This resolver used to prefer
+// "module" for ESM imports specifically (present since this resolver's
+// very first commit, apparently never verified against real Node), so
+// `import` picked a different file (dist-es) than `require()` did
+// (dist-cjs) for the exact same package - a different file with a
+// different import graph and, in the real package that surfaced this,
+// a different crash than real Node's own resolution would ever hit.
+func TestResolveMainEntryIgnoresModuleFieldWithoutExports(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "package.json"), `{
+		"name": "pkg",
+		"main": "./main.js",
+		"module": "./module.js"
+	}`)
+	writeFile(t, filepath.Join(root, "main.js"), `module.exports = "from-main";`)
+	writeFile(t, filepath.Join(root, "module.js"), `module.exports = "from-module";`)
+
+	for _, cond := range []exportsCondition{exportsConditionRequire, exportsConditionImport} {
+		entry, err := resolveMainEntry(root, cond)
+		if err != nil {
+			t.Fatalf("resolveMainEntry(%v): %v", cond, err)
+		}
+		want, err := canonicalPath(filepath.Join(root, "main.js"))
+		if err != nil {
+			t.Fatalf("canonicalPath: %v", err)
+		}
+		gotAbs, err := canonicalPath(entry)
+		if err != nil {
+			t.Fatalf("canonicalPath(entry): %v", err)
+		}
+		if gotAbs != want {
+			t.Errorf("resolveMainEntry(cond=%v) = %q, want %q (the \"main\" field, matching real Node - not \"module\")", cond, entry, want)
+		}
+	}
+}
+
 func TestNodeModulesResolverResolveScopedPkg(t *testing.T) {
 	root := t.TempDir()
 

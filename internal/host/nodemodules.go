@@ -239,9 +239,22 @@ func resolveMainEntry(pkgDir string, cond exportsCondition) (string, error) {
 		} else if ok {
 			return resolveRelativeEntry(pkgDir, entry)
 		}
-		if cond == exportsConditionImport && pkg.Module != "" {
-			return resolveRelativeEntry(pkgDir, pkg.Module)
-		}
+		// "module" is a bundler-only convention (webpack/rollup/esbuild),
+		// not part of real Node's own resolution algorithm at all - real
+		// Node uses "main" for both require() and import when there's no
+		// "exports" map, full stop, and completely ignores "module".
+		// Verified directly (not assumed): a synthetic package with both
+		// fields and no "exports" resolves to "main" under real Node's
+		// `import`, every time. This dates back to this resolver's very
+		// first commit and had gone unquestioned since - found the hard
+		// way chasing a real crash while constructing
+		// @aws-sdk/client-bedrock-runtime (docs/real-node-plan.md, round
+		// 96): the package's own package.json has no "exports", so this
+		// preference silently picked its `dist-es/index.js` (the
+		// "module" field) over the `dist-cjs/index.js` real Node's
+		// import would actually load - a different file with a
+		// different import graph and, it turned out, a different crash
+		// than the one real Node's own resolution would ever hit here.
 		if pkg.Main != "" {
 			return resolveRelativeEntry(pkgDir, pkg.Main)
 		}
