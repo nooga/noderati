@@ -47,16 +47,30 @@ went the same way, 2026-08-31.
 `events.go`'s — picked the real one, Round 90, docs below.
 
 **B. Third-party npm package fakes — delete the shim, load the real
-package.** These aren't Node surface at all; they're interceptions of specific
-libraries pi-coding-agent depends on, hardcoded as JS strings in Go and
-registered ahead of the real files on disk: `@earendil-works/pi-ai` (a
-from-scratch reimplementation of the real LLM client, including its own model
-catalog and provider fetch calls — its bare-entry fake only exports
-`modelsAreEqual`, everything else lives in the separate `/compat` fake;
-real `pi-agent-core` imports `EventStream`/`parseStreamingJson` from the
-*bare* specifier, coupling the two fakes — neither de-fakes cleanly
-without the other, confirmed 2026-09-02), `@earendil-works/pi-agent-core`
-(a from-scratch reimplementation of the actual agent loop), `jiti/static`.
+package. All closed as of Round 85 (2026-09-08).** These weren't Node
+surface at all; they were interceptions of specific libraries pi-coding-agent
+(or, for `undici`, the fetch stack) depends on, hardcoded as JS strings in Go
+and registered ahead of the real files on disk. Kept here, struck through in
+spirit rather than deleted outright, matching group D's own precedent below,
+so this section's own history stays legible — this paragraph used to name
+`@earendil-works/pi-ai`, `@earendil-works/pi-agent-core`, and `jiti/static`
+as the currently-active remainder; all three are gone:
+- ~~`@earendil-works/pi-ai`~~ (a from-scratch reimplementation of the real
+  LLM client, including its own model catalog and provider fetch calls) and
+  ~~`@earendil-works/pi-agent-core`~~ (a from-scratch reimplementation of the
+  actual agent loop) — coupled fakes, neither de-faked cleanly without the
+  other (confirmed 2026-09-02) — both deleted **Round 48** (2026-09-05).
+- ~~`jiti/static`~~ — deleted **Round 63** (2026-09-06), once
+  [paserati#285](https://github.com/nooga/paserati/issues/285) closed the
+  jiti-pipeline blocker this investigation had chased since round 57; verified
+  against pi-coding-agent's own real extension-loader call pattern before
+  deletion, not just a CLI-invocation match.
+- ~~`undici`~~ (`internal/host/undici.go`) — real Node builtin `net`/`tls`
+  built first (rounds 69-70), then real, unmodified `undici@7.11.0` deleted
+  the fake outright in **Round 85** (2026-09-08) once real `fetch()` worked
+  end to end against it; rounds 86-90 stress-tested and closed the
+  remaining flakes. Not in this ledger's original text at all - added here
+  since it's exactly the same shape as the others and belongs in this list.
 (`minimatch` was here too — deleted 2026-08-31; `hosted-git-info` deleted
 2026-09-01; `proper-lockfile`, `glob`, `typebox`'s own top-level entry,
 `diff`, and `typebox/value` all deleted 2026-09-02 —
@@ -68,8 +82,8 @@ entire TUI component library, every export a no-op — deleted 2026-09-03
 once paserati#195/#196/#218/#222–#225 all merged and a real functional
 exercise of its actual component surface matched real Node byte-for-byte;
 see Phase 3 below for all of these.)
-None of these belong in a "Node host." Removing them is a deletion task, not
-a build task, and it's most of `internal/host/`'s file count.
+None of these belong in a "Node host." Removing them was a deletion task, not
+a build task, and it used to be most of `internal/host/`'s file count.
 
 **C. `esmpatch.go` per-file source rewrites — done, file deleted
 2026-09-01.** Was twelve rewrites keyed by filename, each patching around
@@ -80,9 +94,15 @@ scoreboard confirmed each dead; `syntax-highlight-stub` the same day once
 register-allocator compiler bug) and
 [paserati#122](https://github.com/nooga/paserati/issues/122) (a stale
 frozen-property flag) were both fixed upstream and the real `highlight.js`
-was confirmed to register 190/191 bundled languages — the one exception
-(`latex`, needing regex lookahead Go's RE2 doesn't support) is a documented,
-linked, architectural gap, not a reason to keep faking the whole module. The
+was confirmed to register 190 of its 191 bundled languages — at the time,
+`latex` alone still failed (needing regex lookahead Go's RE2 doesn't
+support), a gap this paragraph used to describe as documented-and-accepted.
+**That's stale, corrected here**: **Round 8** (2026-09-01) got a `regexp2`
+lookahead fallback merged upstream as
+[paserati#172](https://github.com/nooga/paserati/issues/172) (filed for an
+unrelated `glob`/`minimatch` blocker that turned out to be the identical RE2
+gap), verified directly — real `highlight.js` now registers all **191/191**
+bundled languages, `latex` included. No architectural gap remains here. The
 last one, `sdk-reexports` — a real, still-needed compile-error workaround,
 misidentified in an earlier pass of this doc as an `export *` issue (it
 isn't) — was deleted 2026-09-01 once
@@ -112,6 +132,48 @@ deleted outright, so this section's own history stays legible:
   Node's own `ERR_MODULE_NOT_FOUND`/`ERR_UNKNOWN_BUILTIN_MODULE` shapes.
   Fixed, and extended to cover every specifier shape nothing else could
   resolve (bare packages, relative/absolute paths), not just `node:*`.
+
+**Ledger status as of Round 92 (2026-09-11): groups A/B/C/D are all
+closed.** `internal/host/host.go:installModules()` registers only real Node
+builtins and real npm packages today — zero per-app fakes, zero
+per-file source rewrites, zero resolver-side special-casing. This
+paragraph was stale for a long stretch (Round 85 deleted the last group-B
+fake, `undici`, and nothing here was updated to say so until this pass) -
+worth remembering that this section needs a deliberate re-check pass
+rather than assuming later rounds keep it current on their own.
+
+That doesn't mean every gap is closed - it means the *shim-deletion*
+project (this doc's original goal) is done. What's left is genuine,
+not-yet-implemented (or not-yet-verified) engine/host capability, tracked
+in each item's own round rather than in this ledger's four letter groups:
+
+- **Bedrock (AWS provider)** - real `net`/`tls`/`http`/`https` built and
+  verified (rounds 68-70), but a second, un-isolated blocker remains
+  (`@smithy/core/protocols`'s subpath import throws `require is not
+  defined` - a likely CJS/ESM interop gap, not root-caused further) and no
+  AWS credentials were ever available to attempt a real end-to-end call.
+  Last touched Round 72.
+- **Native `.node` addon loading** - unexplored; blocks real OS clipboard
+  support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
+- **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
+  module-loading across goroutines; blocks real `worker_threads`
+  concurrency (today's in-process fallback covers the one real consumer,
+  so low urgency). Round 67.
+- **WASM-backed image resizing** (`resizeImageInProcess`, real Photon via
+  WebAssembly) - flagged before noderati had WebAssembly at all; Round 76
+  built real WASM support for a different consumer (undici's llhttp
+  parser) and this was never retried against it.
+- **The stray `"1"` file** pi writes to disk - confirmed real, mechanism
+  unconfirmed, cosmetic. Round 67.
+- **Self-hosting `tsc`** (compiling TypeScript's own source with
+  tsc-under-noderati) - Phase 6's one remaining piece; needs an actual
+  microsoft/TypeScript checkout, deliberately not fetched yet (rounds 91-92).
+- **paserati#372** (AbortSignal spec gap surfaced by real `undici`) - a
+  genuine, still-open upstream engine issue; `TestEventsAddAbortListener`
+  stays a deliberate `-skip` sentinel for it in every full-suite run in
+  this doc, including Round 92's. Paserati's own concern to fix in its own
+  time, per the project's current division of labor - tracked here only so
+  the skip doesn't look unexplained.
 
 ## What's already fixed upstream (verified, not assumed)
 
