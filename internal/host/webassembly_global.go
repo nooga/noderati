@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"sync"
 	"sync/atomic"
@@ -36,11 +37,28 @@ import (
 // running the real probe, not assumed from the issue's own summary)
 // with plain-number (i32/i64/f32/f64) function imports, and
 // `instance.exports.memory.buffer` reflecting current wasm memory
-// (including after growth). No WebAssembly.Table, no Global, no
-// streaming instantiate, no multi-value returns - none of those are
-// needed by the concrete call site this exists for, and this project's
+// (including after growth). No Global, no streaming instantiate - not
+// needed by any real call site this bridge targets, and this project's
 // own discipline is to build the real thing a real call site needs, not
 // speculative surface.
+//
+// WebAssembly.Table (round: see docs/real-node-plan.md) and multi-value
+// exported-function results were added later, once a second real call
+// site needed them: @silvia-odwyer/photon-node (a wasm-bindgen/Rust
+// image-resizing package) exports its externref object heap as a real
+// WebAssembly.Table (`__wbindgen_export_2`, read/written by its own
+// generated JS glue via `.grow()`/`.get()`/`.set()`), and its
+// `photonimage_get_bytes`/`get_bytes_jpeg` exports return a
+// pointer+length pair as two wasm results, destructured by that same
+// glue as a JS Array (`ret[0]`, `ret[1]`) - both confirmed as real,
+// reachable needs by running the actual probe against it, not assumed.
+// Table support is backed by a small wazero fork (see
+// github.com/nooga/wazero, branch noderati-table-export) adding
+// api.Module.ExportedTable, since upstream wazero has no way to obtain
+// an exported table at all as of this writing (tracked upstream as
+// wazero#2461, open and unassigned) - see wasmTableBridge's own doc
+// comment for the table implementation, and go.mod's replace directive
+// for the fork.
 //
 // Depends on Buffer being real (see buffer.go) - real undici's own
 // vendored llhttp-wasm.js does `Buffer.from(base64, 'base64')`, and a
@@ -102,13 +120,16 @@ func installWebAssemblyGlobal(p *driver.Paserati) {
 	instanceProto := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
 	instanceProtoVal := vm.NewValueFromPlainObject(instanceProto)
 
+	tableProto := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+	tableProtoVal := vm.NewValueFromPlainObject(tableProto)
+
 	moduleCtor := buildWasmModuleConstructor(vmInst, moduleProtoVal, errs)
 	if props := moduleCtor.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
 		props.Properties.DefineFixedProperty("prototype", moduleProtoVal)
 	}
 	moduleProto.SetOwnNonEnumerable("constructor", moduleCtor)
 
-	instanceCtor := buildWasmInstanceConstructor(vmInst, instanceProtoVal, memoryProtoVal, errs)
+	instanceCtor := buildWasmInstanceConstructor(vmInst, instanceProtoVal, memoryProtoVal, tableProtoVal, errs)
 	if props := instanceCtor.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
 		props.Properties.DefineFixedProperty("prototype", instanceProtoVal)
 	}
@@ -129,10 +150,17 @@ func installWebAssemblyGlobal(p *driver.Paserati) {
 	}
 	memoryProto.SetOwnNonEnumerable("constructor", memoryCtor)
 
+	tableCtor := buildWasmTableConstructor(vmInst, tableProtoVal)
+	if props := tableCtor.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+		props.Properties.DefineFixedProperty("prototype", tableProtoVal)
+	}
+	tableProto.SetOwnNonEnumerable("constructor", tableCtor)
+
 	ns := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
 	ns.SetOwn("Module", moduleCtor)
 	ns.SetOwn("Instance", instanceCtor)
 	ns.SetOwn("Memory", memoryCtor)
+	ns.SetOwn("Table", tableCtor)
 	ns.SetOwn("CompileError", errs.compileError)
 	ns.SetOwn("LinkError", errs.linkError)
 	ns.SetOwn("RuntimeError", errs.runtimeError)
@@ -177,7 +205,7 @@ func installWebAssemblyGlobal(p *driver.Paserati) {
 		// to just the Instance; instantiate(bufferSource, imports)
 		// compiles first and resolves to {module, instance}.
 		if isWasmModuleValue(args[0]) {
-			instVal, ierr := instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, errs, args[0], importObject)
+			instVal, ierr := instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, tableProtoVal, errs, args[0], importObject)
 			if ierr != nil {
 				return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(ierr)), nil
 			}
@@ -187,7 +215,7 @@ func installWebAssemblyGlobal(p *driver.Paserati) {
 		if cerr != nil {
 			return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(cerr)), nil
 		}
-		instVal, ierr := instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, errs, modVal, importObject)
+		instVal, ierr := instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, tableProtoVal, errs, modVal, importObject)
 		if ierr != nil {
 			return vmInst.NewRejectedPromise(vmInst.ExceptionValueFromError(ierr)), nil
 		}
@@ -444,38 +472,111 @@ func (b *wasmMemoryBridge) markDirty() {
 	b.mu.Unlock()
 }
 
-// bufferValue returns the current `.buffer` value, refreshing it from
-// real wasm memory first if wasm ran since the last vend or if wasm's
-// memory size changed (a grow - which, per spec, must detach the
-// previously-vended ArrayBuffer and hand back a new one).
+// detachIfGrownLocked proactively detaches the currently-vended
+// ArrayBuffer (if any) the moment a real memory.grow is observed
+// (currentSize != b.size), rather than waiting for the next `.buffer`
+// property read to notice - callers must hold b.mu.
+//
+// This is what makes this copy-based bridge (paserati's ArrayBufferObject
+// has no way to alias an externally-owned []byte, so `.buffer` can never
+// be a true zero-copy view - see this type's own doc comment above)
+// behave like a real engine's genuine live view for any caller that
+// caches it: a real `WebAssembly.Memory.buffer`'s *identity* only
+// changes on a grow, and a real engine detaches every existing view
+// over the old buffer the *instant* that grow happens, as an intrinsic
+// side effect - there is no "wait for JS to ask again" step. That
+// distinction only matters to code that caches `.buffer` across calls;
+// real undici's own llhttp call site never does (it re-reads
+// `.memory.buffer` fresh every time), so this went unnoticed until a
+// second real wasm-bindgen call site (@silvia-odwyer/photon-node, added
+// alongside WebAssembly.Table support - see this file's own
+// top-of-file doc comment) was found to cache its own TypedArray view
+// exactly the spec-compliant way (wasm-bindgen's own
+// getUint8ArrayMemory0 only re-wraps `wasm.memory.buffer` when the
+// cached view's `.byteLength` reads back 0). Before this method
+// existed, this bridge only ever detached reactively, when
+// bufferValue() itself next ran - so a grow that happened while nothing
+// asked for `.buffer` left the old cached view fully valid-looking
+// (non-zero byteLength) but frozen at stale, pre-grow memory contents:
+// confirmed directly - the real photon probe's own
+// get_bytes()/get_bytes_jpeg() came back length-correct but all-zero
+// bytes for exactly this reason (the real PNG/JPEG bytes were written
+// into wasm memory only after further internal growth this bridge never
+// proactively surfaced) until this fix, after which its output matched
+// real Node's own byte-for-byte (see docs/real-node-plan.md's round
+// entry for the full A/B verification).
+func (b *wasmMemoryBridge) detachIfGrownLocked(currentSize int) {
+	if currentSize == b.size {
+		return
+	}
+	if b.ab != nil {
+		b.ab.Detach()
+		b.ab = nil
+		b.abVal = vm.Undefined
+	}
+	b.size = currentSize
+	b.dirty = true
+}
+
+// syncOut eagerly copies wasm's current memory bytes into the
+// already-vended ArrayBuffer, rather than deferring that copy to the
+// next `.buffer` property read the way markDirty() alone would (a read
+// that, per detachIfGrownLocked's own doc comment, real caller code is
+// entitled to never make again once it has cached a view).
+func (b *wasmMemoryBridge) syncOut() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	currentSize := int(b.mem.Size())
+	b.detachIfGrownLocked(currentSize)
+	if b.ab == nil {
+		// Nothing vended yet, or just detached above by a grow - the
+		// next `.buffer` access builds a fresh buffer via bufferValue().
+		return
+	}
+	if view, ok := b.mem.Read(0, uint32(currentSize)); ok {
+		copy(b.ab.GetData(), view)
+	}
+	b.dirty = false
+}
+
+// bufferValue returns the current `.buffer` value: the already-vended
+// ArrayBuffer (refreshed in place first if dirty - see syncOut, which
+// runs this same refresh eagerly after every exported-function call, so
+// this is typically a no-op by the time JS reads `.buffer`), or a fresh
+// one built from wasm's current memory if none has been vended yet
+// (including right after detachIfGrownLocked cleared the old one).
 func (b *wasmMemoryBridge) bufferValue() vm.Value {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	currentSize := int(b.mem.Size())
-	if b.ab == nil || b.dirty || currentSize != b.size {
-		view, ok := b.mem.Read(0, uint32(currentSize))
-		if !ok {
-			// Reading a module's own full current memory range
-			// (offset 0, length mem.Size()) should never fail - if it
-			// somehow does, don't fabricate a plausible-looking but
-			// wrong zero-filled buffer; hand back whatever was
-			// previously vended (stale but honestly so) instead.
-			if !b.abVal.IsUndefined() {
-				return b.abVal
+	b.detachIfGrownLocked(currentSize)
+
+	if b.ab != nil {
+		if b.dirty {
+			if view, ok := b.mem.Read(0, uint32(currentSize)); ok {
+				copy(b.ab.GetData(), view)
 			}
-			view = nil
+			b.dirty = false
 		}
-		if b.ab != nil {
-			b.ab.Detach()
-		}
-		newABVal := vm.NewArrayBuffer(currentSize)
-		newAB := newABVal.AsArrayBuffer()
-		copy(newAB.GetData(), view)
-		b.ab = newAB
-		b.abVal = newABVal
-		b.size = currentSize
-		b.dirty = false
+		return b.abVal
 	}
+
+	view, ok := b.mem.Read(0, uint32(currentSize))
+	if !ok {
+		// Reading a module's own full current memory range
+		// (offset 0, length mem.Size()) should never fail - if it
+		// somehow does, don't fabricate a plausible-looking but wrong
+		// zero-filled buffer's worth of *garbage*; a zero-filled one is
+		// the most honest fallback left once detachIfGrownLocked has
+		// already dropped the old reference.
+		view = nil
+	}
+	newABVal := vm.NewArrayBuffer(currentSize)
+	newAB := newABVal.AsArrayBuffer()
+	copy(newAB.GetData(), view)
+	b.ab = newAB
+	b.abVal = newABVal
+	b.dirty = false
 	return b.abVal
 }
 
@@ -487,6 +588,13 @@ func (b *wasmMemoryBridge) grow(delta int) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("failed to grow memory by %d page(s)", delta)
 	}
+	// Explicit JS-driven grow needs the same eager detach
+	// detachIfGrownLocked gives implicit (wasm-internal) growth via
+	// syncOut - per spec, growing memory.buffer detaches the
+	// previously-vended ArrayBuffer immediately, not on next access.
+	b.mu.Lock()
+	b.detachIfGrownLocked(int(b.mem.Size()))
+	b.mu.Unlock()
 	return int(prevPages), nil
 }
 
@@ -520,6 +628,373 @@ func buildWasmMemoryValue(vmInst *vm.VM, memoryProtoVal vm.Value, mem api.Memory
 		return vm.NumberValue(float64(prevPages)), nil
 	}))
 	return vm.NewValueFromPlainObject(obj), bridge
+}
+
+// wasmValueTypeFuncref is the WASM binary format's funcref type byte
+// (0x70) - present internally as internal/wasm.ValueTypeFuncref/
+// RefTypeFuncref in the wazero fork, but deliberately not exposed as a
+// named api.ValueType constant upstream (only api.ValueTypeExternref
+// is - see the fork's api/wasm.go). This bridge's own real call site
+// (wasm-bindgen's externref object-heap table) never exports a funcref
+// table, so funcref support below is minimal completeness for the JS
+// `new WebAssembly.Table({element: 'anyfunc', ...})` constructor path,
+// not something any real call site exercises.
+const wasmValueTypeFuncref api.ValueType = 0x70
+
+// tableBackend is the shared surface behind a JS-facing WebAssembly.Table
+// object, letting one wrapper (buildWasmTableValue) drive either a real
+// wazero-exported table (wazeroTableBackend, backed by the actual WASM
+// engine's own table storage - see this fork's ExportedTable addition,
+// wazero#2461) or a standalone, host-only table built via `new
+// WebAssembly.Table(...)` (standaloneTableBackend) that was never passed
+// into any wazero-instantiated module - nothing this bridge's real call
+// site does imports a table, so a standalone table never touches wazero
+// at all.
+type tableBackend interface {
+	size() uint32
+	// grow must treat delta==0 the same way the fork's TableInstance.Grow
+	// does: return the current size without consuming raw, matching the
+	// real table.grow instruction's own no-op-but-still-succeeds shape.
+	grow(delta uint32, raw uint64) (previousSize uint32, ok bool)
+	get(i uint32) (raw uint64, err error)
+	set(i uint32, raw uint64) error
+}
+
+// wazeroTableBackend adapts a real wazero api.Table (obtained via
+// mod.ExportedTable, the wazero#2461 gap this bridge exists to use) to
+// tableBackend.
+type wazeroTableBackend struct{ t api.Table }
+
+func (b wazeroTableBackend) size() uint32                       { return b.t.Size() }
+func (b wazeroTableBackend) grow(delta uint32, raw uint64) (uint32, bool) { return b.t.Grow(delta, raw) }
+func (b wazeroTableBackend) get(i uint32) (uint64, error)       { return b.t.Get(i) }
+func (b wazeroTableBackend) set(i uint32, raw uint64) error     { return b.t.Set(i, raw) }
+
+// standaloneTableBackend backs a `new WebAssembly.Table(...)` built
+// without ever instantiating a module: a plain Go slice standing in for
+// the fork's own TableInstance.References, with the identical
+// grow/bounds-check semantics (see internal/wasm/table.go's
+// TableInstance.Grow in the fork) so behavior matches an exported table
+// exactly. Real undici/wasm-bindgen never constructs a table this way
+// (they only ever read a table off instance.exports) - this exists
+// purely so `new WebAssembly.Table(...)` itself doesn't throw, per this
+// bridge's own doc comment on the divide between the two.
+type standaloneTableBackend struct {
+	mu   sync.Mutex
+	refs []uint64
+	max  *uint32
+}
+
+func (b *standaloneTableBackend) size() uint32 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return uint32(len(b.refs))
+}
+
+func (b *standaloneTableBackend) grow(delta uint32, raw uint64) (uint32, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	prev := uint32(len(b.refs))
+	if delta == 0 {
+		return prev, true
+	}
+	newLen := uint64(prev) + uint64(delta)
+	if newLen > math.MaxUint32 || (b.max != nil && newLen > uint64(*b.max)) {
+		return 0, false
+	}
+	grown := make([]uint64, delta)
+	for i := range grown {
+		grown[i] = raw
+	}
+	b.refs = append(b.refs, grown...)
+	return prev, true
+}
+
+func (b *standaloneTableBackend) get(i uint32) (uint64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if i >= uint32(len(b.refs)) {
+		return 0, fmt.Errorf("out of bounds table access %d >= %d", i, len(b.refs))
+	}
+	return b.refs[i], nil
+}
+
+func (b *standaloneTableBackend) set(i uint32, raw uint64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if i >= uint32(len(b.refs)) {
+		return fmt.Errorf("out of bounds table access %d >= %d", i, len(b.refs))
+	}
+	b.refs[i] = raw
+	return nil
+}
+
+// wasmTableBridge is the real-value-preserving JS<->wasm table bridge.
+//
+// wazero's own Reference type (see this fork's api.Table doc comment,
+// wazero#2461) is a raw uintptr, which cannot safely round-trip an
+// arbitrary paserati vm.Value: Go's GC does not trace a value reachable
+// only through a uintptr, so stashing a real JS object's address there
+// would let it be collected out from under wazero while still "in" the
+// table. This is confirmed necessary, not just theoretical, by
+// disassembling the real call site's own compiled wasm
+// (photon_rs_bg.wasm, via wasm2wat): its `__wbindgen_init_externref_table`
+// stores real JS values (undefined, null, true, false) directly into its
+// exported externref table via table.set - not a numeric handle of its
+// own - so whatever this bridge hands back from a later .get() must be
+// that *exact* JS value, not one reconstructed from a bit pattern.
+//
+// So real values are never written into wazero's own Reference array at
+// all. Every JS-driven .set()/.grow() instead allocates a small integer
+// handle in this bridge's own registry (a live Go map, immune to the GC
+// hazard above) mapping that handle to the real vm.Value, and only the
+// *handle* (encoded as the Reference/uint64) is written through to the
+// backend. .get() reverses this: read the raw handle back from the
+// backend, look it up in the registry.
+//
+// The backend (wazero's own table, for an exported one) stays the single
+// source of truth for length and for which slots are "null" - critical
+// because photon_rs_bg.wasm's own compiled code, not just its JS glue,
+// mutates this same table directly at the WASM bytecode level: confirmed
+// via wasm2wat that both `__externref_table_alloc`
+// (`ref.null extern; table.grow 1`) and `__externref_table_dealloc`
+// (`ref.null extern; table.set 1`) run real WASM table instructions,
+// entirely inside the wasm engine, with no way for this Go bridge to
+// intercept or be notified. Any parallel length/contents tracking on
+// this side would desync the moment either of those ran - which is
+// routine, not an edge case (addToExternrefTable0/takeFromExternrefTable0
+// call them on every exception-handling round trip in the real glue).
+// Reading length and raw slot state through the backend on every access,
+// rather than caching either, keeps this bridge correct regardless of
+// which side - JS or wasm bytecode - touched the table most recently.
+//
+// Handle 0 is reserved and never allocated: it is exactly the raw value
+// wasm's own `ref.null extern`/fresh-growth-with-no-init produce, and
+// this bridge treats it as "no registry entry" - decoded as JS
+// `undefined` for an externref table (matching real
+// WebAssembly.Table.get's own default-value spec behavior) or JS `null`
+// for a funcref table (funcref's spec null). Every other JS value for an
+// externref table - *including* explicit `null` and `undefined` - gets
+// its own real handle rather than collapsing onto 0, because externref
+// values are never coerced by the spec (unlike funcref, which requires
+// either an Exported Function or null): the real init function above
+// does `table.set(0, undefined)` then `table.set(offset+1, null)`, and
+// both must read back as the exact distinct JS values `undefined` and
+// `null`, not both flattened onto one "empty" sentinel.
+//
+// One accepted, documented gap: overwriting a JS-registered slot via
+// this bridge's own .set() releases the old handle (so a slot repeatedly
+// reused via .set() doesn't leak), but a slot nulled by wasm bytecode
+// directly (dealloc, above) bypasses this bridge entirely, so that
+// handle's registry entry lingers until process exit. Not a regression
+// risk for the real call site (a bounded handful of
+// undefined/null/true/false/Error values over a process's lifetime,
+// never a large or growing set), and no worse than any alternative (e.g.
+// a parallel slice) that also can't observe a wasm-internal write.
+type wasmTableBridge struct {
+	backend  tableBackend
+	elemKind api.ValueType // api.ValueTypeExternref or wasmValueTypeFuncref
+
+	mu       sync.Mutex
+	nextID   uint64
+	registry map[uint64]vm.Value
+}
+
+func newWasmTableBridge(backend tableBackend, elemKind api.ValueType) *wasmTableBridge {
+	return &wasmTableBridge{backend: backend, elemKind: elemKind, registry: map[uint64]vm.Value{}}
+}
+
+func (b *wasmTableBridge) size() uint32 { return b.backend.size() }
+
+// decode turns a raw backend reference into the JS value it represents.
+func (b *wasmTableBridge) decode(raw uint64) vm.Value {
+	if raw != 0 {
+		b.mu.Lock()
+		v, ok := b.registry[raw]
+		b.mu.Unlock()
+		if ok {
+			return v
+		}
+	}
+	if b.elemKind == wasmValueTypeFuncref {
+		return vm.Null
+	}
+	return vm.Undefined
+}
+
+// encode allocates a fresh handle for v, or returns the raw null
+// reference 0 directly for funcref's spec-null (needing no handle).
+func (b *wasmTableBridge) encode(v vm.Value) uint64 {
+	if b.elemKind == wasmValueTypeFuncref && v.Type() == vm.TypeNull {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.nextID++
+	id := b.nextID
+	b.registry[id] = v
+	return id
+}
+
+func (b *wasmTableBridge) release(raw uint64) {
+	if raw == 0 {
+		return
+	}
+	b.mu.Lock()
+	delete(b.registry, raw)
+	b.mu.Unlock()
+}
+
+func (b *wasmTableBridge) get(i uint32) (vm.Value, error) {
+	raw, err := b.backend.get(i)
+	if err != nil {
+		return vm.Undefined, err
+	}
+	return b.decode(raw), nil
+}
+
+func (b *wasmTableBridge) set(i uint32, v vm.Value) error {
+	oldRaw, _ := b.backend.get(i) // ignore error: the Set call below surfaces the real OOB error
+	newRaw := b.encode(v)
+	if err := b.backend.set(i, newRaw); err != nil {
+		b.release(newRaw) // don't leak the handle we just made if the write itself failed
+		return err
+	}
+	b.release(oldRaw)
+	return nil
+}
+
+func (b *wasmTableBridge) grow(delta uint32, v vm.Value) (uint32, bool) {
+	if delta == 0 {
+		return b.backend.grow(0, 0)
+	}
+	// Every new slot shares one handle for the same value v, matching the
+	// real table.grow instruction's own behavior (and the fork's
+	// TableInstance.Grow, which fills every new slot with one identical
+	// initialRef) - all `delta` new slots really are the same JS value
+	// reference, not `delta` independent copies.
+	raw := b.encode(v)
+	prev, ok := b.backend.grow(delta, raw)
+	if !ok {
+		b.release(raw)
+	}
+	return prev, ok
+}
+
+// buildWasmTableValue wraps a tableBackend (via a fresh wasmTableBridge) as
+// a real WebAssembly.Table-shaped JS object: `.length` getter, `.grow()`,
+// `.get()`, `.set()`.
+func buildWasmTableValue(vmInst *vm.VM, tableProtoVal vm.Value, bridge *wasmTableBridge) vm.Value {
+	obj := vm.NewObject(tableProtoVal).AsPlainObject()
+
+	enumerableFalse, configurableTrue := false, true
+	obj.DefineAccessorProperty(
+		"length",
+		vm.NewNativeFunction(0, false, "get length", func(_ []vm.Value) (vm.Value, error) {
+			return vm.NumberValue(float64(bridge.size())), nil
+		}),
+		true,
+		vm.Undefined,
+		false,
+		&enumerableFalse,
+		&configurableTrue,
+	)
+	obj.SetOwnNonEnumerable("grow", vm.NewNativeFunction(1, false, "grow", func(args []vm.Value) (vm.Value, error) {
+		delta := 0
+		if len(args) > 0 && args[0].IsNumber() {
+			delta = int(args[0].ToFloat())
+		}
+		if delta < 0 {
+			return vm.Undefined, vmInst.NewRangeError("WebAssembly.Table.grow: delta must not be negative")
+		}
+		initVal := vm.Undefined
+		if len(args) > 1 {
+			initVal = args[1]
+		}
+		prev, ok := bridge.grow(uint32(delta), initVal)
+		if !ok {
+			return vm.Undefined, vmInst.NewRangeError("WebAssembly.Table.grow: failed to grow table")
+		}
+		return vm.NumberValue(float64(prev)), nil
+	}))
+	obj.SetOwnNonEnumerable("get", vm.NewNativeFunction(1, false, "get", func(args []vm.Value) (vm.Value, error) {
+		idx := 0
+		if len(args) > 0 && args[0].IsNumber() {
+			idx = int(args[0].ToFloat())
+		}
+		if idx < 0 {
+			return vm.Undefined, vmInst.NewRangeError("WebAssembly.Table.get: index out of range")
+		}
+		v, err := bridge.get(uint32(idx))
+		if err != nil {
+			return vm.Undefined, vmInst.NewRangeError("WebAssembly.Table.get: " + err.Error())
+		}
+		return v, nil
+	}))
+	obj.SetOwnNonEnumerable("set", vm.NewNativeFunction(2, false, "set", func(args []vm.Value) (vm.Value, error) {
+		idx := 0
+		if len(args) > 0 && args[0].IsNumber() {
+			idx = int(args[0].ToFloat())
+		}
+		if idx < 0 {
+			return vm.Undefined, vmInst.NewRangeError("WebAssembly.Table.set: index out of range")
+		}
+		v := vm.Undefined
+		if len(args) > 1 {
+			v = args[1]
+		}
+		if err := bridge.set(uint32(idx), v); err != nil {
+			return vm.Undefined, vmInst.NewRangeError("WebAssembly.Table.set: " + err.Error())
+		}
+		return vm.Undefined, nil
+	}))
+	return vm.NewValueFromPlainObject(obj)
+}
+
+// buildWasmTableConstructor implements `new WebAssembly.Table({element,
+// initial, maximum})` - always a standaloneTableBackend (see its own doc
+// comment: nothing this bridge's real call site does ever imports a
+// table, so a host-constructed one never touches wazero). Passing one as
+// an *import* to WebAssembly.Instance is not implemented - table imports
+// aren't resolved at all by instantiateWasmModule's import-linking loop
+// below (only function imports are), so a module actually declaring a
+// table import surfaces wazero's own real LinkError for the missing
+// import at Instantiate time, same honest-refusal shape as
+// WebAssembly.Memory's standalone-construction refusal above.
+func buildWasmTableConstructor(vmInst *vm.VM, tableProtoVal vm.Value) vm.Value {
+	return vm.NewConstructorWithProps(1, false, "Table", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 || !args[0].IsObject() {
+			return vm.Undefined, vmInst.NewTypeError("WebAssembly.Table: descriptor argument must be an object")
+		}
+		desc := args[0]
+
+		elementVal, _ := vmInst.GetProperty(desc, "element")
+		var elemKind api.ValueType
+		switch elementVal.ToString() {
+		case "anyfunc", "funcref":
+			elemKind = wasmValueTypeFuncref
+		case "externref":
+			elemKind = api.ValueTypeExternref
+		default:
+			return vm.Undefined, vmInst.NewTypeError("WebAssembly.Table: descriptor.element must be 'anyfunc' or 'externref'")
+		}
+
+		initialVal, _ := vmInst.GetProperty(desc, "initial")
+		if !initialVal.IsNumber() {
+			return vm.Undefined, vmInst.NewTypeError("WebAssembly.Table: descriptor.initial must be a number")
+		}
+		initial := uint32(initialVal.ToFloat())
+
+		var max *uint32
+		if maxVal, _ := vmInst.GetProperty(desc, "maximum"); maxVal.IsNumber() {
+			m := uint32(maxVal.ToFloat())
+			max = &m
+		}
+
+		backend := &standaloneTableBackend{refs: make([]uint64, initial), max: max}
+		bridge := newWasmTableBridge(backend, elemKind)
+		return buildWasmTableValue(vmInst, tableProtoVal, bridge), nil
+	})
 }
 
 // jsValueToWazeroArg converts one JS argument into wazero's uint64 call
@@ -628,7 +1103,7 @@ func makeHostImportTrampoline(vmInst *vm.VM, jsFn vm.Value, params, results []ap
 
 // buildWasmInstanceConstructor implements `new WebAssembly.Instance(module,
 // importObject)` (see instantiateWasmModule for the actual logic).
-func buildWasmInstanceConstructor(vmInst *vm.VM, instanceProtoVal, memoryProtoVal vm.Value, errs wasmErrorCtors) vm.Value {
+func buildWasmInstanceConstructor(vmInst *vm.VM, instanceProtoVal, memoryProtoVal, tableProtoVal vm.Value, errs wasmErrorCtors) vm.Value {
 	return vm.NewConstructorWithProps(2, false, "Instance", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
 			return vm.Undefined, vmInst.NewTypeError("WebAssembly.Instance: missing module argument")
@@ -637,7 +1112,7 @@ func buildWasmInstanceConstructor(vmInst *vm.VM, instanceProtoVal, memoryProtoVa
 		if len(args) > 1 {
 			importObject = args[1]
 		}
-		return instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, errs, args[0], importObject)
+		return instantiateWasmModule(vmInst, instanceProtoVal, memoryProtoVal, tableProtoVal, errs, args[0], importObject)
 	})
 }
 
@@ -660,7 +1135,7 @@ func buildWasmInstanceConstructor(vmInst *vm.VM, instanceProtoVal, memoryProtoVa
 // docs/real-node-plan.md's Round 76 entry notes, each of these Runtimes
 // is never closed - fine at real usage, which memoizes lazyllhttp()'s
 // result to 1-2 Instances per process, but worth knowing the shape of).
-func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal vm.Value, errs wasmErrorCtors, moduleVal, importObject vm.Value) (vm.Value, error) {
+func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal, tableProtoVal vm.Value, errs wasmErrorCtors, moduleVal, importObject vm.Value) (vm.Value, error) {
 	moduleObj := asPlainObjectSafe(moduleVal)
 	var idVal vm.Value
 	var ok bool
@@ -760,6 +1235,18 @@ func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal vm.Va
 		resultsT := def.ResultTypes()
 		exportsObj.SetOwn(name, wrapWasmExportedFunction(vmInst, fn, params, resultsT, bridges, errs.runtimeError))
 	}
+	// Exported tables (this fork's ExportedTable addition, wazero#2461) -
+	// the actual piece this bridge exists for: real wasm-bindgen glue
+	// (see wasmTableBridge's own doc comment) reads its externref object
+	// heap off exactly this, as instance.exports.<name>.
+	for name, def := range compiled.ExportedTables() {
+		tbl := mod.ExportedTable(name)
+		if tbl == nil {
+			continue
+		}
+		bridge := newWasmTableBridge(wazeroTableBackend{t: tbl}, def.Type())
+		exportsObj.SetOwn(name, buildWasmTableValue(vmInst, tableProtoVal, bridge))
+	}
 
 	instObj := vm.NewObject(instanceProtoVal).AsPlainObject()
 	instObj.SetOwnNonEnumerable("exports", vm.NewValueFromPlainObject(exportsObj))
@@ -774,15 +1261,6 @@ func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal vm.Va
 // state (including any grow that happened during this very call).
 func wrapWasmExportedFunction(vmInst *vm.VM, fn api.Function, params, resultsT []api.ValueType, bridges []*wasmMemoryBridge, runtimeErrorCtor vm.Value) vm.Value {
 	name := fn.Definition().DebugName()
-	if len(resultsT) > 1 {
-		// Not needed by any real call site this bridge targets (every
-		// exported function llhttp needs returns 0 or 1 values) -
-		// refuse honestly rather than silently returning only the
-		// first of several real results.
-		return vm.NewNativeFunction(len(params), false, name, func(args []vm.Value) (vm.Value, error) {
-			return vm.Undefined, vmInst.NewTypeError(fmt.Sprintf("WebAssembly: exported function %q returns %d values - multi-value results are not supported", name, len(resultsT)))
-		})
-	}
 	return vm.NewNativeFunction(len(params), false, name, func(args []vm.Value) (vm.Value, error) {
 		for _, b := range bridges {
 			b.syncIn()
@@ -816,14 +1294,15 @@ func wrapWasmExportedFunction(vmInst *vm.VM, fn api.Function, params, resultsT [
 		results, callErr := fn.Call(context.Background(), callArgs...)
 
 		for _, b := range bridges {
-			// Redundant with the pre-call markDirty above for the common
-			// case, but cheap and covers a memory.grow that happened
-			// during the call (grow already forces a re-read via the
-			// size-changed check in bufferValue, but keeping this here
-			// costs nothing and documents the invariant: wasm is always
-			// considered authoritative after any call that could have
-			// touched its memory).
-			b.markDirty()
+			// Eager, not just markDirty()+defer-to-next-access: see
+			// syncOut's own doc comment for why a deferred sync alone
+			// isn't enough for glue that caches its own TypedArray view
+			// across calls (real wasm-bindgen glue does exactly this).
+			// A real grow is still handled lazily by bufferValue() on
+			// next access (syncOut defers to that itself when the size
+			// changed), so this remains correct for the llhttp call
+			// site's own memory.grow-mid-stream pattern too.
+			b.syncOut()
 		}
 
 		if callErr != nil {
@@ -839,9 +1318,29 @@ func wrapWasmExportedFunction(vmInst *vm.VM, fn api.Function, params, resultsT [
 			}
 			return vm.Undefined, throwWasmError(vmInst, runtimeErrorCtor, "WebAssembly: "+callErr.Error())
 		}
-		if len(resultsT) == 0 {
+		switch len(resultsT) {
+		case 0:
 			return vm.Undefined, nil
+		case 1:
+			return wazeroU64ToJSValue(results[0], resultsT[0]), nil
+		default:
+			// Per the real WebAssembly JS API spec (ToJSValueMultiple), a
+			// multi-value exported function's JS-visible return is a
+			// plain Array of the results in order - confirmed a real,
+			// reachable need (not speculative) by the real call site this
+			// bridge was extended for: wasm-bindgen's own generated glue
+			// destructures exactly this shape (`const ret =
+			// wasm.photonimage_get_bytes(ptr); ret[0]; ret[1];` - a
+			// pointer+length pair, the standard wasm-bindgen ABI for
+			// returning an owned buffer) - confirmed directly by running
+			// the real photon_rs_bg.wasm probe, which failed here (a
+			// TypeError, not a wrong-value bug) until this case was
+			// added.
+			vals := make([]vm.Value, len(resultsT))
+			for i, t := range resultsT {
+				vals[i] = wazeroU64ToJSValue(results[i], t)
+			}
+			return vm.NewArrayWithArgs(vals), nil
 		}
-		return wazeroU64ToJSValue(results[0], resultsT[0]), nil
 	})
 }
