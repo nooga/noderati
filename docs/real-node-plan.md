@@ -154,13 +154,25 @@ in each item's own round rather than in this ledger's four letter groups:
   marker, and a stray self-referential `node_modules/node_modules`
   symlink defeating the CJS module cache across a circular require) and
   fixed both, plus a third, independent `stream` gap (`Duplex`/
-  `PassThrough` missing entirely) found immediately after. The dependency
-  chain now reaches a new, smaller, precisely-scoped blocker instead:
-  `node:http2` doesn't exist in noderati at all (only `http2.constants`
-  is actually needed by the real call path, not the full session/
-  connection API) - not yet attempted. No AWS credentials were ever
+  `PassThrough` missing entirely) found immediately after. `node:http2`
+  (Round 95) now exists with real, complete `constants` and honest
+  stubs for the rest - confirmed sufficient to import/construct
+  `@smithy/node-http-handler` end to end. Round 95 also corrected an
+  assumption: Bedrock's real *default* handler is `NodeHttp2Handler`
+  (HTTP/2), not `NodeHttpHandler` - though real, unmodified `pi-ai`
+  source already has a documented `AWS_BEDROCK_FORCE_HTTP1=1` escape
+  hatch back to the fully-verified HTTP/1.1 path, needing no further
+  noderati work. The actual current blocker, found and filed the same
+  round, is **not** http2 at all:
+  [paserati#406](https://github.com/nooga/paserati/issues/406), a real
+  engine panic constructing the full `@aws-sdk/client-bedrock-runtime`
+  client (independent of transport choice - happens at import time via
+  `@aws-crypto/crc32`). Not noderati's to fix. A full `NodeHttp2Handler`
+  (Bedrock's real default, no-env-var path) is scoped in Round 95 as a
+  bounded, `http.go`-sized JS-shape adapter over Go's already-working
+  HTTP/2 transport, not attempted yet. No AWS credentials were ever
   available to attempt a real end-to-end call regardless. Last touched
-  Round 94.
+  Round 95.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -11102,3 +11114,161 @@ next blocker (`http2.constants`) instead of the old, vaguer
 "CJS/ESM interop gap, not root-caused further." AWS credentials are
 still not available in this environment to attempt an actual end-to-end
 call regardless of how far the dependency chain itself gets.
+
+## Round 95: `node:http2` stub built and verified; a new, real, more
+serious blocker found and filed upstream (paserati#406); the *actual*
+Bedrock job properly scoped
+
+Picked up Round 94's one open item: implement `node:http2`, starting
+with a stub, see how far it gets, then scope the rest.
+
+**Stub built and verified.** `internal/host/http2.go` (new): `constants`
+is a real, complete object - all 240 real entries, generated directly
+from real Node's own `require('http2').constants` output (see the
+file's own header for how), not hand-picked or guessed. It's fixed,
+static, spec/nghttp2-derived data with no runtime behavior, so there's
+no "only cover what one caller needs" tradeoff the way a *behavioral*
+API would have - getting all of it right costs nothing extra. Every
+other real export (`connect`, `createServer`, `createSecureServer`,
+`getDefaultSettings`, `getPackedSettings`, `getUnpackedSettings`,
+`performServerHandshake`) throws a clear "not implemented" error on
+actual use - an honest, deliberate gap, not a silent no-op;
+`sensitiveHeaders` is a real `Symbol` placeholder (matches real Node's
+value shape; no behavior needed for it). Wired into both `import` (a
+JS shim, matching `stream`/`http`/`https`'s own pattern) and
+`require()` (added to `nativeRequireNames`, the same gap async_hooks/
+http/https's own comments in `cjs.go` already warn about). Verified the
+constants object byte-for-byte against real Node for one entry from each
+distinct family the object mixes together (an nghttp2 error code, a
+pseudo-header, an HTTP method, an HTTP status code) plus the total
+count; three new tests
+(`TestHTTP2ConstantsMatchRealNode`/`TestHTTP2RequireWorks`/
+`TestHTTP2UnimplementedThrowsClearly`).
+
+**Confirmed this actually unblocks the real, original repro.** The
+exact `import { NodeHttpHandler } from '@smithy/node-http-handler'`
+probe that started Round 94 now succeeds end to end with the stub in
+place - real Node and noderati produce the same output
+(`typeof NodeHttpHandler: function`, handler construction succeeds).
+Also confirmed `NodeHttp2Handler` itself (the class this stub was built
+for) imports and *constructs* cleanly too - its own constructor never
+eagerly calls `http2.connect()`, only `.handle()` does, so the stub is
+exactly sufficient for import/construction, same principle as every
+other "honest gap, not silent" stub in this codebase.
+
+**Correcting a Round 94 assumption, found while scoping further: Bedrock's
+*default* handler is HTTP/2, not HTTP/1.1.** Round 94's text treated
+`NodeHttpHandler` (HTTP/1.1) as "the one Bedrock's default client
+actually uses." Reading `@aws-sdk/client-bedrock-runtime`'s own
+`runtimeConfig.js` directly shows this is wrong: it imports
+`NodeHttp2Handler as RequestHandler` and constructs the client's
+default `requestHandler` from *that* class, not `NodeHttpHandler`. A
+comment in `@earendil-works/pi-ai`'s own
+`dist/api/bedrock-converse-stream.js` confirms this in real, unmodified
+application code: `"Bedrock runtime uses NodeHttp2Handler by default
+since v3.798.0, which is based on \`http2\` module and has no support for
+http agent."` - and that same file carries a real, already-coded,
+already-documented escape hatch: if an HTTP(S) proxy is configured, or
+if `AWS_BEDROCK_FORCE_HTTP1=1` is set in the environment, it explicitly
+constructs `new NodeHttpHandler()` instead. This matters enormously for
+scoping: the already-fully-verified HTTP/1.1 path (rounds 68-70, plus
+this round's own resolver/stream fixes) can very plausibly serve
+Bedrock's real, end-to-end traffic *today*, using zero further http2
+work - *if* that env var is set - rather than needing a full
+`NodeHttp2Handler` implementation to get a real call working at all.
+
+**A new, more serious blocker found and filed, independent of http2
+entirely: paserati#406.** Pushed the probe further - constructing the
+*full* `@aws-sdk/client-bedrock-runtime` client (`new
+BedrockRuntimeClient(...)`, not just `@smithy/node-http-handler` in
+isolation) crashes with a real Go-level `[VM PANIC]` (`runtime error:
+index out of range`), not a JS exception. Confirmed this crash is
+**independent of transport choice** - it happens identically whether
+`requestHandler` is left at its HTTP/2 default or explicitly forced to
+`new NodeHttpHandler()` (the `AWS_BEDROCK_FORCE_HTTP1`-equivalent
+workaround above), because it happens purely at **module-import time**,
+before any request handler is ever touched. Root-caused (not just
+observed) to a genuine, real paserati engine bug via a full,
+disciplined isolation pass: traced the crash to `@aws-crypto/crc32`'s
+own `dist-cjs`/`dist-module` source, a `var Foo = (function () {
+function Foo() {...}; Foo.prototype.bar = ...; return Foo; })();`
+IIFE-with-a-same-named-inner-function pattern (real, unmodified
+TypeScript ES5-class-emit shape, not synthetic) - then built a minimal,
+15-line, dependency-free reproduction and confirmed it crashes identically
+against **bare paserati directly**, no noderati involved at all. Isolated
+the exact trigger by testing variants: removing the name collision
+between the outer `var Foo` and the inner `function Foo` fixes it;
+removing the *extra function nesting* around the pattern changes the
+symptom (a JS-level `TypeError: Cannot read property 'prototype' of
+undefined` instead of a VM panic) rather than fixing it outright -
+real Node returns the correct result for both variants, confirmed
+directly. Filed as
+[paserati#406](https://github.com/nooga/paserati/issues/406) with the
+full isolation, the disassembly showing the exact register-count-vs-
+emitted-code mismatch (`RegisterSize=17` but the first instruction
+writes `R17`), and a description of both symptoms as likely one root
+cause. Not fixed here - paserati's own concern per this project's
+current division of labor (see Round 92's ledger entry) - but blocks
+*any* real end-to-end Bedrock call, on *either* transport, until fixed
+upstream.
+
+**The actual full-job scoping, as asked:**
+
+1. **Cheapest real path to "Bedrock works end to end" once paserati#406
+   is fixed**: set `AWS_BEDROCK_FORCE_HTTP1=1` (real, already-coded,
+   already-documented in pi-ai's own source - not a noderati-side hack)
+   and let the already-fully-verified `NodeHttpHandler` (HTTP/1.1) carry
+   the real traffic. This needs **zero further noderati code** - the
+   `http2.constants` stub from this round is already sufficient for the
+   import-time reference the SDK's own module graph makes regardless of
+   which handler ends up used. This should be the first thing retried
+   once paserati#406 lands upstream, before spending any effort on a
+   full `NodeHttp2Handler` - it's very likely sufficient on its own.
+2. **The full job - making Bedrock's real *default* behavior (no env
+   var) work** - implementing a real `NodeHttp2Handler`. Read
+   `@smithy/node-http-handler`'s own `node-http2-handler.js`/
+   `node-http2-connection-manager.js` directly (not guessed) to
+   enumerate the exact real surface needed: `http2.connect(authority,
+   options)` returning a session object with `.request(headers)` (→ a
+   stream), `.settings(obj, cb)`, `.setTimeout(ms, cb)`, and events
+   `'goaway'`/`'error'`/`'frameError'`/`'close'`; the returned stream
+   needs to be genuinely both writable (the request body) and readable
+   (the response body, once headers arrive) - i.e. shaped exactly like
+   this round's own new `stream.Duplex` (Round 94) - plus
+   `.setTimeout()`, `.close()`, `.rstCode`, and events
+   `'response'`(headers, including a literal `:status` pseudo-header
+   key)/`'frameError'`/`'error'`/`'aborted'`/`'close'`. Real Bedrock
+   traffic doesn't touch server-side http2 (`createServer`,
+   `performServerHandshake`) at all - only the client `connect()` path.
+3. **Why this is smaller than "implement HTTP/2" sounds**: Go's own
+   `net/http.Transport` already speaks real HTTP/2 transparently
+   whenever a `https://` server negotiates it via TLS ALPN (this is
+   standard-library behavior, not something this project would need to
+   add) - the wire protocol, HPACK header compression, frame handling,
+   and flow control are already fully implemented and already working,
+   the same way `http.go` (Round 68) already gets real HTTP/1.1 for free
+   from the same `net/http.Client`. What's actually missing is a JS-
+   shape *adapter* translating between real Node's http2 session/stream
+   object model and Go's `http.Client`/`http.Response` - the same kind
+   of adapter `http.go` (434 lines) already is for HTTP/1.1, not a
+   from-scratch protocol implementation. A real, working
+   `NodeHttp2Handler` is realistically comparable in size to `http.go`
+   plus the `stream.Duplex` work already done this round - a genuine,
+   bounded unit of work, not an open-ended one.
+4. **Explicitly not needed for either path**: `createServer`/
+   `createSecureServer`/`performServerHandshake` (server-side http2) -
+   no real call site anywhere in the pi dependency tree touches them;
+   `getPackedSettings`/`getUnpackedSettings` (settings-frame wire
+   encoding used for HTTP/1.1-to-HTTP/2 Upgrade negotiation, not the
+   direct-TLS-ALPN path Bedrock's own client uses).
+
+**Status**: `node:http2`'s constants are real and done; the rest of the
+module is honestly stubbed. The actual current blocker to a real,
+credentialed, end-to-end Bedrock call is paserati#406 (filed, not
+noderati's to fix), not http2 - and once that's resolved upstream, the
+cheapest real path forward needs no new noderati code at all, only the
+`AWS_BEDROCK_FORCE_HTTP1=1` environment variable pi-ai's own real source
+already supports. A full `NodeHttp2Handler` (making Bedrock's real
+*default*, no-env-var behavior work) is scoped above as a bounded,
+`http.go`-sized adapter job for whenever that's wanted, not attempted
+this round.
