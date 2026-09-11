@@ -29,6 +29,8 @@ github.com/nooga/wazero v1.12.1-0.20260911144739-8570a68114ff h1:+reQ2hNGtE39c3g
 github.com/nooga/wazero v1.12.1-0.20260911144739-8570a68114ff/go.mod h1:LvKtzl2RqO4gyF27BiXU+nKAjcV8f38U+kP/q2vgxh0=
 github.com/nooga/wazero v1.12.1-0.20260911145747-e98e31fd6f13 h1:rJ2AeXcyao7bOFhfrOTLtFAMJPqjNPqw4CJ4Ckl9T5c=
 github.com/nooga/wazero v1.12.1-0.20260911145747-e98e31fd6f13/go.mod h1:LvKtzl2RqO4gyF27BiXU+nKAjcV8f38U+kP/q2vgxh0=
+github.com/nooga/wazero v1.12.1-0.20260911153041-6e16f4129bbf h1:4U0E0YqNXr1qrGqohuZ55LgPfWeUUjcHezsLI/61YDk=
+github.com/nooga/wazero v1.12.1-0.20260911153041-6e16f4129bbf/go.mod h1:LvKtzl2RqO4gyF27BiXU+nKAjcV8f38U+kP/q2vgxh0=
 github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=
 go.opencensus.io v0.24.0/go.mod h1:vNK8G9p7aAivkbmorf4v+7Hgx+Zs0yY+0fOtgBfjQKo=
 golang.org/x/crypto v0.53.0/go.mod h1:DNLU434OwVakk9PzuwV8w62mAJpRJL3vsgcfp4Qnsio=

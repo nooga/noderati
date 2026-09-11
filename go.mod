@@ -18,4 +18,4 @@ require (
 
 replace github.com/nooga/paserati => ../paserati
 
-replace github.com/tetratelabs/wazero => github.com/nooga/wazero e98e31fd6f139bf4f0413357057fb628cde28c77
+replace github.com/tetratelabs/wazero => github.com/nooga/wazero 6e16f4129bbfe439a70c58a9feb65a2c47aa1ade
