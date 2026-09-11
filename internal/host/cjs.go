@@ -284,6 +284,61 @@ func nodeModulePaths(from string) []string {
 	return paths
 }
 
+// requireJSON handles `require("./x.json")`/`require("../package.json")` -
+// real Node's own CJS loader (Module._extensions['.json']) parses a
+// required .json file's content as JSON and hands back the parsed value
+// as module.exports; it never runs the file's raw text as JS source the
+// way every other extension does. execFile's own CJS function-wrapper
+// unconditionally did exactly that before this existed - found the hard
+// way chasing the real Bedrock investigation (docs/real-node-plan.md,
+// round 96): @aws-sdk/client-bedrock-runtime's own dist-cjs
+// runtimeConfig.js does `require("../package.json")` for its own
+// package-version metadata, and wrapping that file's raw `{ "name":
+// ..., ... }` content in `(function (exports, require, module, ...) {
+// ... })` and parsing it as a JS function body is a syntax error
+// ("Expression expected") - a labeled-statement misparse of what's
+// actually a JSON object, not a JS block.
+//
+// Delegates to the real, engine-native JSON.parse (rather than a
+// separate hand-rolled Go-side JSON-to-vm.Value converter) so parsing
+// semantics - number formats, key ordering, everything - match exactly
+// what parsing this same text via JS code would produce, with nothing
+// to keep in sync.
+func (l *cjsLoader) requireJSON(resolved, source string) (vm.Value, error) {
+	abs, err := canonicalPath(resolved)
+	if err != nil {
+		abs = resolved
+	}
+	if cached, ok := l.cache[abs]; ok {
+		return l.moduleExports(cached), nil
+	}
+
+	vmInst := l.p.GetVM()
+	jsonGlobal, ok := vmInst.GetGlobal("JSON")
+	if !ok {
+		return vm.Undefined, fmt.Errorf("JSON global not available to parse %q", resolved)
+	}
+	jsonObj := jsonGlobal.AsPlainObject()
+	if jsonObj == nil {
+		return vm.Undefined, fmt.Errorf("JSON global not an object, cannot parse %q", resolved)
+	}
+	parseFn, ok := jsonObj.Get("parse")
+	if !ok {
+		return vm.Undefined, fmt.Errorf("JSON.parse not available to parse %q", resolved)
+	}
+	parsed, err := vmInst.Call(parseFn, vm.Undefined, []vm.Value{vm.String(source)})
+	if err != nil {
+		return vm.Undefined, fmt.Errorf("invalid JSON in %q: %w", resolved, err)
+	}
+
+	moduleVal := vm.NewObject(vmInst.ObjectPrototype)
+	modObj := moduleVal.AsPlainObject()
+	modObj.SetOwn("exports", parsed)
+	moduleVal = vm.NewValueFromPlainObject(modObj)
+	l.cache[abs] = moduleVal
+	return parsed, nil
+}
+
 func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.PaseratiError) {
 	abs, err := canonicalPath(filename)
 	if err != nil {
@@ -422,6 +477,9 @@ func (l *cjsLoader) require(specifier, fromFile string) (vm.Value, error) {
 	data, err := os.ReadFile(resolved)
 	if err != nil {
 		return vm.Undefined, fmt.Errorf("Cannot find module '%s'", specifier)
+	}
+	if strings.EqualFold(filepath.Ext(resolved), ".json") {
+		return l.requireJSON(resolved, string(data))
 	}
 	val, errs := l.execFile(resolved, StripShebang(string(data)))
 	if len(errs) > 0 {
