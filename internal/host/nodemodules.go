@@ -81,7 +81,7 @@ func (r *NodeModulesResolver) Resolve(specifier string, fromPath string) (*modul
 		return nil, fmt.Errorf("failed to resolve entry for %q: %w", specifier, err)
 	}
 
-	absPath, err := filepath.Abs(entryPath)
+	absPath, err := canonicalPath(entryPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to absolutize %q: %w", entryPath, err)
 	}
@@ -142,6 +142,43 @@ func splitPackageSpecifier(specifier string) (pkgName, subpath string) {
 		subpath = parts[1]
 	}
 	return pkgName, subpath
+}
+
+// canonicalPath resolves filename to an absolute path with every symlink
+// component followed - the same thing real Node's own module resolution
+// does (via fs.realpathSync) before using a resolved path as a module
+// cache key or as the "from" directory for a nested require/import.
+// Skipping this is what a real, reproduced bug traced back to: a real
+// npm/homebrew global install (@earendil-works/pi-coding-agent's own
+// node_modules, found while chasing the Bedrock "@smithy/core/protocols"
+// blocker) had a stray self-referential
+// `node_modules/node_modules -> node_modules` symlink sitting inside it.
+// findPackageDir's ancestor walk (see below) matches an ancestor as soon
+// as `<ancestor>/node_modules/<pkg>` exists - and that self-symlink makes
+// that check succeed one level too early, prepending an extra, spurious
+// "/node_modules" segment onto the resolved path. Each hop across a
+// circular require (@smithy/core/protocols <-> @smithy/core/serde, a
+// real, unavoidable cycle in real, unmodified `@smithy/core`'s own
+// dist-cjs output) re-triggered that same shortcut from a deeper starting
+// point, so the resolved absolute path grew by one more "/node_modules"
+// every time - a different string each time for what is really the same
+// file. Since execFile's own module cache is keyed by that exact string,
+// every hop looked like a brand-new, never-before-required module: the
+// circular require never got the shared, in-progress `module.exports`
+// real Node's cache would hand back, and something reading from the
+// wrong, freshly-(re)executing instance's not-yet-populated exports (a
+// `class X extends SerdeContext` base class, in the repro that surfaced
+// this) got `undefined` instead of the real one - "Class extends value
+// undefined is not a constructor or null", nothing to do with class
+// syntax itself. EvalSymlinks collapses any such shortcut straight back
+// to the one real, canonical file, restoring cache identity regardless
+// of which path first reached it - falls back to a plain filepath.Abs
+// only if the file can't be stat'd at all (e.g. it was already deleted).
+func canonicalPath(filename string) (string, error) {
+	if resolved, err := filepath.EvalSymlinks(filename); err == nil {
+		return filepath.Abs(resolved)
+	}
+	return filepath.Abs(filename)
 }
 
 func findPackageDir(startDir, pkgName string) (string, error) {
@@ -391,7 +428,25 @@ func shouldWrapCJS(absPath, source string) bool {
 // same-word-boundary match anywhere in the source is safe.
 var esmKeywordRe = regexp.MustCompile(`(?:^|[^\w$])(?:import|export)(?:[^\w$]|$)`)
 
+// dynamicImportCallRe matches a dynamic `import(...)` call expression -
+// legal in both CommonJS and ES module source (a CJS file can perfectly
+// well use it to load an ESM-only dependency), so its presence alone
+// must not count as "this file is ESM" the way a static `import ...
+// from ...`/bare `export ...` declaration does. esmKeywordRe's blanket
+// word-boundary match on "import" can't tell the two apart by itself.
+// Found via a real CJS file - @smithy/core's own dist-cjs
+// submodules/protocols/index.js (a real Bedrock/@smithy dependency) -
+// doing exactly `const { X } = await import('@smithy/core/event-streams')`
+// among otherwise unambiguous `require(...)`/`module.exports` CJS: that
+// one dynamic-import call was enough to flip looksLikeESMSource to
+// true, which skipped CJS-wrapping the file entirely and left its own
+// top-level `require(...)` calls with no `require` in scope once it was
+// loaded as if it really were ESM source - "ReferenceError: require is
+// not defined", not a resolution bug at all.
+var dynamicImportCallRe = regexp.MustCompile(`\bimport\s*\(`)
+
 func looksLikeESMSource(source string) bool {
+	source = dynamicImportCallRe.ReplaceAllString(source, "")
 	return esmKeywordRe.MatchString(source)
 }
 

@@ -278,7 +278,7 @@ func nodeModulePaths(from string) []string {
 }
 
 func (l *cjsLoader) execFile(filename, source string) (vm.Value, []errors.PaseratiError) {
-	abs, err := filepath.Abs(filename)
+	abs, err := canonicalPath(filename)
 	if err != nil {
 		abs = filename
 	}

@@ -143,9 +143,112 @@ func TestNodeModulesResolverResolveScopedPkg(t *testing.T) {
 	}
 	defer resolved.Source.Close()
 
-	want := filepath.Join(root, "node_modules", "@scope", "pkg", "index.js")
+	// canonicalPath (nodemodules.go) now resolves symlinks in the final
+	// path - t.TempDir() itself sits under a symlink on macOS (/var ->
+	// /private/var), so "want" needs the same canonicalization applied
+	// here, or this compares a resolved, symlink-free path against a
+	// raw one that still has the symlink in it. Real Node does the same
+	// realpath-ing on every resolved module path (see canonicalPath's
+	// own doc comment for why), so this is the correct comparison, not
+	// a workaround for the test.
+	want, err := canonicalPath(filepath.Join(root, "node_modules", "@scope", "pkg", "index.js"))
+	if err != nil {
+		t.Fatalf("canonicalPath(want): %v", err)
+	}
 	if resolved.ResolvedPath != want {
 		t.Errorf("ResolvedPath = %q, want %q", resolved.ResolvedPath, want)
+	}
+}
+
+// TestShouldWrapCJSIgnoresDynamicImportCall guards the exact bug found
+// chasing the Bedrock "@smithy/core/protocols" blocker: a real CJS file
+// (@smithy/core's own dist-cjs submodules/protocols/index.js) doing
+// `const { X } = await import('@smithy/core/event-streams')` among
+// otherwise unambiguous require()/module.exports CJS. A dynamic
+// `import(...)` call is legal in CommonJS too - it must not, by itself,
+// flip shouldWrapCJS's ESM-or-not verdict the way a static `import ...
+// from`/bare `export ...` declaration does. Genuine ESM (with a static
+// import) must still be detected as ESM - not wrapped - so both
+// directions are asserted here, not just the false-positive fix.
+func TestShouldWrapCJSIgnoresDynamicImportCall(t *testing.T) {
+	cjsWithDynamicImport := `'use strict';
+var fs = require('fs');
+async function loadExtra() {
+  const { X } = await import('./extra.js');
+  return X;
+}
+module.exports = { loadExtra };
+`
+	if !shouldWrapCJS("/virtual/protocols.js", cjsWithDynamicImport) {
+		t.Error("a CJS file using dynamic import() should still be wrapped as CJS, not treated as ESM")
+	}
+
+	genuineESM := `import fs from "fs";
+export const value = 42;
+`
+	if shouldWrapCJS("/virtual/esm.js", genuineESM) {
+		t.Error("a genuine ESM file (static import/export) should not be wrapped as CJS")
+	}
+}
+
+// TestNodeModulesResolverCircularRequireThroughSelfSymlink guards the
+// second bug found in the same investigation: a real npm/homebrew global
+// install (@earendil-works/pi-coding-agent's own node_modules) had a
+// stray self-referential `node_modules/node_modules -> node_modules`
+// symlink sitting inside it. findPackageDir's ancestor walk matches an
+// ancestor as soon as `<ancestor>/node_modules/<pkg>` exists on disk -
+// and that self-symlink makes the check succeed one level too early,
+// prepending a spurious extra "/node_modules" segment onto the resolved
+// path. A circular CJS require (a real, unavoidable shape - @smithy/
+// core's own dist-cjs protocols/serde modules require each other) that
+// crosses this shortcut resolved to a *different* absolute path string
+// each time, defeating execFile's cache (keyed by that string) and
+// breaking the shared, in-progress module.exports circular CJS require
+// depends on. canonicalPath's EvalSymlinks collapses the shortcut back
+// to one real path regardless of which route reached it - this
+// reproduces the self-symlink directly (no external package needed) and
+// asserts a value set by one side of the cycle is visible, synchronously
+// and via the *same* cached module object, to the other side.
+func TestNodeModulesResolverCircularRequireThroughSelfSymlink(t *testing.T) {
+	root := t.TempDir()
+
+	// Bare package specifiers, not relative ones: findPackageDir's
+	// ancestor walk (the thing the self-symlink below trips up) only
+	// runs for a bare "pkg-a"/"pkg-b" require, not a "./..." one. Each
+	// package's own require() runs from *inside* node_modules/pkg-*, so
+	// its very first ancestor-walk step lands on "root/node_modules" -
+	// exactly the directory the self-symlink sits in - before it would
+	// ever reach "root" itself, one level further up, where the real,
+	// correct match also exists.
+	writeFile(t, filepath.Join(root, "node_modules", "pkg-a", "index.js"), `
+		exports.mark = "unset";
+		const b = require("pkg-b");
+		b.setFromA();
+	`)
+	writeFile(t, filepath.Join(root, "node_modules", "pkg-b", "index.js"), `
+		const a = require("pkg-a");
+		exports.setFromA = function () {
+			a.mark = "set-by-b";
+		};
+	`)
+
+	// The stray self-referential symlink itself: node_modules/node_modules
+	// pointing right back at node_modules, exactly like the real install
+	// that surfaced this.
+	if err := os.Symlink(
+		filepath.Join(root, "node_modules"),
+		filepath.Join(root, "node_modules", "node_modules"),
+	); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	p := driver.NewPaserati()
+	val, errs := RunCJS(p, `module.exports = require("pkg-a").mark;`, filepath.Join(root, "entry.js"))
+	if len(errs) > 0 {
+		t.Fatalf("RunCJS: %v", errs[0])
+	}
+	if got := val.ToString(); got != "set-by-b" {
+		t.Errorf("a.mark = %q, want %q (b's require(\"pkg-a\") should have hit the same cached module a's own require(\"pkg-b\") populated, not a fresh, differently-pathed reload)", got, "set-by-b")
 	}
 }
 
