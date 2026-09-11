@@ -179,12 +179,19 @@ in each item's own round rather than in this ledger's four letter groups:
   module-loading across goroutines; blocks real `worker_threads`
   concurrency (today's in-process fallback covers the one real consumer,
   so low urgency). Round 67.
-- **WASM-backed image resizing** (`resizeImageInProcess`, real Photon via
-  WebAssembly) - retried in Round 93 against the real
-  `@silvia-odwyer/photon-node` package. No longer "never retried"; the
-  blocker is now precisely identified as a missing `WebAssembly.Table`
-  in wazero's own public API (see Round 93), not a noderati-side gap
-  that can be closed by more host code.
+- ~~**WASM-backed image resizing**~~ - **closed in Round 96.** Round 93
+  root-caused the blocker to a missing `WebAssembly.Table` in wazero's
+  own public API; Round 96 forked wazero
+  ([nooga/wazero, `noderati-table-export`](https://github.com/nooga/wazero/tree/noderati-table-export))
+  to add it, wired a real spec-shaped `WebAssembly.Table` into
+  `webassembly_global.go`, and found/fixed two more real bugs
+  (multi-value exported-function results; a latent `wasmMemoryBridge`
+  grow-detection bug) surfaced chasing the real
+  `@silvia-odwyer/photon-node` probe to a byte-for-byte-identical-to-real-Node
+  pass. The fork is a maintenance liability, not a permanent fix -
+  [wazero#2461](https://github.com/wazero/wazero/issues/2461) is still
+  open upstream and should be watched; switch back to stock wazero and
+  retire the fork once it lands there.
 - **The stray `"1"` file** pi writes to disk - confirmed real, mechanism
   unconfirmed, cosmetic. Round 67.
 - **Self-hosting `tsc`** (compiling TypeScript's own source with
@@ -11272,3 +11279,209 @@ already supports. A full `NodeHttp2Handler` (making Bedrock's real
 *default*, no-env-var behavior work) is scoped above as a bounded,
 `http.go`-sized adapter job for whenever that's wanted, not attempted
 this round.
+
+## Round 96: `WebAssembly.Table` landed via a wazero fork - Round 93's
+own "don't fork" conclusion explicitly overridden by the user; real
+photon-node resize now byte-for-byte identical to real Node, plus one
+more real memory-bridge bug found chasing it to the end
+
+Round 93 root-caused the "WASM-backed image resizing" blocker to a real,
+external gap in wazero itself (no `ExportedTable` on `api.Module`, no
+way to reach a module's exported table from host Go code) and explicitly
+decided *not* to fork or vendor wazero to work around it, deferring to
+the user. This round is that explicit ask: fork wazero, add the missing
+accessor, and wire it through - Round 93's own conclusion doesn't apply
+once the user has made that call directly.
+
+**The fork.** [github.com/nooga/wazero, branch
+`noderati-table-export`](https://github.com/nooga/wazero/tree/noderati-table-export),
+branched from the exact `v1.12.0` tag noderati already pinned (not
+wazero's current `main`, to keep the diff to this one gap and nothing
+else that changed upstream since). Two commits:
+
+1. `api.Module.ExportedTable(name string) api.Table` - fills the literal
+   `// TODO: Table` gap Round 93 found, mirroring `ExportedMemory`/
+   `ExportedGlobal`'s exact existing shape (`internal/wasm/table_api.go`'s
+   `exportedTable` wrapper mirrors `global.go`'s `constantGlobal`/
+   `mutableGlobal` line for line). `api.Table` itself: `Type()`/`Size()`/
+   `Grow(delta, init uint64) (prev uint32, ok bool)`/`Get(i uint32)
+   (uint64, error)`/`Set(i uint32, v uint64) error` - references
+   encoded/decoded as `uint64` the same way `Global.Get`/
+   `MutableGlobal.Set` already do, reusing the existing
+   `EncodeExternref`/`DecodeExternref` helpers. **Deliberate divergence
+   from wazero#2461's own sketch** (`Set(ctx, i, obj any)`, taking a live
+   Go value directly): that shape would require wazero itself to keep
+   host objects alive against the GC, which wazero does for neither
+   globals nor memory either - see `api.Table`'s own doc comment in the
+   fork. `TableInstance` (internal) gained `Get`/`Set` methods (only
+   `Grow` existed before).
+2. `CompiledModule.ExportedTables()`/`ImportedTables()` returning
+   `api.TableDefinition` - not asked for by wazero#2461 directly, but
+   needed for the actual bridge below to enumerate *which* names to call
+   `ExportedTable` on, the same way it already walks
+   `compiled.ExportedMemories()`/`ExportedFunctions()`. Mirrors
+   `MemoryDefinition`/`BuildMemoryDefinitions` exactly
+   (`internal/wasm/table_definition.go`, copy-adapted line for line).
+
+Both commits add table-driven tests mirroring the existing
+`TestModule_Global`/`TestModule_BuildMemoryDefinitions` coverage
+one-for-one. `go test ./...` in the fork is fully green - confirmed
+directly, not assumed: **zero regressions** to wazero's own suite
+(interpreter, wazevo/compiler, wasi_snapshot_preview1, every spectest
+variant including `typed-function-references` and `threads`, all
+passed).
+
+**Wired into noderati.** `go.mod`'s `replace
+github.com/tetratelabs/wazero => github.com/nooga/wazero
+<pseudo-version>` (not a `go.work` sibling checkout, unlike the
+`paserati` pattern): the fork's own `go.mod` still declares itself as
+`module github.com/tetratelabs/wazero` (deliberately never renamed, so
+rebasing onto upstream stays a plain `git merge`/`git rebase`, not an
+import-path rewrite across the whole tree) - `replace` with a different
+left-hand module path but an unchanged right-hand `module` line is a
+well-established Go idiom for exactly this ("depend on my fork, keep
+upstream's import path"), confirmed to actually resolve and build
+cleanly, not merely assumed. A `go.work` sibling checkout (the
+`paserati` pattern) was considered and rejected: paserati is a sibling
+repo under this same person's *active, ongoing, joint* development,
+where a live local checkout is the point; this wazero fork is a single
+narrow patch this project doesn't intend to keep developing - a pinned
+`replace` at a specific commit is reproducible via `go.work.sum` for
+anyone who clones noderati fresh, with no extra sibling-repo setup step,
+which is the more maintainable choice for a fork of this shape.
+
+**The JS bridge - `internal/host/webassembly_global.go`.** A real,
+spec-shaped `WebAssembly.Table`:
+
+- `instance.exports.<name>` now yields a working table object for any
+  table a module exports - `wasmTableBridge` wraps the fork's
+  `api.Table` and gives it `.length`/`.grow()`/`.get()`/`.set()`.
+- **The real design problem, found by disassembling the actual call
+  site's own compiled wasm** (`wasm2wat` on `photon_rs_bg.wasm`, not
+  assumed from the JS glue alone): wazero's `Reference` is a raw
+  `uintptr` - fine for a host to round-trip its *own* numbers, but
+  unsafe for an arbitrary live paserati JS value, since Go's GC does not
+  trace a value reachable only through a `uintptr`. Worse, wasm-bindgen's
+  real generated code (`__externref_table_alloc`/
+  `__externref_table_dealloc`, both real, exported wasm functions)
+  mutates this *same* table directly via real WASM `table.grow`/
+  `table.set` **bytecode instructions**, entirely inside the wasm engine,
+  on every exception-handling round trip - confirmed directly in the
+  disassembly, not assumed - so any JS-side parallel length/contents
+  tracking would desync the moment that ran. The fix: real JS values
+  never go into wazero's own reference array at all - every `.set()`/
+  `.grow()` allocates a small integer handle in the bridge's own live Go
+  map (immune to the GC hazard) and writes only that handle through;
+  `.get()` reverses the lookup. wazero's own table (via the fork's
+  accessor) stays the single source of truth for length and null state
+  regardless of which side - JS or wasm bytecode - touched it most
+  recently. Handle `0` is reserved (matching wasm's own null-reference
+  bit pattern) and decodes to `undefined` for an externref table or
+  `null` for a funcref one; externref's own explicit `null`/`undefined`
+  values still get real handles, never collapsed onto `0`, because the
+  real init function this bridge now runs correctly
+  (`__wbindgen_init_externref_table`) sets `table.set(0, undefined)` and
+  `table.set(offset+1, null)` and both must read back as those exact
+  distinct values, not one flattened "empty" sentinel. Full reasoning
+  and the one accepted, documented gap (a slot nulled by wasm bytecode
+  directly bypasses this bridge's own handle-release step, so that
+  handle lingers until process exit - bounded and harmless for this real
+  call site, never a large or growing set) are in `wasmTableBridge`'s own
+  doc comment.
+- `new WebAssembly.Table({element, initial, maximum})` also implemented,
+  as a standalone, wazero-independent backend (`standaloneTableBackend`)
+  sharing the same bridge/wrapper code - nothing this bridge's real call
+  site does ever imports a table, so a host-constructed one never
+  touches wazero at all; passing one as an *import* isn't implemented
+  (table imports aren't resolved by the existing import-linking loop,
+  which only ever handled function imports) and surfaces wazero's own
+  real `LinkError` for the unresolved import, the same honest-refusal
+  shape `WebAssembly.Memory`'s own standalone-construction refusal
+  already uses.
+
+**Two more real, separate bugs found chasing the probe to an actual
+byte-for-byte pass - neither about `WebAssembly.Table` itself, both
+fixed in this same file:**
+
+1. **Multi-value exported-function results were refused outright.**
+   `photonimage_get_bytes`/`get_bytes_jpeg` (the wasm-bindgen ABI for
+   returning an owned buffer) return a real pointer+length *pair* - two
+   wasm results, not one - which `wrapWasmExportedFunction` threw a
+   `TypeError` for (a Round 76 scoping decision: llhttp, the original
+   target, never needed more than one result). Real `get_bytes()`'s own
+   glue destructures exactly `ret[0]`/`ret[1]`, matching the actual
+   WebAssembly JS API spec (`ToJSValueMultiple` boxes multiple results
+   into a plain `Array`) - implemented that shape rather than continuing
+   to refuse it, confirmed a real, reachable need (not speculative) by
+   running the real probe, which failed with exactly this `TypeError`
+   until fixed.
+2. **A latent, real bug in `wasmMemoryBridge`'s memory-growth handling -
+   present since Round 76, never triggered until now.** With multi-value
+   results fixed, `get_bytes()`'s own output came back
+   *length-correct but every byte zero* - not a crash, a silently wrong
+   answer, root-caused rather than assumed away. `wasm.memory.buffer`
+   only ever got detached-and-replaced *reactively*, the next time JS
+   code happened to read `.buffer` again. Real undici's own llhttp call
+   site (this bridge's original target) always re-reads `.memory.buffer`
+   fresh on every access, so this was never observable there. Real
+   wasm-bindgen glue (`photon_rs.js`'s own `getUint8ArrayMemory0`)
+   instead does exactly what a real, spec-compliant engine's genuine
+   zero-copy `.buffer` *entitles* it to do: fetch the view once, keep
+   reading through the same cached `Uint8Array` forever, and only
+   re-fetch when that cached view's own `.byteLength` reads back `0`
+   (i.e. actually detached). Since this bridge only detached
+   reactively, a grow that happened while nothing asked for `.buffer`
+   left the old cached view fully valid-looking (non-zero `byteLength`)
+   but frozen at stale, pre-grow memory contents - exactly the `get_bytes`
+   pattern, since the real PNG/JPEG bytes are written only after further
+   internal wasm-side allocation growth this bridge never proactively
+   surfaced. Fixed with a `detachIfGrownLocked` helper, called the
+   *instant* a size change is observed (right after every exported call
+   returns, and right after an explicit JS `.grow()`), matching a real
+   engine's own intrinsic "grow detaches every existing view immediately"
+   behavior instead of waiting for a `.buffer` access that may never
+   come. Also added eager same-size sync (`syncOut`, called post-call)
+   so an already-vended buffer's *bytes* update in place without waiting
+   for the next `.buffer` read either - matching how a real live view
+   would already look UI to JS with genuinely zero synchronization step.
+   Confirmed necessary and sufficient by direct A/B testing at the raw
+   byte level (see verification below), not by re-running the top-level
+   probe alone.
+
+**Verification - real output, not just "it worked".**
+
+- `cd wazero-fork && go build ./...` and `go vet ./...`: clean (the
+  fork's own pre-existing `stdmethods`/arm64-asm vet warnings are
+  present identically on unmodified `v1.12.0`, confirmed by diffing
+  against a pristine checkout - nothing new).
+- `cd wazero-fork && go test ./...`: fully green, zero regressions.
+- `cd noderati && go build ./...`, `go vet ./...`: clean.
+- `go test ./internal/host/... -skip 'TestEventsAddAbortListener'`:
+  green (that skip is paserati#372, tracked in the ledger below, not
+  this round's concern).
+- The real probe (`/tmp/photon_test/probe.mjs`, unmodified from Round
+  93): `original size: 2 x 2` / `resized size: 1 x 1` / `output png byte
+  length: 73` / `output jpeg byte length: 631` / `ALL GOOD` - all
+  matching real Node's own run of the identical script.
+- Went further than length-matching: wrote both runtimes' actual output
+  bytes to disk (`get_bytes()`/`get_bytes_jpeg()`, not just their
+  `.length`) and diffed them with `cmp`. **Byte-for-byte identical** -
+  `noderati_out.png`/`.jpg` and real Node's own `node_out.png`/`.jpg`
+  have zero differing bytes, confirmed directly, not inferred from
+  matching lengths alone (which is exactly what the pre-fix, all-zero
+  output would have passed too, had length been the only check).
+- All temporary debug instrumentation (`fmt.Fprintf(os.Stderr, ...)`
+  added while diagnosing the memory-bridge bug above) reverted before
+  landing.
+
+**Status**: the "WASM-backed image resizing" ledger item below is
+updated from "blocked on wazero's missing `WebAssembly.Table` API" to
+closed - real photon-node image resizing now works end to end under
+noderati, byte-for-byte identical to real Node, backed by a small,
+focused wazero fork. That fork is a maintenance liability, not a free
+win: **wazero#2461 is still open and unassigned upstream** as of this
+writing, and should stay watched - if/when it lands (in whatever shape a
+maintainer actually picks, which may not match this fork's own `uint64`-
+encoding choice), noderati's `go.mod` should switch back to a stock
+`tetratelabs/wazero` release and this fork should be retired rather than
+carried forward indefinitely.
