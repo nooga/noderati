@@ -62,6 +62,13 @@ var nativeRequireNames = map[string]bool{
 	"dns":         true,
 	"zlib":        true,
 	"util/types":  true,
+	// http2 (declareHTTP2, round 94) added directly here too, same
+	// deliberate reason async_hooks's own comment above gives - a JS-
+	// shim-backed module (like stream/http/https before it) still needs
+	// a require("node:http2") route through requireNative, or it falls
+	// through to file resolution and fails with "Cannot find module"
+	// even though `import` of the same name works fine.
+	"http2": true,
 }
 
 type cjsLoader struct {
