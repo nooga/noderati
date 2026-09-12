@@ -184,12 +184,23 @@ in each item's own round rather than in this ledger's four letter groups:
   real `class X extends builder.build() {}` command-class pattern (used
   ~90 times, once per Bedrock API operation) - isolated to an 8-line
   repro, possibly the same underlying class of bug `#406` was, just not
-  covered by that fix's own scope. Not noderati's to fix. A full
-  `NodeHttp2Handler` (Bedrock's real default, no-env-var path) is scoped
-  in Round 95 as a bounded, `http.go`-sized JS-shape adapter over Go's
-  already-working HTTP/2 transport, not attempted yet. No AWS
-  credentials were ever available to attempt a real end-to-end call
-  regardless. Last touched Round 98.
+  covered by that fix's own scope. Round 99: confirmed `#416` fixed -
+  **full, real `BedrockRuntimeClient`/`ConverseCommand` construction now
+  succeeds end to end, matching real Node exactly** - the milestone this
+  whole chain (rounds 94-99) has been building toward. Pushing one step
+  further, into an actual `client.send()`, found and fixed one more real
+  noderati gap: `URLSearchParams` had no `Symbol.iterator`/`entries`/
+  `keys`/`values`/`forEach`/`.size` at all (real `@smithy/core` code does
+  `for (const [key, value] of new URLSearchParams(search))` at a real
+  serialization call site) - worked around `ModuleBuilder.Class`'s
+  per-instance-only method binding using `vm.GetThis()`, no paserati
+  changes needed. `client.send()` now reaches a new, not-yet-isolated
+  failure inside real schema-based request serialization - left open for
+  a following round. A full `NodeHttp2Handler` (Bedrock's real default,
+  no-env-var path) is scoped in Round 95 as a bounded, `http.go`-sized
+  JS-shape adapter over Go's already-working HTTP/2 transport, not
+  attempted yet. No AWS credentials were ever available to attempt a
+  real end-to-end call regardless. Last touched Round 99.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -11709,3 +11720,111 @@ The Bedrock dependency graph now reaches a new, precisely-identified
 upstream engine gap (`paserati#416`) instead of the resolved
 `TransformStream`/`fs.promises` gaps - not noderati's to fix. Full
 suite/vet/scoreboard clean after the `fs.promises` fix, no regressions.
+
+## Round 99: paserati#416 confirmed fixed - full `BedrockRuntimeClient`/
+`ConverseCommand` construction now succeeds, matching real Node exactly;
+`URLSearchParams` iteration found missing and fixed; an accidental
+contamination of the real npm install caught mid-round and fully
+reverted
+
+Picked up `paserati#416` (merged as
+[df8db835](https://github.com/nooga/paserati/commit/df8db835)) and
+reset local `paserati` onto it.
+
+**Confirmed fixed, and a real milestone reached: full client + command
+construction now succeeds.** Re-ran the exact filed repro directly
+against `paserati` - prints `true`, no panic. Rebuilt noderati; the
+natural, no-workaround
+`import { BedrockRuntimeClient, ConverseCommand } from
+'@aws-sdk/client-bedrock-runtime'; new BedrockRuntimeClient({...}); new
+ConverseCommand({...})` probe now succeeds completely -
+`client created: function` / `command created: object`, matching real
+Node's own baseline output exactly. This is Bedrock's actual
+construction milestone: every real package in the chain
+(`@smithy/core`, `@aws-sdk/core`, `@aws-sdk/client-bedrock-runtime`,
+and everything each of those pulls in) now imports and constructs
+cleanly under noderati.
+
+**A real `URLSearchParams` gap found and fixed pushing one step
+further, into `client.send()`.** Attempting an actual request (against
+`NodeHttpHandler`, no real AWS credentials) failed with `TypeError:
+undefined is not a function` inside `serializeRequest`. Traced (see
+below for how) to `@smithy/core`'s own real request-serialization code:
+`for (const [key, value] of new URLSearchParams(search))` - a real
+`for...of` over a `URLSearchParams` instance. `urlsearchparams.go`'s
+own doc comment had already flagged this precisely: "No ...
+`Symbol.iterator`/`entries`/`keys`/`values`/`forEach`... add real
+support for any of these once something does" - and now something
+does. Root cause of *why* it's not simply a missing method:
+`ModuleBuilder.Class` (paserati's `pkg/driver`) binds every Go method
+as an instance-owned closure created fresh per construction, with no
+shared-prototype equivalent and no generic way to recover a specific
+instance's own Go struct from an arbitrary `this` - `Symbol.iterator`
+has to live on the shared prototype (real code does
+`Object.getPrototypeOf(x)[Symbol.iterator]`-shaped checks, and a
+per-instance version would wrongly show up in `for...in`), so the
+usual per-instance trick doesn't reach. Worked around, not around
+paserati: a new `RawPairs()` Go method (itself an ordinary per-instance
+method, reachable as `.rawPairs()`) plus a new
+`installURLSearchParamsIteration`, which uses `vm.GetThis()` - the same
+mechanism paserati's own native-call path (`pkg/vm/call.go`'s
+`vm.currentThis`) already threads through for exactly this reason - to
+find which instance is being iterated, calls that instance's own
+`rawPairs()` via a real `vmInst.Call(...)`, and builds real iterator
+objects and `entries`/`keys`/`values`/`forEach`/`.size` from the result
+directly on the shared `URLSearchParams.prototype`. No paserati changes
+needed. Verified against real Node exactly, including the real
+`[Symbol.iterator] === entries` identity and `forEach`'s real `(value,
+key, target)` argument order (not the more intuitive `(key, value)`).
+New test: `TestURLSearchParamsIteration`.
+
+**An accidental contamination of the real, global npm install, caught
+mid-round and fully reverted.** Bisecting `serializeRequest`'s own
+crash location used the same debug-instrumentation technique earlier
+rounds relied on (temporary checkpoint prints in a local copy of the
+real package). A directory-setup script's symlink loop had a real bug:
+it created `/tmp/bedrock_debug/node_modules/@smithy` as a symlink
+*directly at* the real, global `@smithy` directory (rather than an
+independent copy) before a later step tried to populate it further -
+every subsequent `ln -sfn`/`cp -r` aimed at what was believed to be an
+isolated scratch tree actually wrote *through* that symlink into the
+real install. Caught two effects of this: one real package file
+(`@smithy/core/dist-cjs/submodules/protocols/index.js`) had temporary
+debug `console.error(...)` lines inserted into it directly, and 26
+stray self-referential symlinks (e.g. `@smithy/types/types ->
+@smithy/types/`, `@aws-sdk/core/core -> @aws-sdk/core/` - the same
+class of stray symlink Round 94 found pre-existing elsewhere in this
+same install, self-inflicted this time) appeared across every
+`@smithy/*`/`@aws-sdk/*` package the setup script had touched. Both
+fully reverted: the one file's debug lines removed by precisely
+reversing the exact insertion (confirmed via line count matching the
+pristine original, `1159` lines, read before any edit), and all 26
+stray symlinks removed individually (each one verified as a genuine
+self-referential symlink before removal, never touching real package
+content) - the 8 in `@smithy/*` found and fixed directly, the 18 in
+`@aws-sdk/*` found, listed for confirmation, and removed only after the
+user explicitly chose that cleanup path. Scoreboard re-run afterward
+matches baseline exactly, confirming no lasting damage. Continued the
+actual investigation afterward using a genuinely isolated `cp -r` copy
+under this session's own scratchpad directory instead - no symlinks
+into the real install at all, this time.
+
+**Reached, but did not fully isolate this round: a deeper failure past
+`URLSearchParams`, inside real schema-based request serialization.**
+With the `URLSearchParams` fix in, `client.send()` advances further -
+past the `structIterator()` loop over `ConverseCommand`'s own real
+input fields - into `@smithy/core`'s schema-serializer code
+(`serializer.write(payloadSchema, input)` and whatever it calls
+internally), where it hits another `TypeError: undefined is not a
+function`, not yet root-caused to a specific line or mechanism. Left
+open for a following round rather than chased further into
+`NormalizedSchema`/schema-serializer internals in this same pass.
+
+**Status**: Bedrock's real, unmodified client + command construction is
+now fully working, matching real Node exactly - the actual milestone
+this whole investigation chain (rounds 94-99) has been building toward.
+`URLSearchParams` iteration is real and complete. The next, narrower
+blocker is inside real schema-based request serialization, not yet
+isolated. No AWS credentials were ever available in this environment to
+attempt a real end-to-end call regardless of how far the request-
+building path itself gets.
