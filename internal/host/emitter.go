@@ -69,6 +69,7 @@ func newEventEmitterObject(vmInst *vm.VM) *vm.PlainObject {
 func newReadableStream(vmInst *vm.VM) *vm.PlainObject {
 	obj := newEventEmitterObject(vmInst)
 	obj.SetOwn("readable", vm.True)
+	obj.SetInternalSlots(&pendingStreamData{})
 	self := vm.NewValueFromPlainObject(obj)
 	// setEncoding was missing entirely - real Node's Readable always has it,
 	// and pi-agent-core's own real tool-call harness (nodejs.js's
@@ -105,12 +106,27 @@ func newReadableStream(vmInst *vm.VM) *vm.PlainObject {
 			return vm.Undefined, nil
 		}
 		dest := args[0]
+		// Get, not GetOwn: found the hard way chasing the real Bedrock
+		// investigation (docs/real-node-plan.md, round 101) - a real
+		// `class Collector extends Writable` destination (real
+		// @smithy/node-http-handler's own streamCollector, doing
+		// `stream.pipe(collector)` to read a real HTTP response body)
+		// has `write`/`end` on its *prototype* (stream.go's `Writable`
+		// class defines them as ordinary class methods, which JS puts on
+		// `Writable.prototype`, not as own properties of each instance) -
+		// GetOwn only checks the instance itself and silently found
+		// neither, so piping into any class-based Writable destination
+		// wrote nothing and never called end() at all, hanging whatever
+		// awaited the destination's own "finish"/"close" event forever.
+		// Real Node's `dest.write(...)`/`dest.end()` are ordinary
+		// property accesses, which naturally walk the prototype chain -
+		// Get (object.go) is the direct equivalent here.
 		addListener(vmInst, obj, "data", vm.NewNativeFunction(1, false, "pipeData", func(dataArgs []vm.Value) (vm.Value, error) {
 			if len(dataArgs) == 0 {
 				return vm.Undefined, nil
 			}
 			if destObj := dest.AsPlainObject(); destObj != nil {
-				if writeFn, ok := destObj.GetOwn("write"); ok && writeFn.IsCallable() {
+				if writeFn, ok := destObj.Get("write"); ok && writeFn.IsCallable() {
 					_, _ = vmInst.Call(writeFn, dest, []vm.Value{dataArgs[0]})
 				}
 			}
@@ -118,7 +134,7 @@ func newReadableStream(vmInst *vm.VM) *vm.PlainObject {
 		}), false, false)
 		addListener(vmInst, obj, "end", vm.NewNativeFunction(0, false, "pipeEnd", func(_ []vm.Value) (vm.Value, error) {
 			if destObj := dest.AsPlainObject(); destObj != nil {
-				if endFn, ok := destObj.GetOwn("end"); ok && endFn.IsCallable() {
+				if endFn, ok := destObj.Get("end"); ok && endFn.IsCallable() {
 					_, _ = vmInst.Call(endFn, dest, nil)
 				}
 			}
@@ -186,6 +202,20 @@ func addListener(vmInst *vm.VM, obj *vm.PlainObject, event string, listener vm.V
 		arr.Set(0, fn)
 	} else {
 		arr.Append(fn)
+	}
+	// A "data" listener attaching *late* (after chunks already arrived
+	// and got buffered by scheduleEmit/pendingStreamData, above) still
+	// needs those chunks delivered - nothing else re-checks the buffer
+	// once a chunk has already been scheduled and found no listener.
+	// Scheduled for next tick, not flushed synchronously here, so this
+	// doesn't reenter mid-registration and stays consistent with every
+	// other "data"/"end" emit's own timing.
+	if event == "data" {
+		if pending, ok := obj.InternalSlots().(*pendingStreamData); ok {
+			vmInst.GetAsyncRuntime().ScheduleNextTick(func() {
+				flushPendingStreamData(vmInst, obj, pending)
+			})
+		}
 	}
 	return vm.NewValueFromPlainObject(obj)
 }
@@ -327,9 +357,79 @@ func emitOnObject(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.V
 	return true
 }
 
+// pendingStreamData buffers "data"/"end" for a newReadableStream object
+// between the moment a chunk actually arrives and the moment something
+// is actually listening for it - the same "paused until a consumer
+// attaches" contract every real Node Readable has, and a real race
+// without it: found the hard way chasing the real Bedrock investigation
+// (docs/real-node-plan.md, round 101). Real Node's own
+// `NodeHttpHandler` reads a response body only after normal async/await
+// plumbing (several middleware layers, each its own microtask hop)
+// finally reaches `stream.pipe(collector)` - by then, a background Go
+// goroutine reading the real socket (pumpHTTPResponseBody, http.go) may
+// already have scheduled *every* "data"/"end" emit for a stream nobody
+// had attached a listener to yet. `emit()` with zero listeners is
+// correctly a no-op per the EventEmitter contract - but that made the
+// data gone, not merely deferred, the instant more than a couple of
+// microtask hops separated "response received" from "somebody reads
+// it". Confirmed directly: a minimal repro with only two
+// `await Promise.resolve()` calls between receiving a response and
+// calling `.pipe()` on it was enough to reproduce a stuck promise that
+// real Node completes correctly every time.
+type pendingStreamData struct {
+	chunks []vm.Value
+	ended  bool
+}
+
 func scheduleEmit(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.Value) {
 	rt := vmInst.GetAsyncRuntime()
+	if event == "data" && len(args) == 1 {
+		chunk := args[0]
+		rt.ScheduleNextTick(func() {
+			if pending, ok := obj.InternalSlots().(*pendingStreamData); ok {
+				pending.chunks = append(pending.chunks, chunk)
+				flushPendingStreamData(vmInst, obj, pending)
+				return
+			}
+			emitOnObject(vmInst, obj, event, chunk)
+		})
+		return
+	}
+	if event == "end" {
+		rt.ScheduleNextTick(func() {
+			if pending, ok := obj.InternalSlots().(*pendingStreamData); ok {
+				pending.ended = true
+				flushPendingStreamData(vmInst, obj, pending)
+				return
+			}
+			emitOnObject(vmInst, obj, event)
+		})
+		return
+	}
 	rt.ScheduleNextTick(func() {
 		emitOnObject(vmInst, obj, event, args...)
 	})
+}
+
+// flushPendingStreamData delivers every buffered chunk, in arrival
+// order, as real "data" emits - but only once a real consumer exists
+// (a "data" listener, which pipe() registers one of internally too);
+// otherwise it leaves everything buffered for the next call, whether
+// that's triggered by the next chunk arriving or by addListener (below)
+// noticing a "data" listener just got attached. Emits "end" once, after
+// every buffered chunk has actually been delivered, if the source has
+// already finished.
+func flushPendingStreamData(vmInst *vm.VM, obj *vm.PlainObject, pending *pendingStreamData) {
+	if listenerCount(obj, "data") == 0 {
+		return
+	}
+	for len(pending.chunks) > 0 {
+		chunk := pending.chunks[0]
+		pending.chunks = pending.chunks[1:]
+		emitOnObject(vmInst, obj, "data", chunk)
+	}
+	if pending.ended {
+		pending.ended = false
+		emitOnObject(vmInst, obj, "end")
+	}
 }
