@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/vm"
 )
 
@@ -37,15 +38,19 @@ import (
 //
 // Scoped to what real code above actually exercises: construction from a
 // query string, a plain object, or an array of `[name, value]` pairs;
-// `append`/`delete`/`get`/`getAll`/`has`/`set`/`sort`/`toString`. No
-// `.size` getter, no `Symbol.iterator`/`entries`/`keys`/`values`/
-// `forEach`, and no `new URLSearchParams(existingInstance)` copy form —
-// `ModuleBuilder.Class`'s reflection has no getter or well-known-symbol
-// support to hang the first two off of, and the copy form would need to
+// `append`/`delete`/`get`/`getAll`/`has`/`set`/`sort`/`toString`, plus
+// (installURLSearchParamsIteration, below) `[Symbol.iterator]`/
+// `entries`/`keys`/`values`/`forEach`/`.size` - found missing the hard
+// way chasing the real Bedrock investigation
+// (docs/real-node-plan.md, round 99): real, unmodified `@smithy/core`'s
+// own `dist-cjs/submodules/protocols/index.js` does
+// `for (const [key, value] of new URLSearchParams(search))` at a real
+// request-serialization call site, not a hypothetical one. Still no
+// `new URLSearchParams(existingInstance)` copy form - it would need to
 // distinguish "another URLSearchParams instance" from "a plain object
 // that happens to have the same shape," which nothing here needs yet.
-// Add real support for any of these once something does, same as
-// `url.go`'s own documented gap.
+// Add real support once something does, same as `url.go`'s own
+// documented gap.
 type urlSearchParams struct {
 	pairs [][2]string
 }
@@ -200,6 +205,22 @@ func (u *urlSearchParams) ToString() string {
 	return strings.Join(parts, "&")
 }
 
+// RawPairs exposes every [name, value] pair in insertion order - bound
+// automatically as `.rawPairs()` by `ModuleBuilder.Class`'s reflection,
+// same as every other method here. Not itself a real Node method (real
+// URLSearchParams has no such name); it exists purely so
+// installURLSearchParamsIteration (below) can get at a specific
+// instance's own pairs from a shared prototype-level function, which
+// `ModuleBuilder.Class`'s per-instance method binding has no other way
+// to do - see that function's own doc comment for the full story.
+func (u *urlSearchParams) RawPairs() [][]string {
+	pairs := make([][]string, len(u.pairs))
+	for i, p := range u.pairs {
+		pairs[i] = []string{p[0], p[1]}
+	}
+	return pairs
+}
+
 // formURLEncode percent-encodes s per the WHATWG URL Standard's
 // application/x-www-form-urlencoded serializer, NOT Go's url.QueryEscape —
 // the two disagree on which bytes are "unreserved" and shipping the wrong
@@ -226,4 +247,184 @@ func formURLEncode(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// installURLSearchParamsIteration adds `[Symbol.iterator]`/`entries`/
+// `keys`/`values`/`forEach`/`.size` to `URLSearchParams.prototype` -
+// found missing entirely, the hard way, chasing the real Bedrock
+// investigation (docs/real-node-plan.md, round 99): real, unmodified
+// `@smithy/core`'s own `dist-cjs/submodules/protocols/index.js` does
+// `for (const [key, value] of new URLSearchParams(search))` at a real
+// request-serialization call site.
+//
+// Why this can't be built the same way `Get`/`Set`/`Append`/etc. are:
+// `ModuleBuilder.Class` (paserati's `pkg/driver`) binds every Go method
+// as an *instance*-owned property, each one a closure created fresh at
+// construction time over that specific instance's own Go struct - there
+// is no shared prototype-level equivalent, and no generic way from
+// outside that mechanism to recover a `*urlSearchParams` back out of an
+// arbitrary `this` value. `Symbol.iterator` (and friends) genuinely
+// need to live on the shared prototype, though - real code does
+// `Object.getPrototypeOf(params)[Symbol.iterator]`-shaped checks, and a
+// per-instance own-property version would also incorrectly show up in
+// `for...in`/`Object.keys()`.
+//
+// The way around it: `RawPairs()` (urlsearchparams.go, just above) is
+// itself one of these ordinary per-instance-bound methods, so it's
+// already reachable from JS as `params.rawPairs()`. Each function below
+// uses `vmInst.GetThis()` - the same mechanism paserati's own native
+// function call path already threads through for exactly this reason
+// (see pkg/vm/call.go's `vm.currentThis`) - to find out *which*
+// instance is being iterated, then calls that instance's own
+// `rawPairs()` through a real `vmInst.Call(...)`, and builds the
+// iterator/behavior from the result. No paserati changes needed.
+func installURLSearchParamsIteration(p *driver.Paserati) {
+	vmInst := p.GetVM()
+	if vmInst == nil {
+		return
+	}
+	ctor, ok := vmInst.GetGlobal("URLSearchParams")
+	if !ok {
+		return
+	}
+	ctorProps := ctor.AsNativeFunctionWithProps()
+	if ctorProps == nil || ctorProps.Properties == nil {
+		return
+	}
+	protoVal, ok := ctorProps.Properties.GetOwn("prototype")
+	if !ok {
+		return
+	}
+	proto := protoVal.AsPlainObject()
+	if proto == nil {
+		return
+	}
+
+	rawPairsOf := func(this vm.Value) ([][2]string, error) {
+		obj := this.AsPlainObject()
+		if obj == nil {
+			return nil, fmt.Errorf("not a URLSearchParams instance")
+		}
+		fn, ok := obj.GetOwn("rawPairs")
+		if !ok || !fn.IsCallable() {
+			return nil, fmt.Errorf("not a URLSearchParams instance")
+		}
+		result, err := vmInst.Call(fn, this, nil)
+		if err != nil {
+			return nil, err
+		}
+		arr := result.AsArray()
+		if arr == nil {
+			return nil, nil
+		}
+		pairs := make([][2]string, arr.Length())
+		for i := 0; i < arr.Length(); i++ {
+			pair := arr.Get(i).AsArray()
+			if pair == nil || pair.Length() != 2 {
+				continue
+			}
+			pairs[i] = [2]string{pair.Get(0).ToString(), pair.Get(1).ToString()}
+		}
+		return pairs, nil
+	}
+
+	// makeIterator builds a real, spec-shaped iterator object (a
+	// `.next()` that returns `{value, done}`, self-iterable via its own
+	// `[Symbol.iterator]` returning itself) over whatever `project`
+	// turns each raw pair into - `[k, v]` for entries, `k` for keys, `v`
+	// for values.
+	makeIterator := func(pairs [][2]string, project func(k, v string) vm.Value) vm.Value {
+		i := 0
+		next := vm.NewNativeFunction(0, false, "next", func(_ []vm.Value) (vm.Value, error) {
+			result := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+			if i >= len(pairs) {
+				result.SetOwn("value", vm.Undefined)
+				result.SetOwn("done", vm.True)
+				return vm.NewValueFromPlainObject(result), nil
+			}
+			p := pairs[i]
+			i++
+			result.SetOwn("value", project(p[0], p[1]))
+			result.SetOwn("done", vm.False)
+			return vm.NewValueFromPlainObject(result), nil
+		})
+		iter := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+		iter.SetOwn("next", next)
+		iterVal := vm.NewValueFromPlainObject(iter)
+		selfIter := vm.NewNativeFunction(0, false, "[Symbol.iterator]", func(_ []vm.Value) (vm.Value, error) {
+			return iterVal, nil
+		})
+		writable, enumerable, configurable := true, false, true
+		iter.DefineOwnPropertyByKey(vm.NewSymbolKey(vmInst.SymbolIterator), selfIter, &writable, &enumerable, &configurable)
+		return iterVal
+	}
+
+	pairProject := func(k, v string) vm.Value {
+		arr := vm.NewArrayWithArgs([]vm.Value{vm.NewString(k), vm.NewString(v)})
+		return arr
+	}
+	keyProject := func(k, _ string) vm.Value { return vm.NewString(k) }
+	valueProject := func(_, v string) vm.Value { return vm.NewString(v) }
+
+	entriesFn := vm.NewNativeFunction(0, false, "entries", func(_ []vm.Value) (vm.Value, error) {
+		pairs, err := rawPairsOf(vmInst.GetThis())
+		if err != nil {
+			return vm.Undefined, err
+		}
+		return makeIterator(pairs, pairProject), nil
+	})
+	keysFn := vm.NewNativeFunction(0, false, "keys", func(_ []vm.Value) (vm.Value, error) {
+		pairs, err := rawPairsOf(vmInst.GetThis())
+		if err != nil {
+			return vm.Undefined, err
+		}
+		return makeIterator(pairs, keyProject), nil
+	})
+	valuesFn := vm.NewNativeFunction(0, false, "values", func(_ []vm.Value) (vm.Value, error) {
+		pairs, err := rawPairsOf(vmInst.GetThis())
+		if err != nil {
+			return vm.Undefined, err
+		}
+		return makeIterator(pairs, valueProject), nil
+	})
+	// forEach(callback[, thisArg]): real Node calls callback(value, key,
+	// searchParams) - value before key, matching Map.prototype.forEach's
+	// own argument order, not the more intuitive (key, value).
+	forEachFn := vm.NewNativeFunction(1, false, "forEach", func(args []vm.Value) (vm.Value, error) {
+		this := vmInst.GetThis()
+		pairs, err := rawPairsOf(this)
+		if err != nil {
+			return vm.Undefined, err
+		}
+		if len(args) == 0 || !args[0].IsCallable() {
+			return vm.Undefined, vmInst.NewTypeError("callback must be a function")
+		}
+		callback := args[0]
+		var thisArg vm.Value = vm.Undefined
+		if len(args) > 1 {
+			thisArg = args[1]
+		}
+		for _, p := range pairs {
+			if _, err := vmInst.Call(callback, thisArg, []vm.Value{vm.NewString(p[1]), vm.NewString(p[0]), this}); err != nil {
+				return vm.Undefined, err
+			}
+		}
+		return vm.Undefined, nil
+	})
+	sizeGetter := vm.NewNativeFunction(0, false, "size", func(_ []vm.Value) (vm.Value, error) {
+		pairs, err := rawPairsOf(vmInst.GetThis())
+		if err != nil {
+			return vm.Undefined, err
+		}
+		return vm.NumberValue(float64(len(pairs))), nil
+	})
+
+	proto.SetOwnNonEnumerable("entries", entriesFn)
+	proto.SetOwnNonEnumerable("keys", keysFn)
+	proto.SetOwnNonEnumerable("values", valuesFn)
+	proto.SetOwnNonEnumerable("forEach", forEachFn)
+	writable, enumerable, configurable := true, false, true
+	proto.DefineOwnPropertyByKey(vm.NewSymbolKey(vmInst.SymbolIterator), entriesFn, &writable, &enumerable, &configurable)
+	sizeEnumerable, sizeConfigurable := false, true
+	proto.DefineAccessorProperty("size", sizeGetter, true, vm.Undefined, false, &sizeEnumerable, &sizeConfigurable)
 }

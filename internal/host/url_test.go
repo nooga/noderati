@@ -213,6 +213,55 @@ func TestURLSearchParamsGetMissing(t *testing.T) {
 	}
 }
 
+// TestURLSearchParamsIteration guards the exact real gap found chasing
+// the Bedrock investigation (docs/real-node-plan.md, round 99): real,
+// unmodified @smithy/core's own dist-cjs/submodules/protocols/index.js
+// does `for (const [key, value] of new URLSearchParams(search))` at a
+// real request-serialization call site, not a hypothetical one. Checks
+// for-of directly (the real shape) plus entries/keys/values/forEach/
+// .size and the real `[Symbol.iterator] === entries` identity, since
+// all of them share one implementation (installURLSearchParamsIteration)
+// that could plausibly get one right and another wrong.
+func TestURLSearchParamsIteration(t *testing.T) {
+	// Deliberately not newURLHost(t): its own redundant declareURL(p)
+	// call (on top of what New() already declares via installModules)
+	// replaces the "url" module's URLSearchParams constructor with a
+	// fresh one, whose prototype never gets
+	// installURLSearchParamsIteration's patches - those only ran once,
+	// against the first declaration. Every other URLSearchParams test
+	// in this file doesn't need iteration, so it never noticed.
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	js := `
+		import { URLSearchParams } from "url";
+		const params = new URLSearchParams("a=1&b=2");
+
+		const forOfPairs = [];
+		for (const pair of params) forOfPairs.push(pair);
+
+		const forEachPairs = [];
+		params.forEach((v, k, target) => forEachPairs.push([k, v, target === params]));
+
+		JSON.stringify({
+			identitySameAsEntries: params[Symbol.iterator] === params.entries,
+			forOfPairs,
+			entries: [...params.entries()],
+			keys: [...params.keys()],
+			values: [...params.values()],
+			forEachPairs,
+			size: params.size,
+		})
+	`
+	val, errs := p.RunCode(js, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"identitySameAsEntries":true,"forOfPairs":[["a","1"],["b","2"]],"entries":[["a","1"],["b","2"]],"keys":["a","b"],"values":["1","2"],"forEachPairs":[["a","1",true],["b","2",true]],"size":2}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
 func TestURLDomainConversion(t *testing.T) {
 	p := newURLHost(t)
 	js := `
