@@ -155,19 +155,90 @@ class Readable extends EventEmitter {
   }
 }
 
+// write()/end() used to just emit("data")/emit("end") directly instead
+// of calling a subclass's own _write()/_final() overrides - completely
+// wrong for a base Writable (real Node's Writable never emits "data" at
+// all; that's a Readable-only event) and, more seriously, a real
+// correctness bug found the hard way chasing the real Bedrock
+// investigation (docs/real-node-plan.md, round 101): real
+// @smithy/node-http-handler's own streamCollector does exactly
+// class Collector extends Writable, overriding _write(chunk, encoding,
+// callback) to push each chunk into its own buffer, then does
+// stream.pipe(collector) to read a real HTTP response body - since
+// write() never called this subclass's real _write() override, every
+// piped chunk silently vanished (emitted as an unheard "data" event on
+// the destination itself, which nothing subscribes to) and the
+// collected response body was always empty. Matches Duplex's own
+// already-correct write()/end() (this same file, above) - a plain
+// Writable is exactly that same writable half, just without a readable
+// side to go with it.
+// notImplementedWriteError matches real Node's own exact behavior for a
+// Writable/Duplex whose _write() is never overridden - confirmed
+// directly (not assumed): real Node throws a real
+// ERR_METHOD_NOT_IMPLEMENTED error the instant something is actually
+// written, rather than silently succeeding. Every real subclass in this
+// codebase's own dependency tree does override _write, so this is
+// purely about not silently misrepresenting "nothing happened" as
+// success on the one hypothetical caller that doesn't.
+function notImplementedWriteError() {
+  const err = new Error("The _write() method is not implemented");
+  err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+  return err;
+}
+
 class Writable extends EventEmitter {
   constructor(_opts) {
     super();
     this.writable = true;
   }
-  write(chunk) {
-    this.emit("data", chunk);
+  _write(chunk, _encoding, callback) {
+    callback(notImplementedWriteError());
+  }
+  _final(callback) {
+    callback();
+  }
+  write(chunk, encoding, cb) {
+    if (typeof encoding === "function") {
+      cb = encoding;
+      encoding = undefined;
+    }
+    this._write(chunk, encoding, (err) => {
+      if (err) {
+        this.emit("error", err);
+        if (typeof cb === "function") cb(err);
+        return;
+      }
+      if (typeof cb === "function") cb();
+    });
     return true;
   }
-  end(chunk) {
-    if (chunk !== undefined) this.write(chunk);
-    this.emit("end");
-    this.emit("finish");
+  end(chunk, encoding, cb) {
+    if (typeof chunk === "function") {
+      cb = chunk;
+      chunk = undefined;
+    } else if (typeof encoding === "function") {
+      cb = encoding;
+    }
+    const finishUp = (err) => {
+      if (err) {
+        this.emit("error", err);
+        if (typeof cb === "function") cb(err);
+        return;
+      }
+      this.emit("finish");
+      if (typeof cb === "function") cb();
+    };
+    if (chunk !== undefined) {
+      this._write(chunk, encoding, (err) => {
+        if (err) {
+          finishUp(err);
+          return;
+        }
+        this._final(finishUp);
+      });
+    } else {
+      this._final(finishUp);
+    }
     return this;
   }
 }
@@ -210,7 +281,7 @@ class Duplex extends EventEmitter {
   }
   _read(_size) {}
   _write(chunk, _encoding, callback) {
-    callback();
+    callback(notImplementedWriteError());
   }
   _final(callback) {
     callback();

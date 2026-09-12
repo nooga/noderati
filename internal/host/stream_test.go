@@ -6,6 +6,15 @@ import (
 	"github.com/nooga/paserati/pkg/driver"
 )
 
+// Both pipeline tests below used to override write() directly instead
+// of _write() (real Node's own actual extension point), calling
+// super.write(chunk) - confirmed directly against real Node (round 101,
+// docs/real-node-plan.md) that this exact shape throws
+// ERR_METHOD_NOT_IMPLEMENTED there too (super.write() -> the base
+// Writable's own _write(), never overridden here, throws). Both were
+// coincidentally passing only because stream.go's own Writable._write()
+// default used to silently succeed instead of throwing like real Node -
+// fixed the same round these are corrected in.
 func TestStreamPipelinePromises(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
@@ -16,7 +25,7 @@ func TestStreamPipelinePromises(t *testing.T) {
 		class Src extends Readable {}
 		class Dst extends Writable {
 			collected = "";
-			write(chunk) { this.collected += chunk; return super.write(chunk); }
+			_write(chunk, _encoding, callback) { this.collected += chunk; callback(); }
 		}
 		const src = new Src();
 		const dst = new Dst();
@@ -44,7 +53,7 @@ func TestStreamPipelineCallback(t *testing.T) {
 		class Src extends Readable {}
 		class Dst extends Writable {
 			collected = "";
-			write(chunk) { this.collected += chunk; return super.write(chunk); }
+			_write(chunk, _encoding, callback) { this.collected += chunk; callback(); }
 		}
 		const src = new Src();
 		const dst = new Dst();
@@ -258,7 +267,18 @@ func TestStreamTransformDefaultIsPassthrough(t *testing.T) {
 
 // TestStreamTransformPipesToDest checks Transform's own .pipe() (used
 // by real undici's pipeline() to chain a Transform into the next stage)
-// actually forwards transformed output.
+// actually forwards transformed output - to a real Writable subclass
+// overriding _write(), matching real Node's own actual contract. This
+// used to pipe into a bare `new Writable()` and read the result via a
+// "data" listener on the *destination* - confirmed directly against
+// real Node (round 101, docs/real-node-plan.md) that this was never a
+// real, valid shape at all: a plain Writable never emits "data" (that's
+// Readable-only), and writing to one with no _write() override throws
+// ERR_METHOD_NOT_IMPLEMENTED in real Node. The test's own premise was
+// wrong from the start, coincidentally passing only because
+// stream.go's Writable.write() had the exact matching bug (emitting
+// "data" instead of calling _write()) - fixed the same round this test
+// is corrected in.
 func TestStreamTransformPipesToDest(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
@@ -270,21 +290,50 @@ func TestStreamTransformPipesToDest(t *testing.T) {
 				callback(null, chunk + chunk);
 			}
 		}
+		class Collector extends Writable {
+			result = "";
+			_write(chunk, _encoding, callback) {
+				this.result += chunk;
+				callback();
+			}
+		}
 
 		const t = new Double();
-		const w = new Writable();
-		let result = "";
-		w.on("data", (chunk) => { result += chunk; });
+		const w = new Collector();
 		t.pipe(w);
 		t.write("ab");
 		t.end();
-		result
+		w.result
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
 	if val.ToString() != "abab" {
 		t.Errorf("got %q, want %q", val.ToString(), "abab")
+	}
+}
+
+// TestStreamWritableDefaultWriteThrows guards real Node's own exact
+// behavior for a Writable whose _write() is never overridden: a real
+// ERR_METHOD_NOT_IMPLEMENTED error, not a silent success - confirmed
+// directly against real Node before fixing (round 101,
+// docs/real-node-plan.md).
+func TestStreamWritableDefaultWriteThrows(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { Writable } from "node:stream";
+		const w = new Writable();
+		let code = "";
+		w.on("error", (e) => { code = e.code; });
+		w.write("x");
+		code
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "ERR_METHOD_NOT_IMPLEMENTED" {
+		t.Errorf("got %q, want %q", val.ToString(), "ERR_METHOD_NOT_IMPLEMENTED")
 	}
 }
 
