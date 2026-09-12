@@ -12840,3 +12840,76 @@ slice` call returns an inconsistent result for identical arguments on
 a repeated invocation of the same closure shape" - genuinely open,
 needs more instrumentation budget than this round had, not yet
 fileable without a smaller repro.
+
+## Round 108: paserati#438 and #443 confirmed merged and fixed -
+noderati#3 (real ajv) closed, fully passing end to end; one new
+regression found in today's paserati pull and filed as #444/#449
+
+Pulled paserati `main` (now `667a4b7a`, after the compiler-tail-position
+fix filed in Round 107 as paserati#438 plus a large batch of other
+work: `#424`-`#437` and several unnumbered fixes, including today's
+own register-freeing work for `#426`'s register-exhaustion follow-up).
+Rebuilt noderati clean.
+
+**Confirmed: `paserati#438` (tagged-template `inTailPosition` leak,
+found and fixed directly in paserati this round - see that commit,
+`00e1ccfc`) and `paserati#443` (named-function-expression self-
+reference lost when a destructured param has a whole-pattern default,
+filed with a repro but left for paserati to fix) are both merged and
+verified.** `examples/ajv_repro.mjs`'s real `ajv.validateSchema(...)`
+call now returns `true`, matching real Node exactly - the full chain
+this investigation has been chasing since Round 104 (`schema0.type` ->
+bare `.type` -> the recursive-self-call crash) is closed.
+[noderati#3](https://github.com/nooga/noderati/issues/3) closed.
+Re-ran the full Round 104 breadth-sweep slate: `ajv` now passes
+end to end (`p04-ajv.mjs`: `ok ajv`, matching real Node byte-for-byte).
+
+**A new regression found in the same sweep, from today's own paserati
+pull - filed as
+[paserati#449](https://github.com/nooga/paserati/issues/449), not
+fixed here per this round's own instruction to leave paserati's source
+alone and file instead.** Both `@anthropic-ai/sdk@0.68.0` and
+`openai@6.7.0` - previously passing every prior round - now fail to
+import at all, on real, unmodified, identical `internal/utils/uuid.mjs`
+files (`export let uuid4 = function () { ... uuid4 =
+crypto.randomUUID.bind(crypto); ... };` - the standard "replace
+yourself with a faster path the first time you're called" memoization
+idiom). Minimal, dependency-free, single-line repro:
+```js
+let a = function () { a = 1; };
+```
+fails to even *compile* with `Invalid local register index 255 for
+upvalue capture` - real Node declares this fine, no error. Narrowed
+precisely: needs an assignment to the outer variable from inside the
+closure (a read-only self-reference works fine), needs top-level
+(module/global) scope (the identical pattern inside a nested function
+works fine), and isn't specific to `function` expressions (an arrow
+function closure reproduces it identically). Suspected - not
+confirmed by bisection - to be adjacent to today's own new register-
+freeing work for `#426` (`c.regAlloc.Free(...)` right after moving a
+global-scope `let`/`const`/function-value's register into its global
+slot), since the closure here needs that same register to stay alive
+as an upvalue.
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean; scoreboard
+clean (`all-fakes-off` still reproduces `baseline` exactly, including
+both configs hitting the same, unrelated, pre-existing
+`pi-coding-agent` register-capture issue in its own bundled `openai`
+copy - not a new discrepancy between the two configs, and not this
+round's own regression, which is a compile-time failure the scoreboard
+probe doesn't happen to hit the same way). No noderati code changed
+this round - paserati-side investigation and a paserati-side fix
+(`#438`, committed directly per explicit instruction that round) plus
+one filed-only regression (`#449`, per this round's own instruction not
+to touch paserati further without it being asked for again).
+
+**Status**: the ajv chain (Round 104's original breadth-sweep finding,
+through `#426`/`#438`/`#443`) is fully closed - real ajv now matches
+real Node exactly. Breadth-sweep slate: 4/13 passing outright
+(commander, ajv, graphql, plus the two AI SDKs' shallower
+construction-only probes now blocked by `#449` instead of passing) -
+net unchanged at the slate level since `#449` cancels out `ajv`'s own
+gain for this round's headline count, though the underlying chain of
+real fixes landed is substantial. `#449` is the next thing to watch for
+before re-running the two SDK probes.
