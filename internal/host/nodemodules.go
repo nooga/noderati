@@ -526,6 +526,21 @@ func cjsESMWrapper(absPath, source string) string {
 	return b.String()
 }
 
+// definePropertyExportsRe matches the extremely common TypeScript-
+// CommonJS-output re-export shape - `Object.defineProperty(exports,
+// "name", { enumerable: true, get: function () {...} })` (single or
+// double-quoted name) - which the plain-assignment/object-literal scans
+// above never see at all, silently missing every name a package exports
+// this way (found via real graphql@16.11.0's actual `buildSchema` and
+// friends, docs/real-node-plan.md paserati#427: `import { buildSchema }
+// from "graphql"` produced no compile error at all - a name this scan
+// misses isn't reported "not found", it's just never added to the
+// generated wrapper's own export list, and paserati's import-binding
+// resolution silently binds an unresolvable name to `undefined` rather
+// than failing - so `require("graphql").buildSchema` worked while the
+// identical ESM named import silently returned `undefined`).
+var definePropertyExportsRe = regexp.MustCompile(`Object\.defineProperty\(\s*exports\s*,\s*["'](\w+)["']\s*,`)
+
 func extractCJSExportNames(source string) []string {
 	seen := make(map[string]bool)
 	var names []string
@@ -538,6 +553,10 @@ func extractCJSExportNames(source string) []string {
 	}
 
 	for _, m := range regexp.MustCompile(`exports\.(\w+)\s*=`).FindAllStringSubmatch(source, -1) {
+		add(m[1])
+	}
+
+	for _, m := range definePropertyExportsRe.FindAllStringSubmatch(source, -1) {
 		add(m[1])
 	}
 

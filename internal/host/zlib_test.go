@@ -62,6 +62,21 @@ func compressFlateRaw(t *testing.T, data []byte) []byte {
 // using \xHH-style escapes for every byte, so the compressed payload
 // (which is binary, not valid UTF-8 in general) survives embedding
 // directly into a test script unchanged.
+// bytesToJSStringLiteral embeds arbitrary bytes as a JS string literal via
+// one \xNN escape per byte - the classic "binary string" convention (one
+// character = one byte value 0-255), not UTF-8 text. Every call site
+// below must write it with an explicit "latin1" (or "binary") encoding -
+// confirmed directly against real Node: `.write(literal)` with no
+// encoding (real Node's own default is "utf8") gets the compressed bytes
+// UTF-8-re-encoded on the way in and real Node's own zlib rejects the
+// result ("incorrect header check"), the exact same failure noderati
+// started producing here once paserati#425 fixed \xNN escapes to
+// properly represent their real code point (this doc's Round 104/425) -
+// this was a latent gap in this test, not a regression: `.write()`
+// silently ignoring its own encoding argument, papered over by the
+// previous, incorrect \xNN representation coincidentally round-tripping
+// raw bytes through the default (wrong) "utf8" path. Real Node needs
+// "latin1" here for the very same reason; noderati's zlib now honors it.
 func bytesToJSStringLiteral(data []byte) string {
 	var sb bytes.Buffer
 	sb.WriteByte('"')
@@ -84,7 +99,7 @@ func runDecompressTest(t *testing.T, ctorName string, compressed []byte, want st
 			d.on("data", (chunk) => { result += chunk.toString(); });
 			d.on("end", resolve);
 			d.on("error", reject);
-			d.write(%s);
+			d.write(%s, "latin1");
 			d.end();
 		});
 		result
@@ -138,8 +153,8 @@ func TestZlibDecompressStreamsIncrementally(t *testing.T) {
 			d.on("data", (chunk) => { result += chunk.toString(); });
 			d.on("end", resolve);
 			d.on("error", reject);
-			d.write(%s);
-			d.write(%s);
+			d.write(%s, "latin1");
+			d.write(%s, "latin1");
 			d.end();
 		});
 		result

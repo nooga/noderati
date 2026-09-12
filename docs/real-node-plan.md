@@ -12589,3 +12589,131 @@ scoped back in Round 95 as a bounded, `http.go`-sized adapter over Go's
 already-working HTTP/2 transport - not attempted, and not required for
 what this chain was verifying (the documented
 `AWS_BEDROCK_FORCE_HTTP1=1` escape hatch covers the verified path).
+
+## Round 106: paserati#424/#425/#426 confirmed fixed upstream; #427
+checked per paserati's own push-back and confirmed to be noderati's
+bug after all - a real gap in `extractCJSExportNames`, fixed and
+verified against real graphql
+
+Prompted by paserati's own maintainers, after merging fixes for
+`#424`/`#425`/`#426` (all three confirmed fixed below), pushing back on
+`#427` specifically: the getter-based CJS-named-export bug might be
+noderati's own, not paserati's. It was - Round 104's own issue write-up
+had already guessed this ("almost certainly inside paserati's own
+CJS-into-ESM binding mechanism") without finding the actual code; this
+round found it.
+
+**Confirmed fixed, paserati side (pulled paserati `main`,
+now `9decf0f9`):**
+- `#424` (namespace-import re-export) - `pkg/checker/checker.go` /
+  `pkg/compiler/compiler.go`, commit `9c25d627`. Verified: the minimal
+  `export { ns }` repro from the issue now matches real Node.
+- `#425` (non-ASCII `RegExp`) - `pkg/lexer/lexer.go`, commit `f157cc03`
+  ("`\xNN` string/template escapes for 0x80-0xFF UTF-8-encode the code
+  point"). Verified: `new RegExp("[\xaa]")` and
+  `/[\xc0-\xd6]/.test("\xc0")` both now match real Node.
+- `#426` (register exhaustion / crash) - two commits:
+  `9decf0f9` ("nested if/ternary no longer leak registers per nesting
+  level" - fixes the synthetic 150-level-if repro) and `aa2b0b6c`
+  ("contain new Function()/AsyncFunction() compile-time panics" - the
+  crash itself is now a catchable `SyntaxError`, never a raw Go panic,
+  regardless of whether the underlying limit is still hit). Still
+  **open** upstream, correctly: real `@babel/core`'s and real
+  `@aws-sdk/client-s3`'s own actual bundled code are both large/nested
+  enough to still hit the underlying register-exhaustion *limit* itself
+  (bigger than this round's synthetic repro) - but real `ajv`'s own
+  meta-schema compile, which used to crash the whole process, now fails
+  with a clean, catchable `SyntaxError: Function constructor: internal
+  compiler error: ...` instead. The severity half of `#426` (never
+  panic) is resolved; the capacity half (raise or remove the limit) is
+  not, and doesn't need to be for this round's purposes.
+
+**`#427`, investigated and fixed in noderati - `internal/host/
+nodemodules.go`'s `extractCJSExportNames`.** This function is a small,
+regex-based text scanner - noderati's own equivalent of Node's real
+`cjs-module-lexer` - that decides which names a CJS file's `cjsESMWrapper`
+generated ESM shim re-exports, by pattern-matching the CJS source text
+for `exports.name = ...` and `module.exports = { ... }` shapes. It had
+no pattern at all for the third, extremely common shape:
+`Object.defineProperty(exports, "name", { enumerable: true, get()
+{...} })` - the shape TypeScript's own CommonJS output uses for every
+re-exported name, which is exactly what real `graphql@16.11.0`'s
+`buildSchema` (and everything else it exports) uses.
+
+**Why this produced `undefined` and not a compile error - the actual
+mechanism, confirmed by testing a name that's not exported at all:**
+when `extractCJSExportNames` misses a name, `cjsESMWrapper` simply never
+writes an `export { ... as name }` line for it into the generated ESM
+shim - there's no trace of the name anywhere in that shim's own source.
+`import { totallyMadeUpNameNotExported } from "./cjs-file.cjs"` (a name
+guaranteed absent from any real export list) was tried directly to
+confirm what paserati does with an import binding a module genuinely
+doesn't have: no compile error, `typeof totallyMadeUpNameNotExported ===
+"undefined"` at runtime. So `buildSchema` was never being read
+incorrectly (no getter-invocation bug at all, contrary to Round 104's
+own guess) - it was never even being *asked for*; the wrapper's own
+generated export list simply didn't contain it, and paserati's own
+unresolvable-import-binds-to-undefined behavior (the same general shape
+as `#424`'s root cause, though this half of it isn't a bug - it's a
+reasonable way to handle a best-effort heuristic export list that might
+be incomplete) quietly handed back `undefined` instead of the real
+function `require("graphql").buildSchema` returns correctly.
+
+**Fix:** added `definePropertyExportsRe`
+(`Object\.defineProperty\(\s*exports\s*,\s*["'](\w+)["']\s*,`) as a
+third source `extractCJSExportNames` feeds into its de-duplicated name
+list, alongside the two existing regex scans. New test,
+`TestCJSNamedExportsViaDefineProperty`, reproduces the exact real
+graphql shape (`__esModule` marker, a `require()`'d submodule, a getter
+returning a property off it) as a minimal, dependency-free CJS package
+and confirms the named import now resolves correctly. Verified against
+the real package too: `p06-graphql.mjs`'s full probe
+(`buildSchema("type Query { hello: String }")`, `graphql({ schema,
+source: "{ hello }", rootValue })`) now runs end to end and matches
+real Node's own output exactly - the same probe Round 104 recorded as
+failing.
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean twice in a row
+(no flake this round, including the historically-flaky
+`TestURLSearchParamsIteration`); scoreboard clean. Re-ran all 13
+packages from Round 104's own slate against the current paserati
+`main` + this fix: graphql now fully passes end to end; zod/prettier/
+eslint/babel/handlebars/sql.js/webpack still fail, but on their own
+separate, already-tracked issues (zod/prettier no longer hit `#424`'s
+compile error - they now fail later, on a different, not-yet-diagnosed
+`undefined is not a function`; babel/aws-s3 still hit `#426`'s
+register-exhaustion *limit*, just no longer able to crash the process;
+eslint/handlebars/sql.js/webpack are unchanged, per Round 104's own
+"not yet isolated" list).
+
+**A second, unrelated regression found by this round's own full-suite
+run and fixed along the way**: `#425`'s upstream fix (correct `\xNN`
+UTF-8 encoding) broke four pre-existing zlib tests
+(`TestZlibCreateGunzipDecompressesRealGzip` and three siblings), which
+build a raw-binary JS string literal via one `\xNN` escape per byte and
+`.write()` it with no explicit encoding. This was a latent noderati bug
+this whole time, not a new one: confirmed directly against real Node
+that `.write()` with no encoding (real Node's own default is `"utf8"`)
+on such a literal produces the identical corruption/error in real Node
+too ("incorrect header check") - the previous, *incorrect* `\xNN`
+lexer behavior had been silently papering over `internal/host/net.go`'s
+`valueToBytes` never supporting an explicit encoding argument at all on
+`zlib.go`'s `write()`/`end()`, which is what real Node actually needs
+here (`.write(literal, "latin1")`). Fixed: added
+`valueToBytesWithEncoding` (reusing `buffer.go`'s existing
+`decodeBufferString`) and `parseWriteEncodingAndCallback` (real Node's
+`write(chunk, [encoding], [callback])` overload resolution) to
+`zlib.go`; updated the four tests' own `.write()` calls to pass
+`"latin1"` explicitly, matching what real Node itself requires for this
+exact shape - confirmed against real Node before changing anything.
+
+**Status**: three of Round 104's four filed issues are fully resolved
+upstream (`#424`, `#425`) or resolved for the severity that mattered
+(`#426`'s crash, though its capacity limit stays open, correctly);
+`#427` turned out to be noderati's own bug after all, per paserati's
+own push-back, and is now fixed and verified against the real package
+that surfaced it. One incidental regression (zlib) found via this
+round's own full-suite run was root-caused and fixed in the same pass,
+confirming against real Node before touching any code, per this
+project's own standing discipline.

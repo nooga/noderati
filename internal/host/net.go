@@ -293,6 +293,53 @@ func valueToBytes(vmInst *vm.VM, v vm.Value) []byte {
 	return []byte(v.ToString())
 }
 
+// valueToBytesWithEncoding is valueToBytes plus real support for an
+// explicit string encoding on the string branch - real Node's own
+// `Writable.write(chunk, [encoding], [callback])` accepts one, and
+// callers that actually pass raw binary data through a string (the
+// classic "latin1"/"binary" convention for byte values 0-255, one
+// per character) need it decoded that way, not as the default utf8 a
+// bare string argument gets everywhere else in this codebase. A
+// TypedArray/Buffer argument already carries its own real bytes, so
+// encoding is irrelevant there, same as valueToBytes.
+func valueToBytesWithEncoding(vmInst *vm.VM, v vm.Value, encoding string) []byte {
+	if ta := v.AsTypedArray(); ta != nil {
+		if b := typedArrayBytes(ta); b != nil {
+			return b
+		}
+		return nil
+	}
+	if encoding == "" || normalizeBufferEncoding(encoding) == "utf8" {
+		return []byte(v.ToString())
+	}
+	if b, err := decodeBufferString(v.ToString(), encoding); err == nil {
+		return b
+	}
+	return []byte(v.ToString())
+}
+
+// parseWriteEncodingAndCallback pulls the optional encoding/callback pair
+// out of a real Node-style `write(chunk, [encoding], [callback])` (or
+// `end(chunk, [encoding], [callback])`) argument list, starting at
+// index `from` (the position right after `chunk`). Real Node accepts
+// either an encoding string, a callback function, both, or neither in
+// that slot - this mirrors that overload resolution rather than
+// assuming one shape.
+func parseWriteEncodingAndCallback(args []vm.Value, from int) (encoding string, cb vm.Value) {
+	cb = vm.Undefined
+	if len(args) > from {
+		if args[from].IsCallable() {
+			cb = args[from]
+		} else if args[from].IsString() {
+			encoding = args[from].ToString()
+		}
+	}
+	if len(args) > from+1 && args[from+1].IsCallable() {
+		cb = args[from+1]
+	}
+	return encoding, cb
+}
+
 // encodeChunkValue mirrors real Node's default: a chunk is a Buffer
 // unless setEncoding() was called, in which case it's a decoded string
 // instead. Shared between emitDataChunk (flowing-mode 'data' events) and

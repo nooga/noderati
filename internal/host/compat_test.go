@@ -245,6 +245,56 @@ func TestCJSNamedExports(t *testing.T) {
 	}
 }
 
+// TestCJSNamedExportsViaDefineProperty covers the extremely common
+// TypeScript-CommonJS-output re-export shape -
+// `Object.defineProperty(exports, "name", { enumerable: true, get() {...}
+// })` - which extractCJSExportNames's plain-assignment/object-literal
+// scans never matched at all. Confirmed against real graphql@16.11.0
+// (docs/real-node-plan.md, Round 104/paserati#427): a name this scan
+// misses isn't reported as a compile error - it's simply absent from the
+// generated wrapper's own export list, and the import binding silently
+// resolves to `undefined` rather than failing, even though
+// `require("graphql").buildSchema` (plain CJS) returns the real function
+// correctly the whole time.
+func TestCJSNamedExportsViaDefineProperty(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "node_modules", "cjs-getter", "package.json"), `{
+		"name": "cjs-getter",
+		"main": "index.js"
+	}`)
+	writeFile(t, filepath.Join(root, "node_modules", "cjs-getter", "impl.js"), `
+		exports.buildSchema = function (s) { return "schema:" + s; };
+	`)
+	writeFile(t, filepath.Join(root, "node_modules", "cjs-getter", "index.js"), `
+		"use strict";
+		Object.defineProperty(exports, "__esModule", { value: true });
+		var _impl = require("./impl.js");
+		Object.defineProperty(exports, "buildSchema", {
+			enumerable: true,
+			get: function () {
+				return _impl.buildSchema;
+			},
+		});
+	`)
+	appPath := filepath.Join(root, "app.ts")
+	writeFile(t, appPath, `import { buildSchema } from "cjs-getter"; buildSchema("hi")`)
+
+	origWD, _ := os.Getwd()
+	_ = os.Chdir(root)
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	p := New([]string{"noderati", appPath})
+	p.SetSkipTypeCheck(true)
+	source, _ := os.ReadFile(appPath)
+	val, errs := p.RunCode(string(source), driver.RunOptions{ModuleName: appPath, Filename: appPath})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "schema:hi" {
+		t.Errorf("getter-based cjs named export = %q, want %q", val.ToString(), "schema:hi")
+	}
+}
+
 func TestCJSNamedExportValid(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "node_modules", "cjs-valid", "package.json"), `{

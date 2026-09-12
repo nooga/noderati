@@ -103,27 +103,31 @@ func buildZlibDecompressor(vmInst *vm.VM, newReader func(io.Reader) (io.Reader, 
 		_ = pw.Close()
 	}()
 
-	obj.SetOwn("write", vm.NewNativeFunction(2, true, "write", func(args []vm.Value) (vm.Value, error) {
+	obj.SetOwn("write", vm.NewNativeFunction(3, true, "write", func(args []vm.Value) (vm.Value, error) {
+		encoding, cb := parseWriteEncodingAndCallback(args, 1)
 		if len(args) > 0 && !args[0].IsUndefined() {
-			bodyCh <- valueToBytes(vmInst, args[0])
+			bodyCh <- valueToBytesWithEncoding(vmInst, args[0], encoding)
 		}
-		if len(args) > 1 && args[1].IsCallable() {
-			cb := args[1]
+		if cb.IsCallable() {
 			rt.ScheduleNextTick(func() { _, _ = vmInst.Call(cb, vm.Undefined, nil) })
 		}
 		return vm.True, nil
 	}))
-	obj.SetOwn("end", vm.NewNativeFunction(1, true, "end", func(args []vm.Value) (vm.Value, error) {
+	obj.SetOwn("end", vm.NewNativeFunction(2, true, "end", func(args []vm.Value) (vm.Value, error) {
 		if len(args) > 0 && args[0].IsCallable() {
 			close(bodyCh)
 			cb := args[0]
 			rt.ScheduleNextTick(func() { _, _ = vmInst.Call(cb, vm.Undefined, nil) })
 			return self, nil
 		}
+		encoding, cb := parseWriteEncodingAndCallback(args, 1)
 		if len(args) > 0 && !args[0].IsUndefined() {
-			bodyCh <- valueToBytes(vmInst, args[0])
+			bodyCh <- valueToBytesWithEncoding(vmInst, args[0], encoding)
 		}
 		close(bodyCh)
+		if cb.IsCallable() {
+			rt.ScheduleNextTick(func() { _, _ = vmInst.Call(cb, vm.Undefined, nil) })
+		}
 		return self, nil
 	}))
 
