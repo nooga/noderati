@@ -148,3 +148,49 @@ func TestFSPromisesAccessUnlinkRm(t *testing.T) {
 		t.Errorf("access/unlink/rm = %q", val.ToString())
 	}
 }
+
+// TestFSPromisesAliasOnFS guards a real Node alias found chasing the
+// Bedrock investigation (docs/real-node-plan.md, round 98):
+// `require('fs').promises === require('fs/promises')` is `true` in real
+// Node, and real code still reaches for it this way -
+// @aws-sdk/token-providers' own dist-cjs/index.js does
+// `const { writeFile } = node_fs.promises` (`node_fs` being
+// `require('node:fs')`) at module top level. Checks both the ESM
+// (`import fs from "node:fs"`) and CJS (`require("fs")`) shapes, since
+// they're built from independently-snapshotted "default" objects here
+// (see installFSPromisesAlias's own comment for why) - fixing one
+// without the other would leave a real, silent gap.
+func TestFSPromisesAliasOnFS(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "via-fs-promises.txt")
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	js := `
+		import fs from "node:fs";
+		await fs.promises.writeFile("` + file + `", "via-fs.promises");
+		await fs.promises.readFile("` + file + `", "utf8")
+	`
+	val, errs := p.RunCode(js, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode (ESM): %v", errs[0])
+	}
+	if val.ToString() != "via-fs.promises" {
+		t.Errorf("fs.promises.readFile (ESM) = %q", val.ToString())
+	}
+
+	cjsVal, errs := RunCJS(p, `
+		const fs = require("fs");
+		module.exports = JSON.stringify({
+			sameAsRequireFsPromises: fs.promises === require("fs/promises"),
+			writeFileIsFunction: typeof fs.promises.writeFile === "function",
+		});
+	`, filepath.Join(dir, "app.js"))
+	if len(errs) > 0 {
+		t.Fatalf("RunCJS: %v", errs[0])
+	}
+	want := `{"sameAsRequireFsPromises":true,"writeFileIsFunction":true}`
+	if cjsVal.ToString() != want {
+		t.Errorf("CJS fs.promises = %s, want %s", cjsVal.ToString(), want)
+	}
+}

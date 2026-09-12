@@ -86,3 +86,71 @@ func declareFSPromises(p *driver.Paserati) {
 	})
 	_ = p.DeclareModuleAlias("node:fs/promises", "fs/promises")
 }
+
+// installFSPromisesAlias adds fs.promises, real Node's own long-standing
+// alias: `require('fs').promises === require('fs/promises')` is `true`
+// in real Node (the exact same kind of alias util.go's own
+// TextEncoder/TextDecoder fix already covers for a different module -
+// see that file's doc comment). Found the hard way chasing the real
+// Bedrock investigation (docs/real-node-plan.md, round 98):
+// @aws-sdk/token-providers' own dist-cjs/index.js does
+// `const { writeFile } = node_fs.promises` (`node_fs` being
+// `require('node:fs')`) at module top level - a real, unconditional
+// destructure, not a hypothetical one - so a missing `.promises` threw
+// "Cannot destructure 'undefined'" before any of the module's own
+// token-provider logic ran.
+//
+// Reuses fs/promises's own, already-implemented module (declared just
+// above, in the same file) via LoadModule + GetExportValues - the same
+// mechanism cjs.go's own requireNative uses for every native
+// require() - rather than a second, separate implementation: real
+// Node's fs.promises genuinely is the same object fs/promises's own
+// module.exports is, not a separate copy with its own behavior to keep
+// in sync.
+func installFSPromisesAlias(p *driver.Paserati) {
+	vmInst := p.GetVM()
+	if vmInst == nil {
+		return
+	}
+	fsRec, err := p.LoadModule("fs", ".")
+	if err != nil {
+		return
+	}
+	promisesRec, err := p.LoadModule("fs/promises", ".")
+	if err != nil {
+		return
+	}
+
+	// fs/promises's own `m.Default(nil)` (declared just above in this
+	// same file) already built its whole-module "default" object -
+	// reusing it directly (rather than copying its named exports into a
+	// second, new object) is what makes `fs.promises ===
+	// require("fs/promises")` real, strict identity, matching real
+	// Node's own guarantee here exactly, not just equivalent behavior.
+	promisesExports := promisesRec.GetExportValues()
+	promisesDefault, ok := promisesExports["default"]
+	if !ok {
+		return
+	}
+
+	fsExports := fsRec.GetExportValues()
+	fsExports["promises"] = promisesDefault
+
+	// "fs"'s own `m.Default(nil)` (fs.go) already built and cached a
+	// snapshot "default" object at declare time, before this function
+	// ever runs - the same one-time-snapshot behavior util.go's own
+	// TextEncoder/TextDecoder fix has to work around (see its own
+	// comment there). Mutating the named-exports map above alone
+	// doesn't reach into that already-built object, so it has to be
+	// rebuilt here too, or `import fs from "fs"`/CJS require("fs")'s
+	// whole-module value (what real code actually destructures
+	// `.promises` off of) would never see the addition.
+	ns := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+	for name, val := range fsExports {
+		if name == "default" {
+			continue
+		}
+		ns.SetOwn(name, val)
+	}
+	fsExports["default"] = vm.NewValueFromPlainObject(ns)
+}

@@ -21,6 +21,7 @@ func New(argv []string) *driver.Paserati {
 	}
 	installBufferGlobal(p)
 	installUtilNatives(p)
+	installFSPromisesAlias(p)
 	installFileGlobal(p)
 	installMessagePortGlobal(p)
 	installEventGlobals(p)
