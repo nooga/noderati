@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/nooga/paserati/pkg/vm"
@@ -143,44 +144,58 @@ func simpleNodeError(vmInst *vm.VM, code, message string) error {
 	return &simpleException{exception: exception, message: message}
 }
 
-// startSignalBridge subscribes to every real OS signal this host recognizes
-// and re-emits each as a "signalName" event on processObj, matching real
-// Node's process being a genuine target for process.on("SIGTERM", ...) etc.
-// Without this, code that calls process.kill(process.pid, "SIGWINCH") to
-// self-signal (or a real `kill -TERM <pid>` from outside) would have the
-// signal correctly delivered at the OS level but nothing in this VM would
-// ever know it happened - registerSignalHandlers-shaped code would sit
-// registered but silently inert.
+// startSignalBridge re-emits real OS signals as "signalName" events on
+// processObj, matching real Node's process being a genuine target for
+// process.on("SIGTERM", ...) etc. Without this, code that calls
+// process.kill(process.pid, "SIGWINCH") to self-signal (or a real
+// `kill -TERM <pid>` from outside) would have the signal correctly
+// delivered at the OS level but nothing in this VM would ever know it
+// happened - registerSignalHandlers-shaped code would sit registered but
+// silently inert.
 //
-// Runs on its own goroutine reading from the OS; each delivery is scheduled
-// onto the VM's own event loop via ScheduleNextTick rather than emitted
-// directly from that goroutine, since VM state must only be touched from
-// the VM's own execution flow.
+// Bridging a signal is gated on JS actually listening for it - the fix for
+// a real, user-visible bug found empirically (docs/real-node-plan.md,
+// Round 102/103): the previous version called signal.Notify for every
+// bridgeable signal unconditionally at startup, which - as signal.Notify
+// always does - replaces the OS's own default disposition (terminate the
+// process, for SIGINT/SIGTERM/SIGHUP/SIGQUIT) with "relay to this
+// process's own event loop", even when nothing in JS was listening for it.
+// A running noderati process with zero signal listeners registered simply
+// ignored Ctrl-C forever, unlike every other real Node CLI ever written -
+// real Node only intercepts a signal's default disposition once JS adds
+// its first process.on(signalName, ...) listener, via libuv's own
+// uv_signal_start, and restores the OS default the instant the last such
+// listener is removed. signalBridge (below) reproduces exactly that:
+// activate()/deactivate() are called from wireProcessSignalListeners, which
+// overrides processObj's own on/addListener/once/prependListener/
+// prependOnceListener/off/removeListener/removeAllListeners to detect a
+// signal-shaped event name's listener count crossing 0<->1.
+//
+// The relay goroutine itself is unconditional and permanent - it just
+// blocks on an unsubscribed channel until the first signal is ever
+// actively bridged, at zero cost. Each delivery is scheduled onto the VM's
+// own event loop via ScheduleNextTick rather than emitted directly from
+// this goroutine, since VM state must only be touched from the VM's own
+// execution flow.
 func startSignalBridge(vmInstance *vm.VM, processObj *vm.PlainObject) {
-	names := make([]string, 0, len(nodeSignals))
-	sigs := make([]os.Signal, 0, len(nodeSignals))
+	sigBySignal := make(map[os.Signal]string, len(nodeSignals))
 	for name, sig := range nodeSignals {
 		// SIGKILL/SIGSTOP are deliberately still in nodeSignals (so
 		// process.kill(pid, "SIGKILL") can still send them - that part is
-		// real and unconditional) but are skipped here rather than passed
-		// to signal.Notify: no process can catch or bridge either one, on
-		// any OS, ever - real Node doesn't attempt to bridge them either.
+		// real and unconditional) but are never bridged: no process can
+		// catch either one, on any OS, ever - real Node doesn't attempt to
+		// bridge them either (and throws if JS tries to listen for them).
 		// This is an intentional asymmetry between the two signal tables
 		// installProcessKill and startSignalBridge draw from, not a bug -
 		// don't "fix" it by removing them from nodeSignals.
 		if sig == syscall.SIGKILL || sig == syscall.SIGSTOP {
 			continue
 		}
-		names = append(names, name)
-		sigs = append(sigs, sig)
-	}
-	sigBySignal := make(map[os.Signal]string, len(names))
-	for i, sig := range sigs {
-		sigBySignal[sig] = names[i]
+		sigBySignal[sig] = name
 	}
 
 	ch := make(chan os.Signal, 8)
-	signal.Notify(ch, sigs...)
+	bridge := &signalBridge{ch: ch, active: make(map[syscall.Signal]bool)}
 	rt := vmInstance.GetAsyncRuntime()
 	go func() {
 		for sig := range ch {
@@ -190,7 +205,174 @@ func startSignalBridge(vmInstance *vm.VM, processObj *vm.PlainObject) {
 			}
 			rt.ScheduleNextTick(func() {
 				emitOnObject(vmInstance, processObj, name)
+				// A once()-registered listener (the common shutdown-hook
+				// shape: process.once("SIGINT", cleanup)) has already
+				// self-removed by the time emitOnObject returns - via
+				// addListener's onceWrapper calling the bare
+				// removeListener helper directly (emitter.go), never
+				// through wireProcessSignalListeners' own on/off
+				// overrides below. Left unchecked, that self-removal
+				// would drop listenerCount to 0 without ever calling
+				// bridge.deactivate - the exact bug this whole fix exists
+				// to close, back in a narrower, very real shape: a
+				// process.once("SIGINT", ...) shutdown hook fires once,
+				// silently leaves SIGINT intercepted forever, and a
+				// second Ctrl-C (the real-world "cleanup hung, force
+				// it" gesture) does nothing. Checked here, once per
+				// delivery, on the VM thread (where listener bookkeeping
+				// is stable) rather than relying solely on the
+				// registration-side overrides to catch every removal
+				// path.
+				if listenerCount(processObj, name) == 0 {
+					if s, ok := sig.(syscall.Signal); ok {
+						bridge.deactivate(s)
+					}
+				}
 			})
 		}
 	}()
+
+	wireProcessSignalListeners(vmInstance, processObj, bridge)
+}
+
+// signalBridge tracks which signals JS currently has at least one listener
+// for, and keeps the OS-level subscription on ch in sync with that set -
+// the dynamic, listener-gated replacement for startSignalBridge's old
+// unconditional signal.Notify. All mutation goes through activate/
+// deactivate/deactivateAll, each holding mu for its own check-then-resync.
+type signalBridge struct {
+	mu     sync.Mutex
+	ch     chan os.Signal
+	active map[syscall.Signal]bool
+}
+
+func (b *signalBridge) activate(sig syscall.Signal) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.active[sig] {
+		return
+	}
+	b.active[sig] = true
+	b.resync()
+}
+
+func (b *signalBridge) deactivate(sig syscall.Signal) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.active[sig] {
+		return
+	}
+	delete(b.active, sig)
+	b.resync()
+}
+
+func (b *signalBridge) deactivateAll() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.active) == 0 {
+		return
+	}
+	b.active = make(map[syscall.Signal]bool)
+	b.resync()
+}
+
+// resync must be called with mu held. signal.Notify/Stop don't offer a
+// per-signal "stop relaying just this one, keep the rest" on a shared
+// channel - Stop(ch) always undoes every prior Notify(ch, ...) for that
+// channel at once - so the whole active set is recomputed from scratch on
+// every transition instead of attempting incremental adds/removes. Stop
+// also restores each now-unwanted signal's OS-level default disposition
+// (Go's own os/signal semantics: a signal keeps its default action for as
+// long as nothing has ever Notify'd it, and Stop un-Notifies it the moment
+// no channel is left registered for it) - exactly the "no listener means
+// default OS behavior" contract this bridge exists to provide.
+func (b *signalBridge) resync() {
+	signal.Stop(b.ch)
+	if len(b.active) == 0 {
+		return
+	}
+	sigs := make([]os.Signal, 0, len(b.active))
+	for sig := range b.active {
+		sigs = append(sigs, sig)
+	}
+	signal.Notify(b.ch, sigs...)
+}
+
+// wireProcessSignalListeners overrides processObj's own on/addListener/
+// once/prependListener/prependOnceListener/off/removeListener/
+// removeAllListeners - already installed generically by
+// newEventEmitterObject - so that registering or removing a listener for a
+// signal-shaped event name (exactly "SIGINT", "SIGTERM", etc. - Node signal
+// event names are exact, case-sensitive strings, never normalized the way
+// process.kill's more permissive signal argument is) also
+// activates/deactivates that signal's OS-level bridging. Every other event
+// name (e.g. "exit", "uncaughtException") passes straight through to the
+// same generic addListener/removeListener/removeAllListeners helpers
+// newEventEmitterObject itself already uses - this is a thin wrapper
+// around them, not a second listener-bookkeeping implementation.
+func wireProcessSignalListeners(vmInstance *vm.VM, processObj *vm.PlainObject, bridge *signalBridge) {
+	bridgeableSignal := func(name string) (syscall.Signal, bool) {
+		sig, ok := nodeSignals[name]
+		if !ok || sig == syscall.SIGKILL || sig == syscall.SIGSTOP {
+			return 0, false
+		}
+		return sig, true
+	}
+
+	registerAdd := func(name string, once, prepend bool) {
+		processObj.SetOwn(name, vm.NewNativeFunction(2, false, name, func(args []vm.Value) (vm.Value, error) {
+			self := vm.NewValueFromPlainObject(processObj)
+			if len(args) < 2 {
+				return self, nil
+			}
+			event := args[0].ToString()
+			before := listenerCount(processObj, event)
+			result := addListener(vmInstance, processObj, event, args[1], once, prepend)
+			if before == 0 {
+				if sig, ok := bridgeableSignal(event); ok {
+					bridge.activate(sig)
+				}
+			}
+			return result, nil
+		}))
+	}
+	registerAdd("on", false, false)
+	registerAdd("addListener", false, false)
+	registerAdd("once", true, false)
+	registerAdd("prependListener", false, true)
+	registerAdd("prependOnceListener", true, true)
+
+	registerRemove := func(name string) {
+		processObj.SetOwn(name, vm.NewNativeFunction(2, false, name, func(args []vm.Value) (vm.Value, error) {
+			self := vm.NewValueFromPlainObject(processObj)
+			if len(args) < 2 {
+				return self, nil
+			}
+			event := args[0].ToString()
+			result := removeListener(processObj, event, args[1])
+			if sig, ok := bridgeableSignal(event); ok && listenerCount(processObj, event) == 0 {
+				bridge.deactivate(sig)
+			}
+			return result, nil
+		}))
+	}
+	registerRemove("off")
+	registerRemove("removeListener")
+
+	processObj.SetOwn("removeAllListeners", vm.NewNativeFunction(1, false, "removeAllListeners", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			// No event name - real Node clears every listener for every
+			// event; every signal this bridge currently has active loses
+			// its only listener(s) at once, so deactivate all of them.
+			result := removeAllListeners(processObj, args)
+			bridge.deactivateAll()
+			return result, nil
+		}
+		event := args[0].ToString()
+		result := removeAllListeners(processObj, args)
+		if sig, ok := bridgeableSignal(event); ok {
+			bridge.deactivate(sig)
+		}
+		return result, nil
+	}))
 }

@@ -68,6 +68,7 @@ func installModules(p *driver.Paserati) {
 	declareVM(p)
 	declareHTTP()
 	installHTTPNatives(p)
+	installHTTPServerNatives(p)
 	declareHTTP2()
 	declareNet()
 	installNetNatives(p)
