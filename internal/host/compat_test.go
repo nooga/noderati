@@ -172,6 +172,50 @@ func TestNestedExportsResolution(t *testing.T) {
 	}
 }
 
+// TestArrayExportsResolution covers real Node's "array of alternatives"
+// exports shape: a target that's an array is tried in order, not a
+// conditions object — a fallback for resolvers that don't understand one
+// of the shapes inside it. Confirmed directly against real
+// eslint-visitor-keys@4.x's own package.json, which ships exactly this
+// ("exports": {".": [{"import": ..., "require": ...}, "./dist/....cjs"]}) —
+// real, unmodified eslint failed to import with "Cannot find module
+// 'eslint-visitor-keys'" before this test's fix (docs/real-node-plan.md,
+// Round 103), even though a valid target for the caller's own condition
+// genuinely exists on disk.
+func TestArrayExportsResolution(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "node_modules", "array-exp", "package.json"), `{
+		"name": "array-exp",
+		"main": "dist/array-exp.cjs",
+		"exports": {
+			".": [
+				{ "import": "./index.mjs", "require": "./dist/array-exp.cjs" },
+				"./dist/array-exp.cjs"
+			]
+		}
+	}`)
+	writeFile(t, filepath.Join(root, "node_modules", "array-exp", "index.mjs"), `export const hi = () => "hi-esm";`)
+	writeFile(t, filepath.Join(root, "node_modules", "array-exp", "dist", "array-exp.cjs"), `module.exports = { hi: () => "hi-cjs" };`)
+
+	appPath := filepath.Join(root, "app.ts")
+	writeFile(t, appPath, `import { hi } from "array-exp"; hi()`)
+
+	origWD, _ := os.Getwd()
+	_ = os.Chdir(root)
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	p := New([]string{"noderati", appPath})
+	p.SetSkipTypeCheck(true)
+	source, _ := os.ReadFile(appPath)
+	val, errs := p.RunCode(string(source), driver.RunOptions{ModuleName: appPath, Filename: appPath})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "hi-esm" {
+		t.Errorf("array exports = %q, want %q", val.ToString(), "hi-esm")
+	}
+}
+
 func TestCJSNamedExports(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "node_modules", "cjs-named", "package.json"), `{

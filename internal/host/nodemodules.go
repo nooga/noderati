@@ -302,10 +302,22 @@ func entryFromExports(exports json.RawMessage, key string, cond exportsCondition
 		return "", false, nil
 	}
 
+	// A top-level "exports" value that's a string or an array is real
+	// Node's shorthand for "this whole field is the target for the '.'
+	// subpath" (no other subpaths exist) — see resolveExportTarget's own
+	// array handling below for why an array shows up here at all.
 	var asString string
 	if err := json.Unmarshal(exports, &asString); err == nil {
 		if key == "." {
 			return asString, true, nil
+		}
+		return "", false, nil
+	}
+
+	var asArray []json.RawMessage
+	if err := json.Unmarshal(exports, &asArray); err == nil {
+		if key == "." {
+			return resolveExportTarget(exports, cond)
 		}
 		return "", false, nil
 	}
@@ -327,6 +339,31 @@ func resolveExportTarget(raw json.RawMessage, cond exportsCondition) (string, bo
 	var asString string
 	if err := json.Unmarshal(raw, &asString); err == nil {
 		return asString, true, nil
+	}
+
+	// Real Node also allows an export target to be an *array* of
+	// alternatives, tried in order — a fallback for resolvers that don't
+	// understand one of the shapes inside it (e.g. a conditions object),
+	// rather than a set of conditions itself. Confirmed directly: real
+	// `eslint-visitor-keys@4.x`'s package.json ships exactly this shape
+	// (`"exports": {".": [{"import": "...", "require": "..."}, "./dist/
+	// eslint-visitor-keys.cjs"]}`) and real Node resolves it — this
+	// resolver didn't handle the array case at all, so real, unmodified
+	// `eslint` failed to import with "Cannot find module
+	// 'eslint-visitor-keys'" even though the package (and a valid target
+	// for the caller's condition) both genuinely exist on disk.
+	var asArray []json.RawMessage
+	if err := json.Unmarshal(raw, &asArray); err == nil {
+		for _, candidate := range asArray {
+			resolved, found, err := resolveExportTarget(candidate, cond)
+			if err != nil {
+				continue
+			}
+			if found && resolved != "" {
+				return resolved, true, nil
+			}
+		}
+		return "", false, nil
 	}
 
 	var asMap map[string]json.RawMessage

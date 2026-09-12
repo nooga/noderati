@@ -251,11 +251,20 @@ in each item's own round rather than in this ledger's four letter groups:
   instead, once it crosses the loop boundary) causes an internal SDK
   bookkeeping error to leak out instead of the real exception, filed as
   [paserati#422](https://github.com/nooga/paserati/issues/422) - also
-  not noderati's to fix. A full `NodeHttp2Handler` (Bedrock's real
-  default, no-env-var path) is scoped in Round 95 as a bounded,
-  `http.go`-sized JS-shape adapter over Go's already-working HTTP/2
-  transport, not attempted yet. No AWS credentials were ever available
-  to attempt a real end-to-end call regardless. Last touched Round 103.
+  not noderati's to fix. **Round 105: confirmed `#422` merged and
+  fixed - the chain is closed.** `client.send()` now rejects with
+  exactly one, correct `UnrecognizedClientException`, matching real
+  Node all the way through construction, schema serialization, real
+  SigV4 signing, real HTTP dispatch, real response reading, and
+  protocol-level error deserialization. A full `NodeHttp2Handler`
+  (Bedrock's real default, no-env-var path) is scoped in Round 95 as a
+  bounded, `http.go`-sized JS-shape adapter over Go's already-working
+  HTTP/2 transport, not attempted (not required for what this chain
+  verified - the documented `AWS_BEDROCK_FORCE_HTTP1=1` escape hatch
+  covers the verified path). No AWS credentials were ever available to
+  attempt a real, successful (2xx) end-to-end call - that's the one
+  thing this chain never got to exercise, and remains true regardless
+  of any engine work. Last touched Round 105.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -12316,3 +12325,267 @@ cleanly isolated and filed (`#422`), stands between here and a
 `client.send()` reject that matches real Node's own single, clean
 `UnrecognizedClientException` exactly. Once it lands, re-run
 `bedrock_safe/probe.mjs` again.
+
+## Round 104: a breadth sweep across 13 popular, complex npm packages
+outside the Bedrock chain - one real noderati bug found and fixed
+(package.json `exports` array-of-alternatives), four more cleanly
+isolated and filed upstream (`#424`-`#427`), four more found but not
+yet isolated to a specific file/line
+
+Every round since 91 has gone deep on one dependency chain at a time
+(tsc, undici/fetch, WASM/Photon, http2, Bedrock). This round asked a
+different question: pick a slate of popular, complex, real npm
+packages nothing in this doc has touched yet, actually install and run
+each one (a real API call, not just an import), and see where they
+land - to find the *next* several rounds' worth of targets in one pass
+rather than one at a time.
+
+**The slate** (picked to avoid already-known gaps rather than rediscover
+them: no native `.node` addons - unexplored per Round 67; nothing that
+needs async `child_process` or real `worker_threads` concurrency; real
+Node confirmed installed and pinned exact versions for every package
+before testing, so "matches real Node" below is a real claim, not an
+assumption) - 13 packages, one minimal-but-real smoke probe each (a
+real API call, not just `require`/`import`), run against both real
+Node and a clean noderati build:
+
+| package | version | result |
+|---|---|---|
+| commander | 14.0.2 | pass |
+| @anthropic-ai/sdk | 0.68.0 | pass (construction + method presence only - no real network call attempted) |
+| openai | 6.7.0 | pass (construction + method presence only) |
+| prettier | 3.6.2 | fail - `#424` |
+| zod | 3.25.76 | fail - `#424` (identical root cause to prettier) |
+| eslint | 9.36.0 | fail - fixed one bug (`exports` array), then hit a second, new, not-yet-isolated parser bug |
+| @babel/core + preset-env | 7.28.4 / 7.28.3 | fail - `#425` |
+| ajv | 8.17.1 | fail - `#426` (crash) |
+| handlebars | 4.7.8 | fail - not yet isolated |
+| graphql | 16.11.0 | fail - `#427` |
+| @aws-sdk/client-s3 | 3.918.0 | fail - `#426` (same issue as ajv) |
+| sql.js | 1.13.0 | fail - not yet isolated |
+| webpack | 5.102.1 | fail - not yet isolated |
+
+10 of 13 fail somewhere; 3 pass (though the two SDKs only got a
+construction-level probe, not a real network call - shallower than
+"pass" implies for those two). That's a *good* result for this kind of
+sweep: every failure below is either fixed, filed with a real
+dependency-free repro, or narrowed enough to hand to a future round -
+none were a dead end.
+
+**Fixed, this round: package.json `"exports"` can be an array of
+alternatives, tried in order - noderati's resolver didn't handle that
+shape at all.** Real, unmodified `eslint@9.36.0` failed to import with
+`Cannot find module 'eslint-visitor-keys'` even though the package (and
+a valid target for the caller's own `require`/`import` condition) both
+genuinely exist on disk. Root cause: real `eslint-visitor-keys@4.x`'s
+own `package.json` ships
+```json
+"exports": { ".": [{ "import": "./lib/index.js", "require": "./dist/eslint-visitor-keys.cjs" }, "./dist/eslint-visitor-keys.cjs"] }
+```
+- an array is real Node's fallback form for resolvers that don't
+understand one of the shapes inside it (here, a conditions object),
+tried in order. `internal/host/nodemodules.go`'s `resolveExportTarget`
+(and `entryFromExports`, for the rarer case where the whole `exports`
+field itself is an array) only handled string and object-shaped
+targets, silently treating the array as "unsupported" and returning not-found.
+Isolated to a clean, minimal, dependency-free repro first
+(a synthetic package with exactly this two-branch array shape) before
+touching any code. Fixed by recursing into each array element in order
+and returning the first one that resolves; new test,
+`TestArrayExportsResolution`. With the fix, `import { Linter } from
+"eslint"` gets past this module entirely and reaches a second,
+different, genuinely new blocker (below) - confirming the fix is real,
+not just theoretically-correct.
+
+**Filed upstream (paserati, not noderati's to fix) - four issues, each
+with an isolated, dependency-free, minimal repro:**
+
+- [paserati#424](https://github.com/nooga/paserati/issues/424) -
+  `export { ns }` fails with "exported name 'ns' not found in current
+  scope" whenever `ns` is bound via `import * as ns from "..."` (a
+  namespace import), even though `ns` is completely live and usable
+  everywhere else (`ns.a` works fine unexported). This is an extremely
+  common real-world bundler-output shape - real `zod@3.25.76`'s actual
+  `index.js` is `import * as z from "./v3/external.js"; export * from
+  "./v3/external.js"; export { z }; export default z;`, and real
+  `prettier@3.6.2`'s `index.mjs` does the identical thing with `doc`.
+  Root-caused precisely: `processImportBinding`
+  (`pkg/checker/checker.go`) never registers a value-environment
+  binding for a namespace import whose type doesn't statically resolve
+  and isn't type-only - unlike the "no module mode" fallback path a few
+  lines below, which does. `export { ns }`'s own `c.env.Resolve`
+  check then legitimately (if wrongly) finds nothing.
+- [paserati#425](https://github.com/nooga/paserati/issues/425) - a
+  `RegExp` built from a plain JS string containing real non-ASCII
+  characters either throws ("invalid UTF-8" - the pattern handed to
+  Go's `regexp` package isn't valid UTF-8, even though the JS string is
+  one ordinary character) or, for a *literal* built the same way,
+  silently returns the *wrong* match result instead of erroring at all
+  - worse, since it fails quietly. Minimal repro:
+  `new RegExp("[\xaa]")` throws; `/[\xc0-\xd6]/.test("\xc0")` returns
+  `false` instead of `true`. Found via real
+  `@babel/helper-validator-identifier`'s actual
+  `new RegExp("[" + nonASCIIidentifierStartChars + "]")` (a huge
+  literal Unicode character-class string, exactly this shape). Broadly
+  impactful - this is ordinary, common code (Unicode-range character
+  classes built as strings) across many popular packages, not
+  Babel-specific.
+- [paserati#426](https://github.com/nooga/paserati/issues/426) - a
+  register/stack-exhaustion compiler limit ("register exhaustion:
+  expression too deeply nested") that real Node handles trivially - hit
+  by real, unmodified `@aws-sdk/client-s3@3.918.0` at plain `import`
+  time (S3's generated client/schema surface is bigger than Bedrock's,
+  evidently enough to hit this on its own, independent of the
+  previously-fixed #399/#406/#416 register-allocator bugs), and
+  reproduced synthetically with a dependency-free 150-level nested-`if`
+  `new Function` body. Separately, real `ajv@8.17.1` hits what's very
+  likely the *same* underlying limit but as an uncaught Go panic (nil
+  pointer dereference) instead of a clean compile error, compiling its
+  own real, bundled ~27KB JSON-Schema-draft-07 meta-schema validator
+  via `new Function`. Not fully isolated: replaying the exact `self`/
+  `scope`/`sourceCode` arguments ajv's own code passes to that
+  `new Function` call, standalone, does *not* crash - it compiles and
+  runs correctly against a structurally-similar fake `scope` object -
+  so the panic depends on something in the real, live Ajv `scope`
+  object specifically, not the generated source's shape/size alone.
+  Filed as a real, reproducible crash regardless, flagging that it
+  needs more isolation before a fix can be scoped.
+- [paserati#427](https://github.com/nooga/paserati/issues/427) - an
+  ESM named import of a CJS module's getter-based export
+  (`Object.defineProperty(exports, name, { get() {...} })`, the
+  extremely common TypeScript-compiled-output re-export shape) silently
+  binds to `undefined` instead of invoking the getter - no compile
+  error, so it's a silent wrong-value bug, not a hard failure. Found
+  via real, unmodified `graphql@16.11.0`'s actual
+  `buildSchema`/`buildClientSchema`/etc. exports, which use exactly
+  this shape. `require("graphql").buildSchema` (plain CJS) returns the
+  real function correctly - this is specific to the ESM-imports-a-CJS-
+  module binding path. Not isolated to a specific file/line this round
+  (not in noderati's own `internal/host/cjs.go`, which has no
+  accessor-specific handling at all - almost certainly inside
+  paserati's own CJS-into-ESM binding mechanism) - possibly the same
+  *class* of bug as Round 101's `pipe()` (`GetOwn` instead of `Get`),
+  but here the property genuinely is own, so if that's the mechanism
+  it's a different manifestation, not the same fix.
+
+**Found but not yet isolated to a specific file/line - left for a
+future round, same as this doc's own precedent for items that need more
+work before they can be scoped or filed usefully:**
+
+- **eslint**, after the `exports`-array fix above got it past its
+  first blocker, hits a second, different, genuinely new one: a real
+  parser error, `"Syntax Error at 1406:59: enum member type access
+  requires identifier before '.'"` - `pkg/parser/parser.go`'s
+  `parseEnumMemberTypeExpression` (a TS-type-context parser for
+  qualified-name-as-a-type syntax like `Color.Red`) is being invoked
+  somewhere it shouldn't be, on ordinary JS from a plain `.js` package
+  with no actual TypeScript type annotations anywhere in it - almost
+  certainly a grammar-ambiguity misparse (most likely a `<`/`>`
+  comparison chain misdetected as a generic-type context), not a real
+  enum-type usage. Bisected far enough to rule out any single one of
+  eslint's own top-level files failing in isolation (`require()`-ing
+  each of `eslint`'s and `eslint-visitor-keys`'/etc.'s own files one at
+  a time via `-e` all succeed individually) - the trigger only shows up
+  somewhere in the real, full, as-imported dependency graph. Needs
+  systematic bisection of that graph (or an instrumented build) to find
+  the actual triggering source line, not yet attempted.
+- **sql.js@1.13.0** - `import initSqlJs from "sql.js"` (ESM default
+  import of a CJS module) yields `undefined`, while
+  `require("sql.js")` (plain CJS) correctly yields the real factory
+  function. Confirmed this is specific to the ESM-default-import path,
+  not a general CJS-interop failure (a hand-built minimal repro of the
+  same *shape* - a `memoize`+lazy-wrapper CJS file that reassigns
+  `module.exports` to a function - worked fine both ways) - so
+  whatever's different is specific to `sql.js`'s real, large,
+  Emscripten-generated `dist/sql-wasm.js` bundle, not the general
+  mechanism. `process.versions.node` is present and correctly reported,
+  ruling out the obvious environment-detection-flag guess. Not
+  isolated further this round; `require("sql.js")` is a full working
+  workaround in the meantime.
+- **webpack@5.102.1** - `webpack/lib/index.js`'s own real
+  `const fn = lazyFunction(() => require("./webpack"))` (a memoize-
+  then-lazy-call wrapper around a `require`) ends up somewhere calling
+  `require(".")` for real (`Error: Cannot find module '.'`) once
+  actually invoked (`webpack({...}, callback)` in the probe). Confirmed
+  the outer `lazyFunction`/`memoize` wrapper mechanism itself is
+  **not** the bug: reproduced webpack's exact real `memoize.js` +
+  `lazyFunction` code, wrapping a `require()` of a real sibling CJS
+  file that itself exports a function, called the same way the probe
+  does - works correctly, matching real Node. So the actual `"."`
+  resolution happens somewhere *inside* the real `webpack/lib/webpack.js`
+  file's own (considerably larger) require graph, once it's actually
+  loaded - not yet traced to the specific call site.
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean, including the
+new `TestArrayExportsResolution`; scoreboard clean, no regressions.
+Paserati was already at `d32e4332` (same commit Round 103, on the
+Bedrock chain, had just pulled) for this entire round - no version skew
+between the two tracks.
+
+**Status**: one real noderati bug fixed and verified
+(`TestArrayExportsResolution`); four real, cleanly-isolated paserati
+bugs filed (`#424`-`#427`), each with a dependency-free minimal repro;
+four more real failures found and precisely characterized but not yet
+isolated to a fixable location (eslint's second blocker, sql.js,
+webpack, and ajv's crash-specific trigger within `#426`). This is a
+different, complementary track to the Bedrock chain (rounds 94-103) -
+picks up independently whenever someone wants the next target rather
+than continuing Bedrock's own single dependency chain.
+
+## Round 105: paserati#422 confirmed merged and fixed - the Bedrock
+chain (rounds 94-103) is closed. `client.send()` now rejects with
+exactly one, correct exception, matching real Node all the way through
+
+Pulled paserati `main` (now `76f0e85b` - `#422`'s fix,
+"async catch/finally rethrow no longer leaks the original awaited
+rejection"). Rebuilt noderati clean, re-verified the exact minimal
+repro filed in Round 103 (`while`/`for` loop, `try { await refresh() }
+catch (refreshError) { throw lastError }`) - all three variants
+(`while(true)`, `for`, `while` with a `break`) now print `REPLACED`/
+`REPLACED2`/`REPLACED3`, matching real Node exactly.
+
+**Re-ran the full chain's own standing probe
+(`bedrock_safe/probe.mjs` - real, unmodified
+`@aws-sdk/client-bedrock-runtime`, dummy credentials, the real
+`bedrock-runtime.us-east-1.amazonaws.com` endpoint) end to end. It now
+produces exactly what real Node produces: a single, clean
+`UnrecognizedClientException`** ("The security token included in the
+request is invalid.", correct `$fault: "client"`, correct
+`$metadata.httpStatusCode: 403` and `requestId`) - no secondary
+`"No retry token available"` error, no lost/wrong exception value. The
+`name`/`message`/`$metadata` all match real Node's own output for the
+identical dummy-credential request. (Stack-trace *text* differs in
+formatting - paserati's synthetic frame names like
+`<ServiceException>:777:1` vs. real Node's real file:line references -
+this is an expected, cosmetic difference in how each engine renders a
+call stack, not a functional one, and was not chased further.)
+
+**Verification**: full suite (`go test ./... -count=1
+-skip TestEventsAddAbortListener`) and scoreboard both clean, no
+regressions from the paserati bump.
+
+**Status - the Bedrock chain (rounds 94-105) is done.** Every bug this
+investigation found across noderati (four real bugs: `pipe()`'s
+`GetOwn`/`Get`, `Writable.write()` not calling `_write()`,
+`IncomingMessage` emitting strings instead of Buffers, the listener-
+attachment data-loss race; two real crypto gaps plus a silent
+`createHash` correctness bug; a resolver preferring `"module"` over
+`"main"` and mis-parsing required `.json` files as JS; a missing
+`fs.promises`; a missing `URLSearchParams` iteration protocol) and
+across paserati (`#404`, `#406`, `#407`, `#413`, `#416`, `#418`,
+`#420`, `#422`, plus the B4 register-block work) is now fixed and
+verified, and the exact real request/response cycle this whole chain
+set out to validate - construction, schema-based serialization, real
+SigV4 signing, real HTTP dispatch, real response reading, real
+protocol-level error deserialization, and a clean, correctly-classified
+rejection - genuinely works end to end, matching real Node's own
+behavior at every step observed. The only thing this chain never got
+to exercise is a real, successful (2xx) response body, since no real
+AWS credentials have ever been available in this environment - that
+remains true regardless of any engine work. `NodeHttp2Handler`
+(Bedrock's real default, no-env-var transport) is still unimplemented,
+scoped back in Round 95 as a bounded, `http.go`-sized adapter over Go's
+already-working HTTP/2 transport - not attempted, and not required for
+what this chain was verifying (the documented
+`AWS_BEDROCK_FORCE_HTTP1=1` escape hatch covers the verified path).
