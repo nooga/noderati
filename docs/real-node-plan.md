@@ -12717,3 +12717,126 @@ that surfaced it. One incidental regression (zlib) found via this
 round's own full-suite run was root-caused and fixed in the same pass,
 confirming against real Node before touching any code, per this
 project's own standing discipline.
+
+## Round 107: zod's real root cause found and filed (`paserati#432`,
+`#433`); prettier's own failure characterized but not yet isolated to
+a minimal repro despite several serious attempts
+
+Continuing Round 104's "keep going on zod/prettier" - both still
+failed after Round 106's fixes, past their original `#424` blocker
+(`export { ns }`), on a new `TypeError: undefined is not a function`
+each. Chased both to ground; zod's is now fully root-caused, isolated,
+and filed. Prettier's is real and reproduced directly against the
+actual bundle, but resisted every attempt at a minimal, standalone
+repro this round - left open, with the evidence gathered, for whoever
+picks it up next.
+
+**Zod: `import { z } from "zod"` silently returns a namespace missing
+~80% of its real API - `z.object`/`z.string`/`z.number`/etc. all
+`undefined`.** Diffed `Object.keys(z)` directly: real Node reports 107
+keys, noderati only 21 - specifically every export from zod's real
+`v3/errors.js`, `helpers/parseUtil.js`, and `helpers/util.js` (three of
+the six files `v3/external.js` re-exports via `export * from`), and
+none at all from `helpers/typeAliases.js` (a types-only file - 0
+runtime exports either way, not a bug), `types.js` (the file that
+actually defines `z.object`/`z.string`/etc.), or `ZodError.js`.
+
+Isolated to real `v3/types.js` failing to *parse* at all:
+```
+Syntax Error at 3692:814: expected identifier or string after 'as' in export specifier
+```
+at `undefinedType as undefined` - real zod code aliasing an export to
+the literal name `undefined` (a completely valid `IdentifierName`,
+per spec - `undefined` isn't a reserved word). Minimal, dependency-free
+repro: `export { undefinedType as undefined }` in one file, `import *
+as ns` in another, fails to parse under paserati; real Node parses and
+runs it fine. Confirmed this is specific to `undefined` and not
+"reserved words as export aliases" generally - `as null`/`as true`/`as
+class`/`as delete`/`as NaN`/`as Infinity` in the identical shape all
+already work. Root-caused precisely:
+`pkg/parser/parser.go`'s `isExportSpecifierName` is a hand-maintained
+token-type allowlist (IDENT, STRING, plus every real keyword) that's
+simply missing `lexer.UNDEFINED` - the lexer gives literal `undefined`
+its own dedicated token type rather than lexing it as a plain IDENT,
+and this switch statement's list never got updated for it. Filed as
+[paserati#432](https://github.com/nooga/paserati/issues/432), with the
+exact fix location and suggested one-line change.
+
+**A second, independent, real bug found in the same investigation:**
+`export * from` a module that fails to parse/load is silently dropped
+from the merged namespace instead of propagating the failure - which
+is *why* zod "succeeds" at all (with a badly incomplete namespace)
+rather than throwing at the `import` statement the way real Node does.
+Minimal repro: a `mid.mjs` doing `export * from "./lib.mjs"` (where
+`lib.mjs` fails to parse) plus `export const other = 42` - real Node
+throws on `import * as ns from "./mid.mjs"`; noderati happily returns
+`{ other: 42 }`, `lib.mjs`'s own real export silently absent, no error
+anywhere. Filed separately as
+[paserati#433](https://github.com/nooga/paserati/issues/433), since
+it's a distinct concern from the parser bug that happened to trigger
+it here (and this masking behavior could just as easily be hiding
+other, unrelated real load failures the same way, project-wide - not
+just this one instance).
+
+**Prettier: a real, reproduced-against-the-actual-package argument-
+splicing anomaly, not yet reduced to a minimal repro.** `prettier.
+format(code, { parser: "babel" })` fails inside its own real option-
+validation machinery (`vnopts`, bundled): `TypeError: undefined is not
+a function` calling `schema.validate(value, utils)` where `schema` is
+not a schema instance at all. Instrumented the real, unmodified bundle
+directly (a scratch copy, not the project's own `node_modules`) to
+observe the actual values at each layer, rather than guessing:
+
+- `optionInfoToSchema`/`createSchema` build ~29 real per-option schema
+  instances up front (`BooleanSchema`, `ChoiceSchema`, `StringSchema`,
+  `IntegerSchema`, ...) via `Object.create(schema)` plus a per-instance
+  `validate` override, itself wrapped by `normalizeHandler` - a
+  `(...args) => handler(...args.slice(0, N-1), superSchema, ...args.
+  slice(N-1))` closure that splices the real schema instance into the
+  middle of the real call's arguments (`N` is `Schema.prototype.
+  validate.length`, correctly 2 in both engines - checked directly,
+  not assumed).
+- The first two real option validations (`ChoiceSchema`, `IntegerSchema`
+  instances) succeed with everything exactly as expected.
+- The very next one fails: instrumenting `normalizeHandler`'s own
+  returned closure printed `args.length= 2` (correct - `value` and
+  `this._utils`, matching the call site) but `args.slice(0,
+  handlerArgumentsLength - 1).length` came back as **0**, not 1 - for
+  the exact same `handlerArgumentsLength` (2) and the exact same
+  `args.length` (2) that produced the correct `1` one call earlier.
+  `Array.prototype.slice(0, 1)` on a 2-element array returning an empty
+  array sometimes and a 1-element array other times, for structurally
+  identical calls, is the actual anomaly - whatever's downstream of it
+  (the override receiving the `utils` context object in its `schema`
+  parameter slot, and `undefined` in its own `utils` slot) is just the
+  visible symptom.
+- Three separate, serious attempts to reproduce this in isolation all
+  failed - a plain `(...args) => args.slice(...)` closure created and
+  called 3 times; the exact real `normalizeHandler` function driven
+  through the identical splice-into-a-call expression 4 times; and a
+  full-scale harness rebuilding `Schema`/`createSchema`/`HANDLER_KEYS`/
+  `normalizeHandler` faithfully and driving ~40 schemas through it, all
+  matching real Node every time, no inconsistency at any scale tried.
+
+Whatever triggers this needs either the real bundle's exact code shape
+(closures created inside a real loop over `HANDLER_KEYS`, 9 keys × ~29
+schemas, some handler keys unset per-option) or a scale/interaction
+this round's harnesses didn't hit - not filed upstream yet, since
+"sometimes returns the wrong slice for identical inputs" without a
+standalone repro isn't yet actionable for anyone else to pick up.
+Recorded here instead, with the exact debug transcript, so a future
+round can pick the instrumentation back up rather than starting cold.
+
+**Verification**: no noderati code changed this round (diagnostic-only:
+zod/prettier were both instrumented via scratch copies of their real
+`node_modules`, never noderati's own tree) - nothing to run the full
+suite/vet/scoreboard against.
+
+**Status**: zod's real blocker is fully root-caused, isolated, and
+filed as two distinct upstream issues (`#432` parser, `#433` module-
+loading). Prettier's is real, reproduced directly against the actual
+package, and precisely characterized down to "an `Array.prototype.
+slice` call returns an inconsistent result for identical arguments on
+a repeated invocation of the same closure shape" - genuinely open,
+needs more instrumentation budget than this round had, not yet
+fileable without a smaller repro.
