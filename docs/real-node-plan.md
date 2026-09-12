@@ -235,11 +235,19 @@ in each item's own round rather than in this ledger's four letter groups:
   upstream bug: `Object.setPrototypeOf` rejects every typed-array-family
   value as "non-object", filed as
   [paserati#418](https://github.com/nooga/paserati/issues/418) - not
-  noderati's to fix. A full `NodeHttp2Handler` (Bedrock's real default,
-  no-env-var path) is scoped in Round 95 as a bounded, `http.go`-sized
-  JS-shape adapter over Go's already-working HTTP/2 transport, not
-  attempted yet. No AWS credentials were ever available to attempt a
-  real end-to-end call regardless. Last touched Round 101.
+  noderati's to fix. **Round 102: confirmed `#418` merged and fixed -
+  the real 403 response body now deserializes correctly into a genuine
+  `UnrecognizedClientException`, matching real Node exactly.** One more
+  cleanly-isolated upstream bug surfaced immediately after (the SDK's
+  retry middleware misclassifying that exception as retryable, traced
+  to `JSON.stringify` silently dropping `Error` instances' own `.name`
+  after assignment), filed as
+  [paserati#420](https://github.com/nooga/paserati/issues/420) - also
+  not noderati's to fix. A full `NodeHttp2Handler` (Bedrock's real
+  default, no-env-var path) is scoped in Round 95 as a bounded,
+  `http.go`-sized JS-shape adapter over Go's already-working HTTP/2
+  transport, not attempted yet. No AWS credentials were ever available
+  to attempt a real end-to-end call regardless. Last touched Round 102.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -12144,3 +12152,77 @@ fix. Once `paserati#418` lands, this same probe should very plausibly
 complete an entire real AWS Bedrock request/response cycle end to end
 (modulo real AWS credentials, still not available in this
 environment).
+
+## Round 102: paserati#418 confirmed merged and fixed - the real 403
+now deserializes correctly; one more cleanly-isolated upstream bug
+found immediately after, filed as #420
+
+Pulled paserati `main` (now `bb4e5c6c` - `#418`'s fix plus a same-day
+follow-up letting `Generator`/`AsyncGenerator` take an arbitrary
+`Object.setPrototypeOf` override, plus, as a bystander bonus,
+`WritableStream`/`TransformStream` landing upstream per the WHATWG
+spec). Rebuilt noderati clean and re-ran the exact same probe this
+whole chain has used since Round 100
+(`bedrock_safe/probe.mjs` - real, unmodified
+`@aws-sdk/client-bedrock-runtime`, dummy credentials, the real
+`bedrock-runtime.us-east-1.amazonaws.com` endpoint).
+
+**Confirmed: the real 403 response body now deserializes correctly.**
+`Uint8ArrayBlobAdapter.mutate()`'s `Object.setPrototypeOf` call no
+longer throws - `getErrorSchemaOrThrowBaseException` now builds a real
+`UnrecognizedClientException` ("The security token included in the
+request is invalid.") with the right `$metadata.httpStatusCode: 403`
+and `requestId`, matching real Node's own output for the same dummy
+credentials, byte-for-byte down to the message text. Full suite
+(`go test ./... -skip TestEventsAddAbortListener`) and the scoreboard
+both clean - no regressions from the paserati bump.
+
+**Immediately after, a new divergence: the SDK's own retry middleware
+misclassified that exception as retryable**, ultimately throwing a
+second, wrong error - `"No retry token available"` - that real Node
+never produces (real Node's `client.send()` rejects cleanly with just
+the one `UnrecognizedClientException`). Traced with a minimal,
+dependency-free repro (no AWS SDK involved) to `JSON.stringify`
+silently dropping `.name` off of paserati `Error` instances:
+
+```js
+const e = new Error("msg");
+e.name = "MyName";
+JSON.stringify(e); // real Node: {"name":"MyName"}  paserati: {}
+```
+
+Root cause: `Error.prototype.name` is correctly non-enumerable *on the
+prototype* (`pkg/builtins/error_init.go:59`), but the `Error`
+constructor (and every subclass's instance-construction code,
+`initErrorSubclass`, `AggregateError`, `SuppressedError` included) also
+bakes a non-enumerable `"name"` onto the *instance itself* at
+construction time (`error_init.go:141-146` and siblings). Real V8
+instances have no own `"name"` until user code assigns one - at which
+point `[[Set]]`'s `OrdinarySet` finds nothing own, walks to the
+prototype, and creates a *new* own property with spec-default
+attributes (`enumerable: true`), which is why real Node's assignment
+sticks and paserati's doesn't (paserati's assignment instead hits the
+"existing own property, preserve attributes" branch, since `"name"`
+was already own and non-enumerable from construction).
+`PlainObject.SetOwn`/`opSetProp`'s actual `[[Set]]` semantics are
+spec-correct - the bug is purely in the instance-construction code
+pre-baking a property that should only ever live on the prototype. This
+is exactly the same class of bug (an AWS SDK generated exception
+constructor doing `this.name = "SomeServiceException"` and expecting
+it to behave like a normal assignment) that `getRetryErrorInfo`'s
+retry-classification helpers (`isClockSkewError`, `isThrottlingError`,
+`isRetryableByTrait`, all of which read `error.name`/`error.$retryable`
+off the live object) depend on. Filed as
+[paserati#420](https://github.com/nooga/paserati/issues/420) - again,
+not noderati's to fix.
+
+**Status**: `paserati#418` is confirmed fixed and merged - the real
+Bedrock 403 body now deserializes into a correct, real
+`UnrecognizedClientException` matching real Node exactly. The only
+thing standing between here and a fully clean `client.send()` reject
+(matching real Node's own single, clean exception) is `paserati#420`,
+already isolated to an 8-line, dependency-free repro. Once it lands,
+re-run `bedrock_safe/probe.mjs` again to confirm the whole chain
+(rounds 94-102) finally produces an end-to-end result identical to
+real Node's own, modulo real AWS credentials (still unavailable in
+this environment).
