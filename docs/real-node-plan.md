@@ -243,11 +243,19 @@ in each item's own round rather than in this ledger's four letter groups:
   to `JSON.stringify` silently dropping `Error` instances' own `.name`
   after assignment), filed as
   [paserati#420](https://github.com/nooga/paserati/issues/420) - also
+  not noderati's to fix. **Round 103: confirmed `#420` merged and
+  fixed too - the retry middleware's `errorInfo` now matches real Node
+  exactly** - but `client.send()` still doesn't reject cleanly: a
+  distinct, cleanly-isolated exception-unwinding bug (a value thrown
+  from inside a loop's own `catch` leaks the *previous* exception
+  instead, once it crosses the loop boundary) causes an internal SDK
+  bookkeeping error to leak out instead of the real exception, filed as
+  [paserati#422](https://github.com/nooga/paserati/issues/422) - also
   not noderati's to fix. A full `NodeHttp2Handler` (Bedrock's real
   default, no-env-var path) is scoped in Round 95 as a bounded,
   `http.go`-sized JS-shape adapter over Go's already-working HTTP/2
   transport, not attempted yet. No AWS credentials were ever available
-  to attempt a real end-to-end call regardless. Last touched Round 102.
+  to attempt a real end-to-end call regardless. Last touched Round 103.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -12226,3 +12234,85 @@ re-run `bedrock_safe/probe.mjs` again to confirm the whole chain
 (rounds 94-102) finally produces an end-to-end result identical to
 real Node's own, modulo real AWS credentials (still unavailable in
 this environment).
+
+## Round 103: paserati#420 confirmed merged and fixed - errorInfo now
+matches real Node exactly; one more, distinct upstream exception-
+unwinding bug found immediately after, filed as #422
+
+Pulled paserati `main` (now `d32e4332` - `#420`'s fix). Rebuilt
+noderati clean, re-ran both the minimal `Error.name` repro and the full
+`bedrock_safe/probe.mjs` chain.
+
+**Confirmed: `#420` is fully fixed.** The minimal repro
+(`e.name = "MyName"; JSON.stringify(e)`) now matches real Node exactly
+on both bare paserati and under noderati. In the real probe,
+`getRetryErrorInfo`'s `MW-retry-errorInfo` checkpoint now prints
+`{"error":{"$fault":"client","$metadata":{...},"name":
+"UnrecognizedClientException","message":"The security token included
+in the request is invalid."},"errorType":"CLIENT_ERROR"}` - byte-for-
+byte identical in shape and content to real Node's own output at the
+same checkpoint (confirmed side by side).
+
+**Immediately after, the exact same final symptom as Round 102 - still
+`"No retry token available"`, not the real exception - even though the
+`errorInfo` feeding the retry decision is now provably identical to
+real Node's.** That ruled out error-classification entirely as the
+cause and pointed at the retry loop's own control flow instead. Traced
+with a minimal, dependency-free, non-AWS repro (no SDK, no schema, no
+crypto) to a real paserati exception-unwinding bug:
+
+```js
+async function refresh() {
+  throw new Error("INNER");
+}
+async function outer() {
+  while (true) {
+    let lastError = new Error("REPLACED");
+    try {
+      await refresh();
+    } catch (refreshError) {
+      throw lastError;
+    }
+  }
+}
+try {
+  await outer();
+} catch (e) {
+  console.log("final:", e.message);
+}
+```
+
+Real Node: `final: REPLACED`. paserati: `final: INNER` - the *original*
+exception caught by the inner `catch` leaks out to the outer `catch`
+instead of the new value that catch block actually threw. Narrowed
+precisely: removing the loop (a single, non-looped `try { await
+refresh() } catch { throw lastError }`) does **not** reproduce - both
+engines agree without a loop wrapping the `try`. A `for` loop
+reproduces identically to `while(true)`, and the bug needs no
+Go-side/native call reentrancy at all - pure JS, a single `async`
+function. This exactly matches the real `@smithy/core`
+`retryMiddleware`'s own shape: `while (true) { try { await next(args)
+} catch (e) { ... try { await
+retryStrategy.refreshRetryTokenForRetry(...) } catch (refreshError) {
+throw lastError /* the real service exception */ } } }` - the inner
+`refreshRetryTokenForRetry` throws its own internal
+`"No retry token available"` bookkeeping error (by design - real Node
+uses it as an internal "stop retrying" signal, immediately replacing it
+with the real `lastError`), and paserati's unwind path loses that
+replacement, leaking the internal bookkeeping error out to
+`client.send()`'s caller instead. Filed as
+[paserati#422](https://github.com/nooga/paserati/issues/422), noting
+it may share a root cause with the already-tracked exception-unwinding
+issues `#61`/`#142` (different symptom - a stale-but-valid Error object
+survives, not a panic or `null`) - not noderati's to fix.
+
+**Verification**: full suite (`go test ./...
+-skip TestEventsAddAbortListener`) and scoreboard both clean, no
+regressions from the paserati bump.
+
+**Status**: two upstream bugs down (`#418`, `#420`), both confirmed
+fixed and verified against the real Bedrock endpoint; one more,
+cleanly isolated and filed (`#422`), stands between here and a
+`client.send()` reject that matches real Node's own single, clean
+`UnrecognizedClientException` exactly. Once it lands, re-run
+`bedrock_safe/probe.mjs` again.
