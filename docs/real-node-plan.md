@@ -11955,7 +11955,9 @@ Filed here as a real, newly-load-bearing gap in `signals.go`, not fixed
 as part of this round - out of this round's own scope, but anyone
 trying this round's own demo needs `kill -9` (SIGKILL, the one signal
 this project never bridges - see `startSignalBridge`'s own comment), not
-Ctrl-C, to actually stop it.
+Ctrl-C, to actually stop it. **Fixed the following round - see Round
+101; this paragraph is a historical record of the gap as first found,
+not current behavior.**
 
 **Known, deliberate simplifications, each real but minor**:
 `res.statusMessage` is stored and readable JS-side but never reaches the
@@ -11978,3 +11980,106 @@ next natural step if a future consumer needs a raw TCP server rather
 than an HTTP one. Koa itself is blocked on the separate
 `Error.prepareStackTrace`/`CallSite` gap described above, not on
 anything this round built.
+
+## Round 101: `signals.go`'s SIGINT-does-nothing gap (Round 100) fixed -
+signal bridging now gated on listener count, matching real Node's own
+model; a second, narrower bypass found by review and fixed in the same
+pass
+
+Picked up Round 100's own newly-surfaced blocker directly: `kill -INT`
+against a running `http.createServer` process did nothing, because
+`startSignalBridge` called `signal.Notify` for every bridgeable signal
+unconditionally at startup, regardless of whether any JS code was ever
+going to listen for it.
+
+**The real mechanism, confirmed by reading Go's own `os/signal` source,
+not assumed: `signal.Notify(c, sig)` unconditionally replaces a
+signal's OS-level default disposition (e.g. SIGINT's default
+terminate) with "relay to c" for as long as anything has ever Notify'd
+it, and `signal.Stop(c)` - when `c` is the only channel ever registered
+for that signal, true here since this bridge uses one shared channel -
+restores the OS default the moment nothing is left registered for
+it.** Real Node's own model (libuv's `uv_signal_start`) only ever
+intercepts a signal once JS calls `process.on(signalName, ...)` for the
+first time, and lets the OS default apply again once the last such
+listener is gone - `startSignalBridge`'s old unconditional `Notify` at
+startup skipped straight to "always intercepted," permanently.
+
+**Fix: `signalBridge` (`signals.go`), gated on listener count.**
+`wireProcessSignalListeners` overrides `process`'s own
+`on`/`addListener`/`once`/`prependListener`/`prependOnceListener`/`off`/
+`removeListener`/`removeAllListeners` - already installed generically
+by `newEventEmitterObject` - to call `bridge.activate(sig)` the instant
+a signal-shaped event name's listener count goes 0→1, and
+`bridge.deactivate(sig)` the instant it drops back to 0. `resync()`
+recomputes the whole active set via `signal.Stop(ch)` then
+`signal.Notify(ch, activeSigs...)` on every transition, since Go's
+per-channel `Stop` has no "just this one signal" mode.
+
+**A second, narrower bypass found by the advisor's review, not by
+either of this round's own first two tests: `once()`'s self-removal
+never reaches the new overrides at all.** `addListener`'s
+once-wrapper (`emitter.go`) removes itself by calling the bare
+`removeListener` helper directly, not through
+`wireProcessSignalListeners`' own `off`/`removeListener` closures -
+so `process.once("SIGINT", cleanup)`, a completely ordinary real
+shutdown-hook shape, fired once, self-removed, dropped
+`listenerCount` to 0 correctly, and left `bridge.deactivate` uncalled:
+Round 100's exact bug, back in a narrower, very real shape - a
+second Ctrl-C (the real-world "cleanup hung, force it" gesture) does
+nothing. First round's own two tests
+(`TestSignalBridgeActivatesOnListenerAndReactivates`,
+`TestSignalBridgeRemoveListenerDeactivates`) both deactivate via an
+explicit `removeAllListeners()`/`removeListener()` call and couldn't
+have caught this. Fixed by moving the listener-count check into the
+relay goroutine's own tick closure (after `emitOnObject`, still on the
+VM thread where listener bookkeeping is stable) - this catches every
+removal path, once()'s included, rather than relying solely on the
+registration-side overrides. New test:
+`TestSignalBridgeOnceSelfRemovalDeactivates`.
+
+**Three real behaviors verified end to end against the compiled
+binary, not assumed from a substitute signal or a partial probe** -
+this doc's own standard, and the exact thing Round 100's entry got
+wrong once already (guessed at the `CallSite` gap's shape before
+checking):
+- **Unhandled signal terminates via the real OS default, SIGINT
+  itself, not inferred from SIGTERM**: `/tmp/noderati -e
+  'setTimeout(()=>{},60000); process.kill(process.pid, "SIGINT");'`
+  exits `130` (128+2, the standard shell convention for
+  death-by-SIGINT) with zero listeners registered. (Round 100's own
+  manual check used SIGTERM as a stand-in after discovering this
+  session's sandbox swallows `kill -INT` against backgrounded jobs
+  specifically - confirmed independently with a plain `sleep 100 &`
+  control before trusting it; the self-signal probe here sidesteps
+  that entirely by delivering the signal from inside the process
+  itself, bypassing shell job control.)
+- **A registered listener still fires and controls shutdown**: a
+  `process.once("SIGINT", cleanup)` handler runs, and a `process.on`
+  handler calling `server.close(() => ...)` (the idiomatic graceful-
+  shutdown shape, not `process.exit()`) drains Round 100's own
+  `http.createServer` external-op accounting correctly - the process
+  exits on its own once `close()`'s callback runs, with no
+  `process.exit()` call anywhere, confirming `doListen`'s
+  `BeginExternalOp`/`doClose`'s `EndExternalOp` balance exactly as
+  designed.
+- **Removing the last listener (via `once()`'s self-removal
+  specifically) restores the real OS default**: a second SIGINT sent
+  after a `process.once("SIGINT", ...)` handler has already fired and
+  self-removed terminates the process (exit `130` again) rather than
+  being silently absorbed forever.
+
+**Status**: the signal-handling gap Round 100 found and left open is
+fixed. `kill -9` is no longer the only way to stop a `http.createServer`
+demo - a plain Ctrl-C now works exactly when nothing is listening for
+it, and `process.on`/`process.once` shutdown hooks (including the
+idiomatic `server.close()` graceful-shutdown pattern) work exactly as
+before, with no regression. New tests:
+`TestSignalBridgeActivatesOnListenerAndReactivates`,
+`TestSignalBridgeRemoveListenerDeactivates`,
+`TestSignalBridgeOnceSelfRemovalDeactivates` (all
+`internal/host/signals_test.go`), deliberately built on SIGWINCH (real
+OS default: ignore) rather than SIGINT/SIGTERM, so they can safely
+self-signal from inside the `go test` binary itself at every stage,
+including the deactivated one, without risking the test process's own
+death if the fix were subtly wrong.
