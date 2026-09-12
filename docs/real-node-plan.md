@@ -209,12 +209,37 @@ in each item's own round rather than in this ledger's four letter groups:
   real Bedrock endpoint (a real GET and a real POST-with-body-and-auth-
   header both matched real Node's real response exactly) before chasing
   a genuine remaining hang inside the SDK's own signing/dispatch
-  internals - not yet isolated to a specific function. A full
-  `NodeHttp2Handler` (Bedrock's real default, no-env-var path) is scoped
-  in Round 95 as a bounded, `http.go`-sized JS-shape adapter over Go's
-  already-working HTTP/2 transport, not attempted yet. No AWS
-  credentials were ever available to attempt a real end-to-end call
-  regardless. Last touched Round 100.
+  internals - not yet isolated to a specific function. **Round 101
+  root-caused and fixed the hang completely**: four real bugs -
+  `emitter.go`'s native `pipe()` couldn't find a class-based Writable
+  destination's own `write()`/`end()` (looked up via `GetOwn`,
+  instance-only, instead of `Get`, which walks the prototype chain);
+  `Writable.write()` emitted `"data"` directly instead of calling the
+  subclass's own `_write()` override (real `@smithy/node-http-handler`'s
+  own `Collector` class depends on exactly that); `IncomingMessage`
+  emitted a plain string for response body chunks instead of a real
+  Buffer (real code does `Buffer.concat()` on collected chunks, silently
+  producing zero bytes for a string); and a real listener-attachment
+  race - a background goroutine scheduled every `"data"`/`"end"` emit
+  the instant bytes arrived, regardless of whether anything had
+  attached a listener yet, so real code (several `await`-separated
+  middleware layers away from receiving the response) lost the data
+  entirely rather than merely waiting for it, fixed with a small
+  Go-side buffer flushed once a real listener attaches. All four
+  verified against a real local HTTP server and the real
+  `bedrock-runtime.us-east-1.amazonaws.com` endpoint. With all four
+  fixed, the exact real request/response round trip (construction,
+  schema serialization, real SigV4 signing, real HTTP dispatch, real
+  response reading) now works end to end, matching real Node all the
+  way to a real 403 response body - reaching one final, cleanly-isolated
+  upstream bug: `Object.setPrototypeOf` rejects every typed-array-family
+  value as "non-object", filed as
+  [paserati#418](https://github.com/nooga/paserati/issues/418) - not
+  noderati's to fix. A full `NodeHttp2Handler` (Bedrock's real default,
+  no-env-var path) is scoped in Round 95 as a bounded, `http.go`-sized
+  JS-shape adapter over Go's already-working HTTP/2 transport, not
+  attempted yet. No AWS credentials were ever available to attempt a
+  real end-to-end call regardless. Last touched Round 101.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -11958,3 +11983,164 @@ endpoint. The remaining hang is real, reproducible, and now narrowed to
 dispatched request or a settled response" - not yet isolated to a
 specific function or file. Full suite/vet/scoreboard clean after all
 three fixes, no regressions.
+
+## Round 101: the hang, root-caused and fixed - three real noderati
+stream/http bugs; a real end-to-end round trip against real AWS
+Bedrock, up to a genuine, cleanly-isolated paserati bug (filed as
+#418) at the very last step
+
+Picked back up the hang from Round 100 with a properly isolated
+debugging setup (a full, symlink-free `cp -RL` copy of the real
+`node_modules` tree, this session's own scratchpad directory - never
+touching the real global install, unlike Round 100's own accidental
+symlink mistake). Every instrumentation edit this round went into that
+one, genuinely independent copy.
+
+**Bisected the real code path first - two "dead ends" from Round 100
+were this investigation's own wrong guesses, not noderati bugs.**
+`@smithy/core/dist-cjs/index.js` (the file with Round 99's own
+`OpLoadSpill` bug) turned out to have its *own*, separate, inlined
+copies of `httpAuthSchemeMiddleware`/`httpSigningMiddleware` -
+completely different code from the same-named functions in
+`middleware-http-auth-scheme/httpAuthSchemeMiddleware.js`/
+`middleware-http-signing/httpSigningMiddleware.js` that Round 100
+checkpoint-instrumented and found never entered. Confirmed directly:
+`require("@smithy/core")` (a bare import, matching how
+`runtimeConfig.js` actually imports these) resolves to `dist-cjs/
+index.js`, and that file's own inlined copies *are* what actually run,
+under real Node and noderati alike - Round 100's dead end was
+instrumenting unused files, not a real noderati gap. Checkpoint-
+instrumenting the *real* code path traced a clean, complete, real chain
+all the way through: auth-scheme resolution -> real `AwsSdkSigV4Signer`
+signing (`@aws-sdk/core/dist-cjs/submodules/httpAuthSchemes/index.js`)
+-> the terminal `requestHandler.handle(...)` call
+(`@smithy/core/dist-cjs/submodules/client/index.js`) -> back up through
+`schemaDeserializationMiddleware`'s own real protocol deserialization
+(`@aws-sdk/core`'s `AwsRestJsonProtocol.deserializeResponse` calling
+`@smithy/core`'s base `HttpBindingProtocol.deserializeResponse`) - down
+to the exact real line that hangs: `collectBody(response.body,
+context)`, which delegates to real `@smithy/node-http-handler`'s own
+`streamCollector`, doing `stream.pipe(collector)` on the real HTTP
+response.
+
+**Bug 1: `pipe()` couldn't find a class-based destination's own
+`write()`/`end()`.** `emitter.go`'s native `pipe()` implementation
+looked up the destination's `write`/`end` via `GetOwn` (own-properties
+only). Real `streamCollector`'s own `Collector` class extends
+`Writable`, putting `write`/`end` on `Writable.prototype` - ordinary
+class methods, not own instance properties - so `GetOwn` silently found
+neither. Isolated to a clean, minimal, non-AWS-specific repro: piping a
+real local HTTPS response into `class Collector extends Writable {
+_write(...) {...} }` never fired `"finish"` at all. Fixed by using
+`Get` (`object.go`), which walks the prototype chain like a real
+property access does.
+
+**Bug 2, found immediately after fixing (1): `Writable.write()` never
+called the subclass's own `_write()` override.** With `pipe()` finding
+`write`/`end` correctly, the destination's `"finish"` now fired, but
+with zero bytes collected - `stream.go`'s base `Writable.write(chunk)`
+did `this.emit("data", chunk)` directly instead of calling `_write()`,
+which is wrong on two counts: real Node's `Writable` never emits
+`"data"` at all (that's `Readable`-only), and it meant every real
+subclass's own `_write()` override (real `Collector`'s own
+`this.bufferedBytes.push(chunk)`) never ran. Fixed to match `Duplex`'s
+own already-correct `write()`/`end()` (this same file) - a plain
+`Writable` is exactly that same writable half, without a readable side.
+Confirmed directly, not assumed, that real Node's own default
+(unoverridden) `_write()` throws `ERR_METHOD_NOT_IMPLEMENTED` rather
+than silently succeeding, for both `Writable` and `Duplex` - matched
+that too. Three pre-existing tests turned out to be built on the same
+now-invalidated premise (piping into a bare `new Writable()`, or
+overriding `write()` instead of `_write()`) - confirmed each one
+*already* threw the identical real error under real Node, before
+touching anything, and corrected all three to the real, valid shape.
+
+**Bug 3, found testing (2) against a real HTTP response instead of a
+synthetic string: `IncomingMessage` emitted a plain JS string for
+`"data"`, not a real Buffer.** Real Node's response body chunks are
+real `Buffer`s by default (a string only once `setEncoding()` has been
+called) - `http.go` always built a JS string instead. Real
+`streamCollector` does `Buffer.concat(this.bufferedBytes)` on the
+collected chunks - concatenating a string produces a silent,
+zero-length result, not a thrown error, so this failed quietly rather
+than loudly. Fixed with the existing `wrapBuffer` helper (already
+defensively copies its input, so reusing the same read buffer across
+loop iterations in `pumpHTTPResponseBody` stays safe).
+
+**Bug 4, the actual hang itself: a real listener-attachment race with
+no data loss safety net.** With (1)-(3) fixed, piping a *synchronously*
+-attached destination worked - but the real SDK flow still hung, since
+`streamCollector`'s own `.pipe()` call happens only after several
+`await`-separated middleware layers, not immediately upon receiving the
+response. `pumpHTTPResponseBody` reads and schedules every `"data"`/
+`"end"` emit on a background goroutine the instant bytes arrive,
+regardless of whether anything has attached a `"data"` listener yet -
+and `emit()` with zero listeners is correctly a no-op per the
+EventEmitter contract, meaning the data was *gone*, not merely
+deferred, the moment enough microtask hops separated "response
+received" from "somebody actually reads it." Real Node's own `Readable`
+is paused by default specifically to avoid this - it buffers internally
+until a real consumer attaches. Confirmed the exact mechanism with a
+minimal, non-AWS-specific repro: inserting only two
+`await Promise.resolve()` calls between receiving a response and
+calling `.pipe()` on it was enough to reproduce the identical stuck
+promise, which real Node completes correctly every time regardless of
+how many hops separate the two. Fixed with `pendingStreamData`, a small
+internal buffer (Go-side, via `PlainObject`'s existing `InternalSlots`
+mechanism) attached to every `newReadableStream` object:
+`scheduleEmit` now buffers `"data"`/`"end"` for these objects instead
+of firing immediately unless a `"data"` listener already exists, and
+`addListener` flushes any buffered chunks the moment a `"data"`
+listener (including the one `pipe()` itself registers) attaches late.
+This is the actual hang Round 100 left open - fully root-caused and
+fixed.
+
+**Verification**: every fix checked against a real HTTP response (a
+real local test server for the unit tests, the real, actual
+`bedrock-runtime.us-east-1.amazonaws.com` endpoint for the isolation
+repros) - not synthetic stand-ins. New tests:
+`TestHTTPResponseDataIsRealBuffer`,
+`TestHTTPResponsePipesIntoWritableSubclass`,
+`TestStreamWritableDefaultWriteThrows`; three pre-existing tests
+(`TestStreamTransformPipesToDest`, `TestStreamPipelinePromises`,
+`TestStreamPipelineCallback`) corrected to real, valid shapes. Full
+suite/vet/scoreboard clean; the one, pre-existing, order-dependent
+flake seen once during this round (`TestURLSearchParamsIteration`,
+unrelated to any of this round's own changes) did not reproduce across
+25 further runs and is noted, not chased further this round.
+
+**The real end-to-end result: a genuine, complete, real request/
+response round trip against real AWS Bedrock, matching real Node all
+the way to a real 403 response body.** With all four bugs fixed, the
+exact same probe that started this investigation now reaches
+`streamCollector`'s own `"finish"` event with the real response body
+collected - the *entire* real chain (construction, schema-based
+serialization, real SigV4 signing via real `crypto.createHmac`/
+`crypto.getRandomValues`, real HTTP/1.1 dispatch and response reading,
+real protocol-level error deserialization) now genuinely works,
+matching real Node's own real network round trip to the real endpoint.
+
+**The one remaining step, and it's paserati's, not noderati's:**
+deserializing the real 403 response body into a proper
+`UnrecognizedClientException` calls `Uint8ArrayBlobAdapter.mutate()`
+(real `@smithy/core` code), which does `Object.setPrototypeOf(source,
+...)` on the real `Uint8Array` `streamCollector` just produced.
+Confirmed directly, isolated to a clean, minimal, paserati-only repro
+(no noderati involved at all): `Object.setPrototypeOf` throws
+`"called on non-object"` for *any* typed-array-family value
+(`Uint8Array`, `Int32Array`, `Float64Array`, `DataView`,
+`ArrayBuffer`), even though the exact same value passes `typeof`/
+`instanceof` checks correctly - a real, clean, general paserati engine
+bug, not a noderati one. Filed as
+[paserati#418](https://github.com/nooga/paserati/issues/418).
+
+**Status**: the actual hang this whole chain (rounds 94-101) has been
+chasing is real, was genuinely three separate noderati bugs plus one
+race condition, all now fixed and verified against real Node and a
+real remote endpoint. The dependency graph now reaches all the way to
+a real HTTP round trip's real response body, blocked on exactly one
+remaining, cleanly-isolated, upstream paserati bug - not noderati's to
+fix. Once `paserati#418` lands, this same probe should very plausibly
+complete an entire real AWS Bedrock request/response cycle end to end
+(modulo real AWS credentials, still not available in this
+environment).
