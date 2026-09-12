@@ -194,13 +194,27 @@ in each item's own round rather than in this ledger's four letter groups:
   `for (const [key, value] of new URLSearchParams(search))` at a real
   serialization call site) - worked around `ModuleBuilder.Class`'s
   per-instance-only method binding using `vm.GetThis()`, no paserati
-  changes needed. `client.send()` now reaches a new, not-yet-isolated
-  failure inside real schema-based request serialization - left open for
-  a following round. A full `NodeHttp2Handler` (Bedrock's real default,
-  no-env-var path) is scoped in Round 95 as a bounded, `http.go`-sized
-  JS-shape adapter over Go's already-working HTTP/2 transport, not
-  attempted yet. No AWS credentials were ever available to attempt a
-  real end-to-end call regardless. Last touched Round 99.
+  changes needed. Round 100 (isolated the earlier failure precisely: not
+  serialization at all, but `retryMiddleware`'s own real invocation-id
+  UUID generation) found and fixed two more real, noderati-side crypto
+  gaps - `crypto.getRandomValues` and `crypto.createHmac` were both
+  entirely missing, the latter load-bearing for real
+  `@smithy/signature-v4`'s own SigV4 key-derivation chain - plus a real,
+  silent, pre-existing correctness bug in `createHash`'s own
+  `.update()`/`.digest()` byte handling, caught building `createHmac`
+  (a `Uint8Array` argument or a no-encoding `.digest()` result both
+  silently corrupted any byte `>= 0x80`, exactly the shape SigV4's own
+  HMAC chaining hits). All three verified byte-for-byte against real
+  Node. Ruled out noderati's own HTTP transport directly against the
+  real Bedrock endpoint (a real GET and a real POST-with-body-and-auth-
+  header both matched real Node's real response exactly) before chasing
+  a genuine remaining hang inside the SDK's own signing/dispatch
+  internals - not yet isolated to a specific function. A full
+  `NodeHttp2Handler` (Bedrock's real default, no-env-var path) is scoped
+  in Round 95 as a bounded, `http.go`-sized JS-shape adapter over Go's
+  already-working HTTP/2 transport, not attempted yet. No AWS
+  credentials were ever available to attempt a real end-to-end call
+  regardless. Last touched Round 100.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -11828,3 +11842,119 @@ blocker is inside real schema-based request serialization, not yet
 isolated. No AWS credentials were ever available in this environment to
 attempt a real end-to-end call regardless of how far the request-
 building path itself gets.
+
+## Round 100: two more real, verified crypto gaps found and fixed
+(`crypto.getRandomValues`/`crypto.createHmac`, plus a silent
+pre-existing digest-correctness bug caught building them); real network
+transport confirmed innocent; a genuine hang isolated to an
+unidentified point inside real request signing/dispatch, not yet found
+
+Picked back up Round 99's open item (the failure past
+`URLSearchParams`, inside schema-based serialization) using a properly
+isolated debugging setup this time - a full, symlink-free `cp -RL` copy
+of the real `node_modules` tree under this session's own scratchpad
+directory, never touching the real global install again.
+
+**Bisected the "undefined is not a function" precisely: it wasn't
+serialization at all.** Checkpoint-instrumenting `serializeRequest`
+(the same technique used throughout this investigation) showed it
+completes fully and returns - the real crash was one level up, inside
+the middleware chain's own `next()` continuation after serialization,
+not inside serialization itself. Bisecting the middleware chain
+(`contentLengthMiddleware` -> `userAgentMiddleware` ->
+`hostHeaderMiddleware` -> `recursionDetectionMiddleware` ->
+`retryMiddleware`) found it precisely: `retryMiddleware`'s own
+`request.headers[INVOCATION_ID_HEADER] = serde.v4();` - a real,
+unconditional UUID generation for every request's invocation-id header.
+
+**Bug found and fixed: `crypto.getRandomValues` didn't exist at all.**
+Real `@smithy/core`'s own `dist-cjs/submodules/serde/index.js` does
+`const _getRandomValues = node_crypto.getRandomValues;` at module top
+level to seed UUID v4 generation - `serde.v4()` is built on it directly.
+Added, backed by `crypto/rand`, filling the passed typed array in place
+and returning the same reference, matching real Node's actual contract
+(verified: same reference, non-zero bytes, different bytes each call).
+
+**Continuing past that fix reached `retryMiddleware`'s real signing
+attempt, and a second bug: `crypto.createHmac` didn't exist either.**
+The next failure's full stack trace (`reset` -> `Hash` -> `hmac` ->
+`getSigningKey` -> `signRequest`) pointed straight at real
+`@smithy/signature-v4`'s own SigV4 key-derivation chain
+(`getSigningKey` iteratively HMACs `"AWS4"+secret` -> date -> region ->
+service -> `"aws4_request"`), built entirely on `crypto.createHmac`.
+Added, backed by `crypto/hmac`, reusing the existing `hashHasher`
+wrapper (Go's `hmac.New` returns the same `hash.Hash` interface a plain
+hash does, so no new wrapper type was needed).
+
+**A third, real, silent, pre-existing correctness bug found building
+(2), not just a missing-function gap: hash/hmac digests were
+byte-corrupting.** Two separate issues in the existing (round-unknown,
+long-predating this investigation) `createHash` implementation, caught
+by testing the exact real SigV4 chaining shape rather than a synthetic
+one: (a) `.update()` took a plain Go `string` parameter, so a
+`Uint8Array` argument (real signature-v4 code always calls `.update()`
+with a real `Uint8Array`, never a plain string) went through generic
+value-to-Go-string conversion instead of real byte extraction -
+confirmed directly by hashing the same 4 bytes (`0xFF 0x80 0x01 0x02`)
+via a `Uint8Array` and getting a completely different hex digest than
+real Node's; (b) `.digest()` with no encoding argument returned a Go
+string of raw byte values reinterpreted as JS UTF-16 code units, not a
+real Buffer - silently corrupting any byte `>= 0x80` the instant it was
+reused as the next HMAC round's own key, exactly the pattern SigV4's
+own chaining depends on. Both fixed: `Update` now takes a `vm.Value`
+and extracts real bytes via `valueToBytes` (`net.go`); `Digest` returns
+a real Buffer when no encoding is given. Verified against real Node
+byte-for-byte for every case, including the exact
+chained-HMAC-with-a-prior-digest-as-key shape SigV4 actually uses - not
+just a plain single HMAC call, which would have missed bug (b)
+entirely. Four new tests:
+`TestCryptoGetRandomValues`/`TestCryptoCreateHmac`/
+`TestCryptoDigestNoEncodingReturnsBuffer`/
+`TestCryptoUpdateWithHighByteUint8Array`.
+
+**Real network transport confirmed innocent, via direct testing against
+the real endpoint.** With both crypto gaps fixed, `client.send()`
+progressed further, then hung - `PS4001 [ERROR]: Top-level await:
+promise remains pending with no microtasks to process`, a genuine stuck
+promise, not a thrown exception. Before chasing this inside the SDK's
+own considerable internals, ruled out noderati's own HTTP transport
+directly: a bare `https.request()` GET to the real
+`bedrock-runtime.us-east-1.amazonaws.com` endpoint got a real `404`
+matching real Node exactly; a bare POST with a real JSON body and a
+real (dummy) SigV4-shaped `Authorization` header to the real
+Converse endpoint got a real `403` with the exact same AWS error body
+as real Node, byte-for-byte. `http.go`'s own transport genuinely
+handles GET, POST-with-body, and custom headers correctly against a
+real remote HTTPS endpoint over the real internet (not just the local
+Go test server prior rounds' own http.go verification used) - the hang
+is not there.
+
+**The hang itself, not yet isolated.** Checkpoint-instrumenting the two
+most obvious candidates - `@smithy/core`'s own generic
+`middleware-http-auth-scheme/httpAuthSchemeMiddleware.js` and
+`middleware-http-signing/httpSigningMiddleware.js` (and their own
+plugin factories' `applyToStack` methods) - found neither one is ever
+even *entered*, under real Node **or** noderati. This ruled those two
+files out as the actual code path, for both engines - not a noderati-
+specific gap at all, just this investigation's own wrong guess about
+which generic `@smithy/core` middleware actually performs Bedrock's
+real signing (some other, not-yet-identified mechanism - most likely
+Bedrock-specific code in `@aws-sdk/core/dist-cjs/submodules/
+httpAuthSchemes/index.js`, given the earlier crash's own stack trace
+named `signRequest`/`getSigningKey` directly, not a generic
+middleware wrapper). Left open for a following round: find where
+Bedrock's *actual* signing/dispatch call happens, then find what's
+different about it under noderati that causes the promise to never
+settle either way.
+
+**Status**: three more real, verified fixes landed this round
+(`getRandomValues`, `createHmac`, and a silent existing
+correctness bug in `createHash`'s `.update()`/`.digest()` byte
+handling) - all confirmed byte-for-byte against real Node, including
+the actual SigV4 key-derivation shape. Real network transport is
+confirmed innocent via direct testing against the real Bedrock
+endpoint. The remaining hang is real, reproducible, and now narrowed to
+"somewhere between retryMiddleware's `next()` call and either a
+dispatched request or a settled response" - not yet isolated to a
+specific function or file. Full suite/vet/scoreboard clean after all
+three fixes, no regressions.
