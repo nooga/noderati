@@ -396,7 +396,19 @@ func pumpHTTPResponseBody(vmInst *vm.VM, resp *http.Response, stream *vm.PlainOb
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			scheduleEmit(vmInst, stream, "data", vm.NewString(string(buf[:n])))
+			// Real Node's IncomingMessage emits real Buffers by
+			// default (only a string once setEncoding() has been
+			// called) - this used to always emit a plain JS string,
+			// found wrong the hard way chasing the real Bedrock
+			// investigation (docs/real-node-plan.md, round 101): real
+			// @smithy/node-http-handler's own streamCollector collects
+			// chunks into an array and does Buffer.concat(chunks) on
+			// it - concatenating a string produces zero bytes, not a
+			// thrown error, so the response body silently came back
+			// empty rather than failing loudly. wrapBuffer defensively
+			// copies buf[:n] into a fresh ArrayBuffer, so reusing buf
+			// across loop iterations is safe.
+			scheduleEmit(vmInst, stream, "data", wrapBuffer(vmInst, buf[:n]))
 		}
 		if err != nil {
 			if err != io.EOF {

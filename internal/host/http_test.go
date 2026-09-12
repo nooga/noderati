@@ -251,3 +251,103 @@ func TestHTTPSocketConnectEventFires(t *testing.T) {
 		t.Errorf("socket 'connect' event never fired")
 	}
 }
+
+// TestHTTPResponseDataIsRealBuffer guards a real deviation from Node
+// found chasing the Bedrock investigation (docs/real-node-plan.md,
+// round 101): real Node's IncomingMessage emits real Buffers by
+// default (only a string once setEncoding() has been called) - this
+// used to always emit a plain JS string instead. Real
+// @smithy/node-http-handler's own streamCollector collects "data"
+// chunks into an array and does Buffer.concat(chunks) on it -
+// concatenating a string produces zero bytes, not a thrown error, so a
+// response body silently came back empty rather than failing loudly.
+func TestHTTPResponseDataIsRealBuffer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hello")
+	}))
+	defer srv.Close()
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { request } from "node:http";
+		const url = new URL(`+"`"+srv.URL+"`"+`);
+		let result;
+		await new Promise((resolve, reject) => {
+			const req = request({ hostname: url.hostname, port: url.port, path: "/", method: "GET" }, (res) => {
+				const chunks = [];
+				res.on("data", (c) => chunks.push(c));
+				res.on("end", () => {
+					result = JSON.stringify({
+						isBuffer: Buffer.isBuffer(chunks[0]),
+						concatenated: Buffer.concat(chunks).toString("utf8"),
+					});
+					resolve();
+				});
+			});
+			req.on("error", reject);
+			req.end();
+		});
+		result
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"isBuffer":true,"concatenated":"hello"}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestHTTPResponsePipesIntoWritableSubclass guards a real bug found the
+// same round: emitter.go's own pipe() looked up a destination's
+// write()/end() methods via GetOwn (instance-only properties), but a
+// real class-based Writable (e.g. real @smithy/node-http-handler's own
+// streamCollector, which does exactly `class Collector extends
+// Writable { _write(...) {...} }` then `stream.pipe(collector)` to
+// read a real HTTP response body) has write()/end() on its
+// *prototype*, not as own instance properties - GetOwn silently found
+// neither, so piping a real response into any class-based Writable
+// wrote nothing and never called end(), hanging whatever awaited the
+// destination's own "finish" event forever.
+func TestHTTPResponsePipesIntoWritableSubclass(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "piped-body")
+	}))
+	defer srv.Close()
+
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { request } from "node:http";
+		import { Writable } from "node:stream";
+		class Collector extends Writable {
+			chunks = [];
+			_write(chunk, _encoding, callback) {
+				this.chunks.push(chunk);
+				callback();
+			}
+		}
+		const url = new URL(`+"`"+srv.URL+"`"+`);
+		let result;
+		await new Promise((resolve, reject) => {
+			const req = request({ hostname: url.hostname, port: url.port, path: "/", method: "GET" }, (res) => {
+				const collector = new Collector();
+				res.pipe(collector);
+				collector.on("finish", () => {
+					result = Buffer.concat(collector.chunks).toString("utf8");
+					resolve();
+				});
+			});
+			req.on("error", reject);
+			req.end();
+		});
+		result
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "piped-body" {
+		t.Errorf("got %q, want %q", val.ToString(), "piped-body")
+	}
+}
