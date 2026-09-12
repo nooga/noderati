@@ -11828,3 +11828,153 @@ blocker is inside real schema-based request serialization, not yet
 isolated. No AWS credentials were ever available in this environment to
 attempt a real end-to-end call regardless of how far the request-
 building path itself gets.
+
+## Round 100: `http.createServer` implemented and verified against real,
+unmodified Connect; Koa blocked on a new, separate `Error.prepareStackTrace`/
+`CallSite` engine gap
+
+A different kind of probe this round: not chasing Bedrock further, but
+checking whether this project could host a real server-side npm
+framework at all. It couldn't - `http.createServer`/`net.createServer`
+didn't exist (real Node's own `createServer` was a `_notImplemented`
+stub on `node:http2`, and `node:net`/`node:http` were both client-only,
+by deliberate, documented design - see `http.go`'s and `net.go`'s own
+top-of-file comments). Implemented the `http.createServer` half only
+(`internal/host/http_server.go`), leaving `net.createServer` for a
+future round - same asymmetry the client side already has (http.go on
+`net/http.Client`, net.go on raw `net.Dial`), and Connect/Koa's own
+`app.listen()` only ever needs the `http` half.
+
+**Architecture: `http.createServer` on Go's own `net/http.Server`, not
+on a hand-rolled parser over a future `net.Server`** - the exact mirror
+of http.go's own documented client-side decision, for the same reason
+(Go's stdlib already gets HTTP/1.1 framing right; re-parsing it by hand
+over raw sockets would just reintroduce the same class of bugs). A
+background goroutine per request (spawned by Go's own
+`net/http.Server.Serve`) blocks draining a buffered write-item channel
+until the JS side calls `res.end()` - mirroring `doHTTPRequest`'s own
+`bodyCh` pattern (`http.go`) in reverse, for the identical reason: a
+native `write()`/`end()` call must never block the VM's own thread on
+network I/O it doesn't control the pace of. `res.headersSent`/
+`writableEnded`/`finished` all flip synchronously, on the VM thread,
+inside whichever of `writeHead`/`write`/`end`/`flushHeaders` triggers
+the transition first - matching real Node's own contract (`headersSent`
+becomes true the instant `_storeHeader` runs, not once bytes actually
+reach the OS socket) and specifically needed because Koa's own
+`respond()` (`lib/application.js`) checks `res.headersSent`
+synchronously between successive calls, never waiting on whatever the
+background goroutine happens to have flushed yet.
+
+**A real, load-bearing VM API gap found and worked around while wiring
+this up, not hypothetical: `vm.Value.AsArray()`/`.AsPlainObject()`
+panic outright on a type mismatch, unlike `.AsTypedArray()`'s own
+nil-safe check.** First version of `setHeader(name, value)` (and
+`writeHead`'s own header-object branch) did `if arr :=
+args[1].AsArray(); arr != nil { ... }`, copying a pattern seen
+elsewhere in this codebase - and crashed the whole VM
+(`[VM PANIC] recovered: value is not an array`) the moment a real
+request handler called `res.setHeader("X-Test", "yes")`, a plain
+string, the overwhelmingly common case. Confirmed directly by reading
+`AsArray`/`AsPlainObject` in paserati's own `pkg/vm/value.go`: both
+panic unconditionally unless the value's type exactly matches
+(`TypeArray`/`TypeObject`), while `AsTypedArray` (the accessor
+`valueToBytes` in `net.go` already relies on) returns `nil` safely
+instead - two different contracts on visually similar-looking methods,
+easy to conflate. Fixed by checking `.IsArray()` (a real, existing
+predicate) before ever calling `.AsArray()`, factored into one
+`headerValuesFromValue` helper shared by `setHeader`/`writeHead`/
+`appendHeader`'s array-vs-string branch, and `.Type() == vm.TypeObject`
+before `.AsPlainObject()` in `Server.listen()`'s options-object
+overload. Left as a note here rather than filed against paserati:
+whether this asymmetry across `As*` accessors is itself a paserati API
+inconsistency worth raising is paserati's own call, not investigated
+further this round.
+
+**Verified against real, unmodified `connect@3` end to end**: a plain
+`app.listen(port)` Connect app (real middleware chain, `res.setHeader`/
+`res.end`, a 404 fallback) now serves real HTTP responses over a real
+loopback TCP connection, curl'd directly against the running
+`noderati` process - see `examples/compat/connect-server.cjs`. Hit and
+fixed one more real gap surfaced only by Connect's own code, not
+anything in this round's own new tests: `index.js`'s `use()`
+unconditionally runs `handle instanceof http.Server` against every
+middleware function it's given - `http.Server` didn't exist as any kind
+of value at all, so this threw ("Right-hand side of 'instanceof' is not
+an object") on the very first `app.use(...)` call, not just evaluated
+false. Fixed by exporting a nominal `class Server {}` marker from the
+`http` shim - real Connect only ever runs this check against a plain
+function in every call site surveyed, never against an actual server
+object, so a class that exists without appearing in
+`createServer()`'s own returned object's prototype chain is enough;
+full prototype wiring between the two was not attempted.
+
+**Koa blocked on a different, separate engine gap, not this round's own
+work: `Error.prepareStackTrace` is never actually consulted at all.** A
+plain `new Koa()` app (`examples/compat/koa-server.mjs`) fails at
+module load, before any server code of this round's own ever runs:
+Koa's own `lib/application.js` calls `require('depd')('koa')` at the
+top level, and `depd`'s `callSiteLocation()` (`node_modules/depd/
+index.js`) calls `callSite.getFileName()` on what it expects to be a
+`CallSite` object from a `prepareObjectStackTrace`-style
+`Error.prepareStackTrace` override - `TypeError: undefined is not a
+function`. First write of this entry guessed the `CallSite` objects
+existed but were missing methods; checked directly instead of assumed,
+per this doc's own standard, with a minimal probe:
+`Error.prepareStackTrace = (e, s) => s; const o = {};
+Error.captureStackTrace(o); typeof o.stack` - real Node gives `"object"`
+(an array of real `CallSite`s); this prints `"string"` (length 30,
+`Array.isArray` false). `Error.prepareStackTrace` is never invoked at
+all - `.stack` is always the plain formatted string, regardless of
+whether a custom `prepareStackTrace` was assigned - so `depd`'s
+`stack[1]` is a single character, not a `CallSite`, and
+`.getFileName` is undefined on that for an entirely different reason
+than first guessed. This is a paserati engine gap (`Error.
+prepareStackTrace` support, not just individual `CallSite` methods),
+squarely outside this round's own scope (`http.createServer`) and this
+project's own division of labor for engine-level work - noted here, not
+fixed, and not yet filed as a paserati issue.
+
+**A second, separate blocker found by review, not by running the demo
+further: a long-lived `http.createServer` exposes a pre-existing
+signal-handling gap that nothing before this round could reach.**
+`startSignalBridge` (`signals.go`) calls `signal.Notify(ch, sigs...)`
+unconditionally at startup for SIGINT/SIGTERM/etc., which - as
+`signal.Notify` always does - replaces Go's own default
+terminate-the-process behavior for those signals with "forward to a
+channel", and that channel's only consumer schedules a `process.emit()`
+call; nothing calls `process.exit()` on the caller's behalf if no
+listener is registered, unlike real Node's own default action for most
+signals (terminate the process when unhandled). Before this round,
+nothing held `BeginExternalOp()` open indefinitely, so a script always
+finished on its own before this gap was reachable in practice.
+Confirmed directly: `kill -INT` against a running
+`compat/connect-server.cjs` process leaves it running - and so does
+`kill -QUIT` (SIGQUIT is bridged the same way, so Ctrl-\\ doesn't work
+either; every signal `startSignalBridge` bridges shares this gap).
+Filed here as a real, newly-load-bearing gap in `signals.go`, not fixed
+as part of this round - out of this round's own scope, but anyone
+trying this round's own demo needs `kill -9` (SIGKILL, the one signal
+this project never bridges - see `startSignalBridge`'s own comment), not
+Ctrl-C, to actually stop it.
+
+**Known, deliberate simplifications, each real but minor**:
+`res.statusMessage` is stored and readable JS-side but never reaches the
+wire (Go's `http.ResponseWriter.WriteHeader` takes only a numeric code,
+no reason phrase - Koa's own `statuses.message[code]` assignment to it
+is cosmetic here, not broken); `getHeaders()` joins a multi-value header
+into one `", "`-separated string rather than returning an array like
+real Node does (matters for reading back `Set-Cookie`, not exercised by
+Connect or Koa's own default paths); header names go out however Go's
+`net/http` canonicalizes them (`Content-Type`), not verbatim as set.
+
+**Status**: `http.createServer` is real and verified against a real,
+unmodified npm framework (Connect) end to end, including its own
+streaming-response and request-body-streaming guarantees (new tests:
+`TestHTTPServerBasicGET`, `TestHTTPServerRequestShape`,
+`TestHTTPServerPOSTBody`, `TestHTTPServerWritesIncrementally`, all in
+the new `internal/host/http_server_test.go`). `net.createServer` is
+still unimplemented - not needed for this round's own target, but the
+next natural step if a future consumer needs a raw TCP server rather
+than an HTTP one. Koa itself is blocked on the separate
+`Error.prepareStackTrace`/`CallSite` gap described above, not on
+anything this round built.
