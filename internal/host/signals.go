@@ -155,7 +155,7 @@ func simpleNodeError(vmInst *vm.VM, code, message string) error {
 //
 // Bridging a signal is gated on JS actually listening for it - the fix for
 // a real, user-visible bug found empirically (docs/real-node-plan.md,
-// Round 100/101): the previous version called signal.Notify for every
+// Round 102/103): the previous version called signal.Notify for every
 // bridgeable signal unconditionally at startup, which - as signal.Notify
 // always does - replaces the OS's own default disposition (terminate the
 // process, for SIGINT/SIGTERM/SIGHUP/SIGQUIT) with "relay to this

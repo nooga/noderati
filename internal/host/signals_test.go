@@ -7,7 +7,7 @@ import (
 )
 
 // TestSignalBridgeActivatesOnListenerAndReactivates guards the fix for a
-// real, user-visible bug (docs/real-node-plan.md, Round 100/101):
+// real, user-visible bug (docs/real-node-plan.md, Round 102/103):
 // startSignalBridge used to call signal.Notify for every bridgeable signal
 // unconditionally at startup, overriding the OS's own default disposition
 // (e.g. SIGINT's default terminate) even when nothing in JS was listening
@@ -24,7 +24,7 @@ import (
 // were somehow still (or no longer) wired correctly. Verifying the
 // SIGINT/SIGTERM default-terminates-when-unhandled half specifically was
 // done by hand against the compiled binary in a real subprocess (see the
-// Round 100/101 doc entry) rather than here, for exactly that reason.
+// Round 102/103 doc entry) rather than here, for exactly that reason.
 func TestSignalBridgeActivatesOnListenerAndReactivates(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
