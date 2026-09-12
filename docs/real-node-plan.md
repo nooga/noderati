@@ -174,19 +174,22 @@ in each item's own round rather than in this ledger's four letter groups:
   `"module"`-field-over-`"main"` preference dating to this resolver's
   very first commit, and `require()` of a `.json` file executing its
   raw text as JS instead of parsing it as JSON - both pre-dating this
-  whole Bedrock investigation. The dependency graph now reaches a
-  single, cleanly-identified upstream gap:
-  [paserati#413](https://github.com/nooga/paserati/issues/413),
-  `TransformStream`/`WritableStream` not existing at all (unlike the
-  already-implemented `ReadableStream`, paserati#205) - real,
-  unconditional real-code needs (`@aws-sdk/middleware-websocket`'s own
-  `class X extends TransformStream`, `@smithy/core`'s real checksum-
-  stream code). Not noderati's to fix. A full `NodeHttp2Handler`
-  (Bedrock's real default, no-env-var path) is scoped in Round 95 as a
-  bounded, `http.go`-sized JS-shape adapter over Go's already-working
-  HTTP/2 transport, not attempted yet. No AWS credentials were ever
-  available to attempt a real end-to-end call regardless. Last touched
-  Round 97.
+  whole Bedrock investigation. `paserati#413`
+  (`TransformStream`/`WritableStream`) merged same-day as PR #415 -
+  Round 98 confirmed it fixed, found and fixed one more real noderati
+  `fs` gap (`fs.promises` didn't exist - real code destructures it off
+  `require('fs')` directly), and reached a *new* upstream engine panic:
+  [paserati#416](https://github.com/nooga/paserati/issues/416),
+  `OpLoadSpill: invalid spill slot index 0` compiling `@smithy/core`'s
+  real `class X extends builder.build() {}` command-class pattern (used
+  ~90 times, once per Bedrock API operation) - isolated to an 8-line
+  repro, possibly the same underlying class of bug `#406` was, just not
+  covered by that fix's own scope. Not noderati's to fix. A full
+  `NodeHttp2Handler` (Bedrock's real default, no-env-var path) is scoped
+  in Round 95 as a bounded, `http.go`-sized JS-shape adapter over Go's
+  already-working HTTP/2 transport, not attempted yet. No AWS
+  credentials were ever available to attempt a real end-to-end call
+  regardless. Last touched Round 98.
 - **Native `.node` addon loading** - unexplored; blocks real OS clipboard
   support (`@mariozechner/clipboard`). No paserati issue filed. Round 67.
 - **Concurrent-VM thread-safety** - a `go test -race`-shaped gap in
@@ -11621,3 +11624,88 @@ upstream paserati gap (`TransformStream`/`WritableStream`, filed as
 #413) rather than a noderati-side bug - the cleanest state this
 investigation has been in yet. Updated the top-of-file Bedrock ledger
 bullet to match.
+
+## Round 98: paserati#413 merged (PR #415, alongside #414 it surfaced) -
+one more real noderati `fs` gap found and fixed; a second, distinct
+class-declaration engine bug found and filed (paserati#416)
+
+paserati#413 was picked up and merged same-day, as PR #415 - alongside
+a second fix, #414 (a register-directory leak in exception-absorption
+paths that #413's own test writing surfaced). Reset local `paserati`
+onto the merged `origin/main` (local commits and the merged commit had
+identical trees, just different SHAs from the PR's own history - a
+plain `git reset --hard origin/main`, not a merge) and picked the
+Bedrock chase back up.
+
+**Confirmed `TransformStream`/`WritableStream` really do exist now** -
+`typeof TransformStream`/`typeof WritableStream` are both `"function"`,
+and the natural, no-workaround `import { BedrockRuntimeClient,
+ConverseCommand } from '@aws-sdk/client-bedrock-runtime'` probe gets
+past the `middleware-websocket` class declaration that used to throw
+immediately.
+
+**One more real, noderati-side `fs` gap found and fixed: `fs.promises`
+didn't exist.** The probe's next failure was `TypeError: Cannot
+destructure 'undefined'` - `@aws-sdk/token-providers`' own real
+`dist-cjs/index.js` does `const { writeFile } = node_fs.promises` (`node_fs`
+being `require('node:fs')`) at module top level, a real, unconditional
+destructure. Real Node's `require('fs').promises === require('fs/promises')`
+is `true` - a long-standing alias this project's `fs.go` never had.
+Fixed with a new `installFSPromisesAlias`, reusing `fs/promises`'s own
+already-built module value directly (not a copy, so the identity itself
+holds, matching real Node) - and, checked directly rather than assumed,
+had to *also* rebuild `fs`'s own cached "default" snapshot object after
+adding the property, since `fs.go`'s `m.Default(nil)` had already built
+and cached that snapshot at declare time, before this function runs -
+the exact same one-time-snapshot gotcha `util.go`'s own
+TextEncoder/TextDecoder fix (Round 94) already had to work around, and
+the first attempt at this fix (mutating only the named-exports map)
+silently didn't take effect until that was noticed and fixed too. New
+test: `TestFSPromisesAliasOnFS`, covering both the ESM and CJS shapes
+(built from independently-snapshotted "default" objects here, so both
+needed separate coverage).
+
+**A second, distinct engine bug found and filed: `paserati#416`.** Past
+the `fs.promises` fix, the probe reached a new, real VM panic:
+`OpLoadSpill: invalid spill slot index 0`, at `@smithy/core`'s own
+`dist-cjs/submodules/client/index.js`'s `build()` method - the function
+`@aws-sdk/client-bedrock-runtime`'s own `dist-cjs/index.js` calls ~90
+times, once per command, in exactly this real shape:
+
+```js
+class ConverseCommand extends client.Command
+    .classBuilder()
+    .ep(commonParams)
+    .m(function (Command, cs, config, o) { ... })
+    .s("AmazonBedrockFrontendService", "Converse", {})
+    .n("BedrockRuntimeClient", "ConverseCommand")
+    .sc(schemas_0.Converse$)
+    .build() {
+}
+```
+
+- an empty-body class declaration whose `extends` clause is a method
+chain ending in `.build()`, itself returning a `class extends Command {
+... }` expression. Isolated (several attempts, each verified against
+real Node's correct `true` result before trusting a "doesn't crash"
+negative) down to an 8-line repro with none of the real code's own
+specifics: `function build() { return class extends Base {}; }` /
+`class Sub extends build() {}`, reproducing identically. Confirmed the
+trigger, matching #406's own earlier shape exactly: the whole pattern
+has to be nested one level inside an *enclosing function* - the same
+code at true top-level script scope runs correctly (checked via both
+the bare `paserati` CLI directly and noderati's own `RunCJS`-vs-
+`RunCode` harness, which differ in exactly this one respect - `RunCJS`'s
+own CJS module-function wrapper is the enclosing scope). Filed as
+[paserati#416](https://github.com/nooga/paserati/issues/416) with the
+full isolation and a note that this may be the same underlying class of
+bug #406 was, just not fully covered by that fix's own scope (plain
+`function` declarations, not `class` declarations/expressions used
+across a function boundary).
+
+**Status**: `paserati#413` is fixed and verified; one more real,
+noderati-side `fs` gap (`fs.promises`) found and fixed along the way.
+The Bedrock dependency graph now reaches a new, precisely-identified
+upstream engine gap (`paserati#416`) instead of the resolved
+`TransformStream`/`fs.promises` gaps - not noderati's to fix. Full
+suite/vet/scoreboard clean after the `fs.promises` fix, no regressions.
