@@ -12998,3 +12998,71 @@ module-boundary bug," which is a real, load-bearing pattern (every zod
 schema builder uses it) but a single, clean root cause rather than a
 family of unrelated issues. Re-running `p07-zod.mjs` once `#451` lands
 is the next step.
+
+## Round 111: prettier's Round 107 anomaly finally isolated to a
+minimal repro and filed as `paserati#452`
+
+Continuing "keep going on prettier" from Round 107, which reproduced
+the failure directly against the real bundle (instrumented in place)
+but couldn't reduce it to a standalone repro despite three serious
+attempts that round. Picked the instrumentation back up with fresh
+eyes and one new piece of leverage: print the *option name* at the
+exact `VALIDATE for option: X` call site, not just generic arg counts.
+
+**That immediately named the actual failing call: `cursorOffset`,
+the second real option prettier validates** (`parser`, which has an
+`optionInfo.exception` handler, validates correctly first; the very
+next option, using the plain `value === void 0 || schema.validate(...)`
+branch with no exception handler, throws). Dumping `schema`/`utils`
+at that exact call confirmed Round 107's own earlier finding exactly:
+the arrow function's `schema` parameter receives what should have been
+`utils` (a huge, real `utils`-context-shaped object), and its own
+`utils` parameter is `undefined`.
+
+**Bisected by rebuilding progressively smaller standalone harnesses
+around this exact shape (a factory function called twice, each time
+picking one of two different closures via `if`/`else`, each wrapped by
+a `(...args) => handler(...args.slice(...), extra, ...args.slice(...))`
+splicing wrapper) until one finally reproduced with no zod/prettier
+code left at all.** Every one of the following turned out to be
+required - removing any single one made the repro pass:
+
+- the factory called **twice**, `if`-branch first, `else`-branch
+  second (calling the `else`-branch closure alone, as the only call,
+  works correctly);
+- the wrapper's **specific `args.slice(0, N-1)`/`args.slice(N-1)`
+  splicing** (a trivial `(...args) => handler(...args)` passthrough
+  around the identical two closures does not reproduce it);
+- the **second** closure's body being a **bare `value === void 0 ||
+  (...)` short-circuit expression** as the arrow function's sole,
+  implicit-return expression (the identical shape with plain string
+  concatenation instead of `||` does not reproduce it, even with both
+  of the above still in place).
+
+Final repro needs no method call, no class, and no `Object.create` at
+all - just two calls to a factory function, an `if`/`else` picking
+between two closures, and a splicing wrapper:
+```js
+function normalizeHandler(handler, superSchema, N) {
+  return (...args) => handler(...args.slice(0, N - 1), superSchema, ...args.slice(N - 1));
+}
+function optionInfoToSchema(exceptionFn) {
+  let validateFn;
+  if (exceptionFn) validateFn = (value, schema, utils) => "A:" + value;
+  else validateFn = (value, schema, utils) => value === void 0 || ("B:" + value);
+  return normalizeHandler(validateFn, { tag: "s" }, 2);
+}
+const f1 = optionInfoToSchema((v) => false);
+console.log(f1("babel", { u: 1 })); // real Node & paserati agree: "A:babel"
+const f2 = optionInfoToSchema(null);
+console.log(f2(5, { u: 2 })); // real Node: "B:5". paserati: true
+```
+Filed as [paserati#452](https://github.com/nooga/paserati/issues/452)
+with this full narrowing; not fixed here (paserati source left
+untouched, per this investigation's own standing instruction).
+
+**Status**: prettier's real blocker (Round 107's own reproduced-but-
+unminimized anomaly) is now a clean, filed, minimal repro - a genuinely
+different shape from `#438` (no tagged template, the affected closure
+in the minimal repro doesn't even call anything) despite looking
+adjacent in spirit. Re-run `p01-prettier.mjs` once `#452` lands.
