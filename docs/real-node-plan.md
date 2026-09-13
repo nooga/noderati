@@ -13202,3 +13202,57 @@ of the "closure can't see an outer module-scope var" bug class
 (`#438`/`#443`/`#451` were all variations of this), but in acorn this
 time and not yet reduced to a standalone repro. A good candidate for a
 future round with fresh instrumentation budget.
+
+## Round 114: handlebars' Round 104 blocker isolated to a specific file
+and root-caused precisely - filed as `paserati#454`
+
+Continuing "keep going on handlebars" from Round 104, which never
+isolated its own blocker to a specific file. Reused the same
+temporary, noderati-only debug print in `cjsLoader.execFile` that
+found eslint's (Round 112) and webpack's (Round 113) own blockers
+(added and reverted this round, never committed) - immediately named
+the failing file: real, unmodified `handlebars@4.7.8`'s own bundled
+Jison-generated lexer, `dist/cjs/handlebars/compiler/parser.js`, at
+```js
+this.yylloc.range = [this.offset, this.offset += this.yyleng];
+```
+- an ordinary array literal whose second element is a
+compound-assignment expression. Real Jison boilerplate, not
+handlebars-specific - present in any bundled parser generated the same
+way.
+
+**Root cause, precisely located and narrowed to a one-line repro:**
+```js
+let x = 1;
+console.log([1, x += 1]); // real Node: [1, 2]. paserati: parse error
+```
+Confirmed not specific to a member-expression target (`obj.offset +=
+3` fails identically) and not specific to `+=` (`-=`, `*=`, `||=` all
+reproduce) - specific to *compound* assignment operators as an array
+element; plain `=` already works correctly there (`[1, obj.offset =
+9]` parses and runs fine). `pkg/parser/parser.go`'s `parseArrayLiteral`
+parses each element at `ASSIGNMENT` precedence (to support the
+destructuring-default cover grammar, `[x = 10] = arr`), then manually
+special-cases exactly one token - bare `lexer.ASSIGN` (`=`) - to
+recover a real assignment expression when that's what was actually
+meant. It never checks for any compound-assignment token, so the
+parser sees the unhandled operator next and reports "expected ',' or
+']'" instead. Filed as
+[paserati#454](https://github.com/nooga/paserati/issues/454) with this
+narrowing and a suggested fix (compound operators have no
+destructuring-default meaning at all, so they need no cover-grammar
+special case - just parse a real `AssignmentExpression` directly); not
+fixed here (per this investigation's own standing instruction not to
+touch paserati source).
+
+**Verification**: no noderati code changed this round (diagnostic
+only - the temporary debug print was reverted before committing;
+`git diff` on `internal/host/cjs.go` is empty). `go vet ./...` and the
+full suite (`go test ./... -skip TestEventsAddAbortListener`) both
+clean regardless, confirming nothing else drifted.
+
+**Status**: 5 of the 7 original Round-104 breadth-sweep failures now
+have a precise, filed (or fixed) root cause - zod (`#451`), prettier
+(`#452`), eslint (`#453`), webpack (fixed directly, Round 113; one
+deeper blocker still open), handlebars (`#454`). Only sql.js remains
+completely uninvestigated since Round 104.
