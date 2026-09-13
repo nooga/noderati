@@ -235,6 +235,41 @@ export const value = 42;
 	}
 }
 
+// TestShouldWrapCJSIgnoresImportExportWordsInCommentsAndStrings guards
+// the exact bug found running real, unmodified sql.js@1.13.0
+// (docs/real-node-plan.md, Round 115): its own real, bundled
+// dist/sql-wasm.js (`module.exports = initSqlJs` at top level, ordinary
+// CJS/UMD) has a plain-English comment near the top mentioning the
+// word "export" ("...it still expects to export a global object called
+// `Module`...") - esmKeywordRe's own word-boundary match can't tell that
+// apart from a real `export` statement keyword, so this one word alone
+// flipped shouldWrapCJS's verdict to "this is ESM," skipping CJS-
+// wrapping entirely and leaving `import initSqlJs from "sql.js"`
+// resolving to `undefined` (the raw source, loaded as if already ESM,
+// declares no real exports of its own). A string literal containing the
+// same word must not trip it either. Genuine ESM must still be detected
+// correctly even when comments/strings elsewhere also happen to contain
+// the words "import"/"export" as plain text.
+func TestShouldWrapCJSIgnoresImportExportWordsInCommentsAndStrings(t *testing.T) {
+	cjsWithExportInComment := `// it still expects to export a global object
+// see also: the string below mentions import too
+var greeting = "please import this responsibly";
+/* another comment that could export the wrong verdict */
+module.exports = function factory() { return 42; };
+`
+	if !shouldWrapCJS("/virtual/sql-wasm.js", cjsWithExportInComment) {
+		t.Error("a CJS file whose comments/strings merely contain the words import/export should still be wrapped as CJS, not treated as ESM")
+	}
+
+	genuineESMWithMisleadingComment := `// this file does NOT export anything unusual
+import fs from "fs";
+export const value = 42;
+`
+	if shouldWrapCJS("/virtual/esm-with-comment.js", genuineESMWithMisleadingComment) {
+		t.Error("a genuine ESM file (static import/export) should not be wrapped as CJS, even with import/export words also appearing in its own comments")
+	}
+}
+
 // TestNodeModulesResolverCircularRequireThroughSelfSymlink guards the
 // second bug found in the same investigation: a real npm/homebrew global
 // install (@earendil-works/pi-coding-agent's own node_modules) had a

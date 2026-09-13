@@ -13256,3 +13256,80 @@ have a precise, filed (or fixed) root cause - zod (`#451`), prettier
 (`#452`), eslint (`#453`), webpack (fixed directly, Round 113; one
 deeper blocker still open), handlebars (`#454`). Only sql.js remains
 completely uninvestigated since Round 104.
+
+## Round 115: sql.js's Round 104 blocker fixed - a real noderati bug,
+`looksLikeESMSource` tripped by the plain English word "export" inside
+a comment; a new, deeper WASM-runtime blocker found immediately after
+
+Continuing "keep going on sql.js" from Round 104, which had confirmed
+`import initSqlJs from "sql.js"` yields `undefined` while
+`require("sql.js")` works, but hadn't traced why the two diverged.
+
+**Root cause: `looksLikeESMSource`'s own word-boundary regex for
+"import"/"export" doesn't distinguish the real keyword from the same
+plain-English word inside a comment or string.** Real, unmodified
+`sql.js@1.13.0`'s bundled `dist/sql-wasm.js` (an ordinary CJS/UMD file,
+`module.exports = initSqlJs` at its own top level) has a plain-English
+comment near the top mentioning the word "export"
+("...it still expects to **export** a global object called `Module`...")
+- one word-boundary match away from flipping `shouldWrapCJS`'s verdict
+to "this is ESM," which skips CJS-wrapping the file entirely. Loaded
+as if it were already a real ES module (with no actual `export`
+statements of its own), it declares no exports at all - so
+`import initSqlJs from "sql.js"` correctly, if unhelpfully, resolves to
+`undefined`. This function's own doc comment used to claim a bare
+word-boundary match was "safe" because `import`/`export` "can only
+appear as this keyword, as `import()`/`import.meta`, or inside a
+string/comment" - true, but wrong to call safe, since a string/comment
+is exactly the case this regex can't tell apart from the real keyword,
+and real code hits it (this file, at minimum).
+
+**Fixed** with a new single-pass lexical scanner,
+`stripCommentsAndStringsForESMDetection` (`internal/host/
+nodemodules.go`) - blanks out `//` line comments, `/* */` block
+comments, and quoted string/template literals before `esmKeywordRe`'s
+own scan ever runs, so neither can trip a false positive. A template
+literal's own `${...}` interpolation is treated as opaque along with
+the rest of the template (deliberately - a real static
+`import`/`export` statement can never legally appear inside one
+anyway, so this can only avoid a false positive, never hide a genuine
+ESM file). New test,
+`TestShouldWrapCJSIgnoresImportExportWordsInCommentsAndStrings`,
+reproduces the exact real shape (a CJS file with "import"/"export"
+mentioned in comments and a string) plus the inverse case (genuine ESM
+whose own comment happens to mention "export" too, still correctly
+detected as ESM) - both pass, and the pre-existing
+`TestShouldWrapCJSIgnoresDynamicImportCall` (Round 94's own fix, a
+different false-positive shape) still passes unmodified.
+
+**Verified against the real package**: `import initSqlJs from
+"sql.js"` now resolves to the real factory function, `await
+initSqlJs()` succeeds, and `typeof SQL.Database === "function"` -
+matching real Node exactly. This layer of Round 104's own blocker is
+closed.
+
+**Immediately after, a new, deeper blocker appeared**: `new
+SQL.Database()` itself throws `Error: out of memory` from inside the
+real, unmodified WASM binary's own C-side allocator (the constructor
+never gets as far as running any SQL - it fails opening the database
+handle). Not investigated further this round - this is a different
+subsystem (the WASM memory-growth bridge, `webassembly_global.go`/
+`wasmMemoryBridge`, last touched rounds 87/93/96 for the Photon
+image-resizing chain) and deserves its own dedicated pass rather than
+a quick follow-on to an ESM-detection fix.
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean, including
+both new/pre-existing `TestShouldWrapCJS*` tests; scoreboard clean
+(`all-fakes-off` still matches `baseline` exactly - both now hit yet
+another different, unrelated `pi-coding-agent` symptom as paserati
+keeps moving underneath it, not a regression from this round's fix).
+
+**Status**: 6 of the 7 original Round-104 breadth-sweep failures now
+have a precise, filed or fixed root cause (zod `#451`, prettier
+`#452`, eslint `#453`, webpack fixed + one deeper blocker open,
+handlebars `#454`, sql.js fixed + a new, different, deeper WASM
+blocker open). Only babel/aws-s3's shared register-exhaustion capacity
+limit (`#426`, still open upstream) has had no further noderati-side
+work since Round 104 - every other original failure has moved forward
+at least one real layer this session.

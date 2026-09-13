@@ -472,10 +472,24 @@ func shouldWrapCJS(absPath, source string) bool {
 // is what surfaced this) was silently misdetected as CommonJS this way —
 // CJS-wrapped despite having no CommonJS in it at all, which hides its
 // `export{...}` inside a function body the wrapper wraps around it,
-// leaving every export silently empty with no error anywhere. `import`
-// and `export` are JS reserved words — they can only appear as this
-// keyword, as `import()`/`import.meta`, or inside a string/comment, so a
-// same-word-boundary match anywhere in the source is safe.
+// leaving every export silently empty with no error anywhere.
+//
+// The doc comment here used to end with "`import`/`export` are JS
+// reserved words — they can only appear as this keyword, as
+// `import()`/`import.meta`, or inside a string/comment, so a same-
+// word-boundary match anywhere in the source is safe" — that was
+// wrong, corrected 2026-09: a string/comment is exactly the case this
+// regex can't tell apart from the real keyword, and real code hits it.
+// Real, unmodified `sql.js@1.13.0`'s bundled `dist/sql-wasm.js` (a
+// genuine CJS/UMD file, `module.exports = initSqlJs` at its own top
+// level) has a plain-English comment near the top mentioning the
+// ordinary word "export" ("...it still expects to export a global
+// object called `Module`...") - one word-boundary match away from
+// flipping this file to "looks like ESM," which skips CJS-wrapping it
+// entirely and leaves `import initSqlJs from "sql.js"` resolving to
+// `undefined` (the raw UMD source, loaded as if it were already ESM,
+// declares no real ESM exports of its own at all). See
+// stripCommentsAndStringsForESMDetection below, now run first.
 var esmKeywordRe = regexp.MustCompile(`(?:^|[^\w$])(?:import|export)(?:[^\w$]|$)`)
 
 // dynamicImportCallRe matches a dynamic `import(...)` call expression -
@@ -496,8 +510,65 @@ var esmKeywordRe = regexp.MustCompile(`(?:^|[^\w$])(?:import|export)(?:[^\w$]|$)
 var dynamicImportCallRe = regexp.MustCompile(`\bimport\s*\(`)
 
 func looksLikeESMSource(source string) bool {
+	source = stripCommentsAndStringsForESMDetection(source)
 	source = dynamicImportCallRe.ReplaceAllString(source, "")
 	return esmKeywordRe.MatchString(source)
+}
+
+// stripCommentsAndStringsForESMDetection blanks out `//` line comments,
+// `/* */` block comments, and quoted string/template literals, so
+// esmKeywordRe's own word-boundary scan for "import"/"export" can't be
+// tripped by either of those literally containing the plain English
+// word (a real comment saying "...expects to export a global object...",
+// a real string constant, or similar) - only genuine top-level source
+// text is left for it to match against. This is a single-pass lexical
+// scan, not a real tokenizer/parser - regexes alone can't do this
+// reliably (nesting, escapes, and "is this a comment or a division
+// operator" all need real character-by-character state), and this
+// heuristic only needs to be conservative, not exact: a template
+// literal's own `${...}` interpolation is treated as opaque along with
+// the rest of the template (a real static `import`/`export` statement
+// can never legally appear inside one anyway, so this can't hide a
+// genuine ESM file - it can only avoid false-positiving on template
+// text, which is the same direction of error this function exists to
+// fix).
+func stripCommentsAndStringsForESMDetection(source string) string {
+	var out strings.Builder
+	out.Grow(len(source))
+	runes := []rune(source)
+	n := len(runes)
+	for i := 0; i < n; i++ {
+		c := runes[i]
+		switch {
+		case c == '/' && i+1 < n && runes[i+1] == '/':
+			for i < n && runes[i] != '\n' {
+				i++
+			}
+			if i < n {
+				out.WriteRune('\n')
+			}
+		case c == '/' && i+1 < n && runes[i+1] == '*':
+			i += 2
+			for i+1 < n && !(runes[i] == '*' && runes[i+1] == '/') {
+				i++
+			}
+			i++ // land on the '/' of '*/' (loop's i++ then skips past it)
+		case c == '\'' || c == '"' || c == '`':
+			quote := c
+			i++
+			for i < n && runes[i] != quote {
+				if runes[i] == '\\' && i+1 < n {
+					i++
+				}
+				i++
+			}
+			// i now on the closing quote (or n if unterminated) - either
+			// way the loop's own i++ advances past it.
+		default:
+			out.WriteRune(c)
+		}
+	}
+	return out.String()
 }
 
 func looksLikeCJSSource(source string) bool {
