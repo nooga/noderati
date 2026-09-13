@@ -91,21 +91,97 @@ func TestAsyncHooksCJSRequire(t *testing.T) {
 	}
 }
 
-// TestAsyncLocalStorageNotExported documents the deliberate omission (see
-// async_hooks.go's own doc comment) as an actual, checked assertion
-// rather than an unstated absence - a future accidental re-add of a
-// broken stack-based AsyncLocalStorage would need to touch this test.
-func TestAsyncLocalStorageNotExported(t *testing.T) {
+// TestAsyncLocalStorageConstructible guards the exact real-world shape
+// round 117 found breaking real, unmodified @aws-sdk/client-s3: a class
+// field initializer (`static storage = new AsyncLocalStorage();`)
+// evaluated unconditionally at module load, regardless of whether
+// `.run()` is ever subsequently called - round 72's own scoping ("nothing
+// reachable calls `.run()`") never considered that construction alone,
+// with no usage at all, needs a real constructor to exist.
+func TestAsyncLocalStorageConstructible(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
-		import * as ah from "node:async_hooks";
-		typeof ah.AsyncLocalStorage
+		import { AsyncLocalStorage } from "node:async_hooks";
+		class HasStaticField {
+			static storage = new AsyncLocalStorage();
+		}
+		typeof HasStaticField.storage.run
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	if val.ToString() != "undefined" {
-		t.Errorf("AsyncLocalStorage should not be exported (see async_hooks.go), got typeof %q", val.ToString())
+	if val.ToString() != "function" {
+		t.Errorf("AsyncLocalStorage should be constructible with a real .run method, got typeof %q", val.ToString())
+	}
+}
+
+// TestAsyncLocalStorageSyncRunAndGetStore covers the case async_hooks.go's
+// own doc comment says is actually correct: getStore() sees the active
+// store while a *synchronous* run() callback (no internal await) is on
+// the stack, nested run() calls correctly restore the outer store once
+// the inner one returns, and getStore() is undefined both before the
+// first run() and after the last one returns. This is the guarantee the
+// stack-based implementation genuinely provides, not the cross-await case
+// the doc comment says it explicitly does not.
+func TestAsyncLocalStorageSyncRunAndGetStore(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { AsyncLocalStorage } from "node:async_hooks";
+		const als = new AsyncLocalStorage();
+		const before = als.getStore();
+		const seen = [];
+		als.run({ id: "outer" }, () => {
+			seen.push(als.getStore()?.id);
+			als.run({ id: "inner" }, () => {
+				seen.push(als.getStore()?.id);
+			});
+			seen.push(als.getStore()?.id);
+		});
+		const after = als.getStore();
+		JSON.stringify({ before, seen, after });
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"seen":["outer","inner","outer"]}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestAsyncLocalStorageDoesNotSurviveAcrossAwait pins down, as an actual
+// checked assertion rather than just a doc comment's claim, the exact
+// known limitation this implementation has: getStore() called from a
+// run() callback's own continuation *after* an internal await no longer
+// sees the store, because the stack-based run()'s own `finally` pop fires
+// the instant the still-pending promise is returned, not when the
+// callback's remaining code actually resumes. If this ever starts
+// passing "req-1" for the post-await value, either the implementation
+// changed to something genuinely correct (update this test to expect the
+// real value and delete this comment) or something coincidental is
+// masking the gap - either way this test existing means that change gets
+// noticed instead of silently happening.
+func TestAsyncLocalStorageDoesNotSurviveAcrossAwait(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { AsyncLocalStorage } from "node:async_hooks";
+		const als = new AsyncLocalStorage();
+		let beforeAwait, afterAwait;
+		await als.run({ id: "req-1" }, async () => {
+			beforeAwait = als.getStore()?.id;
+			await Promise.resolve();
+			afterAwait = als.getStore()?.id;
+		});
+		JSON.stringify({ beforeAwait, afterAwait });
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"beforeAwait":"req-1"}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s (afterAwait should be the known-missing case - see this test's own doc comment)", val.ToString(), want)
 	}
 }

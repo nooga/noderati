@@ -13466,3 +13466,81 @@ passing; both still fail today, on two different reasons that happen
 to share the same error message. aws-s3's own new blocker
 (`__static_field_init__`) is a distinct, not-yet-isolated finding for
 a future round.
+
+## Round 118: aws-s3's `__static_field_init__` blocker fixed - a real
+noderati gap, not paserati's; scoping error in Round 72's own
+AsyncLocalStorage decision, now corrected; the register-exhaustion
+blocker underneath is already `paserati#455`
+
+Continuing "keep going on s3" after Round 117 filed the register-
+exhaustion ceiling. Found the calling file with a temporary debug print
+in `cjsLoader.execFile` (logging the file about to execute, added and
+reverted this round, never committed): real, unmodified
+`@aws/lambda-invoke-store`'s own `invoke-store.js` -
+```js
+class InvokeStoreImpl {
+  static storage = new async_hooks_1.AsyncLocalStorage();
+  ...
+}
+```
+- `undefined is not a constructor`, since noderati's own `node:async_hooks`
+deliberately didn't export `AsyncLocalStorage` at all (Round 72's own,
+carefully-reasoned decision).
+
+**Round 72's own analysis was real and well-founded, but scoped to the
+wrong question.** It checked "is `.run()` ever actually called by
+anything reachable from pi-coding-agent" - confirmed no (neither
+`AWS_LAMBDA_MAX_CONCURRENCY` nor forced multi-instance mode is ever
+true for pi) - and concluded there was nothing to build. What it never
+checked: `InvokeStoreImpl`'s `static storage = new AsyncLocalStorage()`
+is a **class field initializer**, evaluated the moment the class
+itself is defined, at module top level, unconditionally - regardless
+of whether `InvokeStoreMulti` or `InvokeStoreSingle` is ever actually
+chosen, and regardless of whether `.run()` is ever subsequently called
+at all. So merely *importing* `@aws-sdk/client-s3` (or anything else
+that transitively pulls in `@aws/lambda-invoke-store`) needs a real,
+constructible `AsyncLocalStorage` to exist - a real noderati gap, wider
+than Round 72's own scoping realized, not a paserati bug.
+
+**Fixed**: exported a real `AsyncLocalStorage` (`internal/host/
+async_hooks.go`) with the full API (`run`/`getStore`/`enterWith`/
+`exit`/`disable`), implemented as a plain stack. Round 72's own
+correctness concern is real and not swept aside: a stack-based `run()`
+correctly handles synchronous callbacks and properly nested `run()`
+calls (verified: `TestAsyncLocalStorageSyncRunAndGetStore`), but does
+**not** survive a real `await` inside an async callback - the
+`finally` pop fires the instant the still-pending promise is
+*returned*, not when the callback's own remaining code actually
+resumes, so `getStore()` sees nothing once execution comes back after
+the `await` (pinned down as its own checked assertion, not just a doc
+comment's claim -
+`TestAsyncLocalStorageDoesNotSurviveAcrossAwait` - so a future change
+that fixes this properly, or accidentally masks the gap, gets
+noticed). This is the identical, real limitation Round 72 already
+identified; only the scope of what needed fixing changed (the class
+must exist at all, not that `.run()` needs to be spec-correct for
+every shape). The already-filed paserati feature request for real
+context-propagation-across-promise-continuations (noted in Round 72,
+still open) remains the right fix for full correctness.
+
+**Verified against the real package**: the `undefined is not a
+constructor` crash is gone. `import { S3Client, ListBucketsCommand }
+from "@aws-sdk/client-s3"` now progresses past this point entirely and
+lands on the *already-filed* [paserati#455](https://github.com/nooga/paserati/issues/455)
+register-exhaustion ceiling (Round 117) instead - confirming the two
+issues were genuinely stacked, and this round's fix is real and
+correctly ordered before that one, not a new problem.
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean, including
+the three new/replaced `TestAsyncLocalStorage*` tests (the old
+`TestAsyncLocalStorageNotExported`, guarding the now-reversed decision,
+was replaced rather than left stale); scoreboard clean (`all-fakes-off`
+still matches `baseline` exactly). The temporary debug print was
+reverted before committing - `git diff` on `internal/host/cjs.go` is
+empty.
+
+**Status**: no new paserati issue filed this round - the remaining
+aws-s3 blocker is the register-exhaustion ceiling already filed as
+`#455` in Round 117, confirmed (not assumed) to be the exact next
+thing hit once this round's own noderati-side fix is applied.
