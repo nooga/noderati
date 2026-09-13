@@ -548,7 +548,21 @@ func (l *cjsLoader) requireNative(spec string) (vm.Value, error) {
 }
 
 func (l *cjsLoader) resolveFile(specifier, fromFile string) (string, error) {
-	if strings.HasPrefix(specifier, "./") || strings.HasPrefix(specifier, "../") {
+	// Real Node treats a bare "." or ".." exactly like "./" or "../" - a
+	// relative specifier naming the current or parent directory, not a
+	// package name to look up in node_modules (the two aren't the same
+	// string: strings.HasPrefix(".", "./") is false, since "." is shorter
+	// than "./", so this needs its own check rather than falling out of
+	// the prefix check below). Without this, `require(".")` - real
+	// webpack's own real, unmodified `lib/Compiler.js` does exactly this
+	// to reach back to its own package's public API (`webpack/lib/
+	// index.js`, via ordinary directory-relative resolution) - fell
+	// through to the bare-package-specifier branch below, which tried to
+	// find a node_modules package literally named "." and failed with
+	// "Cannot find module '.'" instead of resolving to the calling
+	// file's own directory.
+	if specifier == "." || specifier == ".." ||
+		strings.HasPrefix(specifier, "./") || strings.HasPrefix(specifier, "../") {
 		return existingJSFile(filepath.Join(filepath.Dir(fromFile), specifier))
 	}
 	if strings.HasPrefix(specifier, "/") || filepath.IsAbs(specifier) {

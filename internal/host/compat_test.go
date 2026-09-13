@@ -295,6 +295,50 @@ func TestCJSNamedExportsViaDefineProperty(t *testing.T) {
 	}
 }
 
+// TestCJSRequireDot covers real Node's own resolution rule for a bare
+// "." (or "..") require specifier - exactly like "./" or "../", it
+// names the current (or parent) directory relative to the requiring
+// file, not a node_modules package to look up. Confirmed against real
+// webpack@5.102.1 (docs/real-node-plan.md, Round 113): its own real
+// lib/Compiler.js does `const webpack = require(".");` to reach back
+// to its own package's public API (lib/index.js, via ordinary
+// directory-relative resolution) - this failed with "Cannot find
+// module '.'" before this fix, since resolveFile only recognized the
+// "./"/"../" *prefix* forms and treated a bare "." as a bare package
+// name instead.
+func TestCJSRequireDot(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "node_modules", "dot-require", "package.json"), `{
+		"name": "dot-require",
+		"main": "index.js"
+	}`)
+	writeFile(t, filepath.Join(root, "node_modules", "dot-require", "index.js"), `
+		exports.value = "from-index";
+	`)
+	writeFile(t, filepath.Join(root, "node_modules", "dot-require", "inner.js"), `
+		module.exports = require(".").value;
+	`)
+	appPath := filepath.Join(root, "app.ts")
+	writeFile(t, appPath, `import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+require("dot-require/inner.js");`)
+
+	origWD, _ := os.Getwd()
+	_ = os.Chdir(root)
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	p := New([]string{"noderati", appPath})
+	p.SetSkipTypeCheck(true)
+	source, _ := os.ReadFile(appPath)
+	val, errs := p.RunCode(string(source), driver.RunOptions{ModuleName: appPath, Filename: appPath})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "from-index" {
+		t.Errorf("require(\".\") result = %q, want %q", val.ToString(), "from-index")
+	}
+}
+
 func TestCJSNamedExportValid(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "node_modules", "cjs-valid", "package.json"), `{

@@ -13123,3 +13123,82 @@ commit - `git diff internal/host/cjs.go` is empty.
 precise, filed root cause (zod -> `#451`, prettier -> `#452`, eslint ->
 `#453`, babel/aws-s3 -> the still-open capacity half of `#426`).
 Remaining, still not isolated: handlebars, sql.js, webpack.
+
+## Round 113: webpack's Round 104 `require(".")` blocker fixed - a
+real noderati bug this time, not paserati's; one more, deeper webpack
+blocker found immediately after, not yet isolated
+
+Continuing "keep going on webpack" from Round 104, which had confirmed
+the outer `lazyFunction`/`memoize` wrapper mechanism itself wasn't at
+fault but hadn't traced the real `require(".")` failure any further.
+Reused the same technique that found eslint's blocker last round: a
+temporary, noderati-only debug print (added and reverted this round,
+never committed) logging the calling file whenever `require(".")` was
+about to fail. Named it immediately: real, unmodified
+`webpack@5.102.1`'s own `lib/Compiler.js` does
+`const webpack = require(".");` - reaching back to its own package's
+public API (`lib/index.js`) via ordinary Node relative-path resolution,
+not a bare package lookup.
+
+**Root cause, this time genuinely noderati's own bug, not paserati's:**
+`internal/host/cjs.go`'s `resolveFile` only recognized the `"./"`/
+`"../"` *prefix* forms of a relative specifier -
+`strings.HasPrefix(specifier, "./")` is false for the bare string `"."`
+itself (it's shorter than the prefix being checked), so a literal `"."`
+or `".."` fell through to the bare-package-specifier branch, which
+tried to find a node_modules package literally named `"."` and failed
+with `Cannot find module '.'` - instead of resolving to the requiring
+file's own directory, exactly like real Node does for `"./"`/`"../"`
+already. **Fixed**: added an exact-match check for `"."`/`".."`
+alongside the existing prefix checks, routing them through the same
+already-correct relative-resolution path. New test,
+`TestCJSRequireDot`, exercises exactly this shape (a package's own
+`inner.js` doing `require(".").value` to reach its own `index.js`).
+Verified: real, unmodified webpack's own `require(".")` now resolves
+correctly - the "Cannot find module '.'" error is gone, and the real
+require chain visibly progresses several frames deeper than Round 104
+ever reached.
+
+**Immediately after, a new, deeper blocker appeared - found but not
+yet isolated to a minimal repro despite several attempts.** Real
+`acorn@8.x` (webpack's own real parser dependency) builds its token
+type table with a long object literal, most entries constructing
+`new TokenType(...)` directly inline (all of which work correctly),
+but a handful (`logicalOR: binop("||", 1)`, `logicalAND: binop("&&",
+2)`, etc.) go through a small wrapper function,
+`function binop(name, prec) { return new TokenType(name, {beforeExpr:
+true, binop: prec}) }`, defined a few lines *above* the object literal,
+referencing the same module-scope `var TokenType = function TokenType
+(label, conf) {...}` every direct call already uses successfully.
+Under noderati, `TokenType` is `undefined` specifically inside
+`binop`'s own body (`TypeError: undefined is not a constructor`),
+even though the exact same binding resolves fine for every direct,
+inline `new TokenType(...)` call in the same object literal, right
+next to the broken ones. Tried reproducing with a from-scratch
+minimal file matching this shape as closely as possible (a
+module-scope `var` assigned a same-named function expression, a
+wrapper function defined afterward referencing it as a free variable,
+both direct and wrapped construction calls in a module-scope object
+literal, loaded as an imported module rather than the entry script,
+with up to 20+ direct calls before the wrapped one to rule out a
+scale/count effect) - none of these attempts reproduced it. Left open,
+with the real file/line identified precisely
+(`acorn/dist/acorn.js:129`'s `binop`, called from its own line 192)
+for whoever picks this up next to instrument further, the same way
+eslint's and prettier's own blockers eventually were.
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean, including the
+new `TestCJSRequireDot`; scoreboard clean (`all-fakes-off` still
+matches `baseline` exactly). The temporary debug print used to locate
+`require(".")`'s calling file was reverted before committing -
+`git diff` on `internal/host/cjs.go` shows only the real fix.
+
+**Status**: one more real noderati bug found, fixed, and verified this
+round (`require(".")`/`require("..")` resolution) - webpack moves one
+real layer deeper into its own actual require graph than it ever has
+before, immediately surfacing what looks like a genuinely new instance
+of the "closure can't see an outer module-scope var" bug class
+(`#438`/`#443`/`#451` were all variations of this), but in acorn this
+time and not yet reduced to a standalone repro. A good candidate for a
+future round with fresh instrumentation budget.
