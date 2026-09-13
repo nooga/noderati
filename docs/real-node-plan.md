@@ -13404,3 +13404,65 @@ time budgeted specifically for WASM-level debugging (a byte-level
 memory dump comparison against real Node/wasmtime at the exact point
 of failure is the next concrete step, rather than more hypothesis
 testing from the JS-glue side).
+
+## Round 117: babel/aws-s3's register exhaustion re-examined - #426's
+own closure was premature; the real trigger is a hard per-frame
+register ceiling on parameter/argument counts, filed as `paserati#455`
+
+Prompted by a direct question ("what's up with s3 and babel again? I
+thought we fixed all paserati blockers") after `paserati#426` showed as
+closed on GitHub. Rechecked both real packages directly against
+current paserati `main` (`18fd0af5`, unchanged since Round 109) rather
+than trusting the issue's closed status:
+
+- **Real `@babel/core@7.28.4` still fails with the exact same**
+  `"register exhaustion: expression too deeply nested"` **error #426
+  was filed for.**
+- **Real `@aws-sdk/client-s3@3.918.0` no longer hits register
+  exhaustion at all** - it now fails differently, with `undefined is
+  not a constructor` at `__static_field_init__` (a class static field
+  initializer referencing something that resolves to `undefined`,
+  shape-adjacent to the `#438`/`#443`/`#451` "closure/reference can't
+  see a module-scope binding" family, but a `TypeError` from evaluating
+  `new undefinedThing()` rather than a `ReferenceError` - not yet
+  isolated to a minimal repro this round; left open).
+
+**#426's own fix is real, but only fixed one of two distinct causes
+behind the same error message.** Its own synthetic repro (150
+sequentially-nested `if` blocks) now works at any depth tried, up to
+1000 levels - that leak (registers not being freed/reused across
+separate statements) is genuinely gone. Real babel still fails on a
+*different* trigger #426 never addressed, bisected precisely this
+round:
+
+**A function with more than 238 parameters (or a call with more than
+238 arguments) fails to compile**, regardless of statement nesting at
+all:
+```js
+const args = Array.from({ length: 239 }, (_, i) => "p" + i).join(",");
+new Function(args, "return p0;"); // real Node: fine. paserati: register exhaustion
+```
+Bisected the exact threshold: 238 parameters compiles fine, 239 fails
+(`255 - 238 = 17`, suggesting a fixed ~17-register-per-frame
+reservation for VM-internal bookkeeping, leaving 238 of a 255-register
+budget for actual use). Confirmed this is about a *single* construct
+needing that many registers *at once* in one contiguous block, not
+about a frame's total register usage in general: 240 sequential `let`
+declarations, one statement at a time, compile and run fine - only a
+flat parameter list or a call's argument list, both of which need
+contiguous registers, hit the ceiling. Filed as
+[paserati#455](https://github.com/nooga/paserati/issues/455) with this
+exact bisection; not fixed here (per this investigation's own standing
+instruction not to touch paserati source).
+
+**Verification**: no noderati code changed this round (diagnostic
+only). `go vet ./...` and the full suite
+(`go test ./... -skip TestEventsAddAbortListener`) both clean.
+
+**Status**: the honest answer to "did we fix all paserati blockers" is
+no - `#426`'s GitHub closure reflected its own synthetic repro and the
+crash-containment half being fixed, not real babel/aws-s3 actually
+passing; both still fail today, on two different reasons that happen
+to share the same error message. aws-s3's own new blocker
+(`__static_field_init__`) is a distinct, not-yet-isolated finding for
+a future round.
