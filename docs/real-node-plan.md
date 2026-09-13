@@ -12958,3 +12958,43 @@ filed with precise root causes, just need someone to pick them up),
 then eslint's second parser blocker (Round 104, never isolated to a
 specific source line), then prettier's own reproduced-but-not-yet-
 minimized argument-splicing anomaly (Round 107).
+
+## Round 110: zod's `#432`/`#433` confirmed merged - a new, precisely
+isolated blocker found immediately after and filed as `paserati#451`
+
+Continuing "keep going on zod" from Round 107. Confirmed both
+`paserati#432` (`export { x as undefined }`) and `#433` (`export *`
+from a broken module now fails loudly) are merged - real, unmodified
+`zod@3.25.76`'s `v3/types.js` now parses correctly, and `import { z }
+from "zod"` no longer returns the badly-incomplete namespace Round 107
+found. Calling the actual API (`z.number()`, `z.object()`, etc.) hits a
+new, different, cleanly-isolated blocker instead:
+
+```
+ReferenceError: ZodFirstPartyTypeKind is not defined
+```
+
+**Root-caused and isolated to a minimal two-file repro, no zod
+involved.** A module-level function that forward-references a `var`
+declared later in the *same file* (real zod's shape: a class's static
+`.create` referencing a TS-compiled `enum` - `export var
+ZodFirstPartyTypeKind; (function(K){...})(ZodFirstPartyTypeKind || ...)`
+- declared at the very end of a ~3700-line file) works correctly when
+that file is run directly as the entry script, but throws when the
+*identical* file is loaded as an imported module and the function is
+called from there - even a synchronous call written at the very end of
+that same file, once it's loaded via `import` rather than run directly.
+Reordering the declarations (var before the function) fixes it either
+way. Points at the module-compilation path not doing the same
+hoisting pre-pass the entry-script path does. Filed as
+[paserati#451](https://github.com/nooga/paserati/issues/451) with the
+repro and this narrowing; not fixed here (paserati source left
+untouched, per this investigation's own standing instruction).
+
+**Status**: zod is one bug closer - the `export`/module-loading layer
+(`#432`/`#433`) is fully done, and the blocker has moved from "module
+won't even parse right" to "one precisely isolated var-hoisting-across-
+module-boundary bug," which is a real, load-bearing pattern (every zod
+schema builder uses it) but a single, clean root cause rather than a
+family of unrelated issues. Re-running `p07-zod.mjs` once `#451` lands
+is the next step.
