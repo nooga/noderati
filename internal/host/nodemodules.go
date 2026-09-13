@@ -327,6 +327,42 @@ func entryFromExports(exports json.RawMessage, key string, cond exportsCondition
 		return "", false, fmt.Errorf("unsupported exports format")
 	}
 
+	// Real Node's package-exports algorithm distinguishes two shapes for
+	// an object-valued "exports" field, by whether ANY of its own keys
+	// starts with "." (real Node treats this as invalid to mix, but only
+	// cares whether it's subpath-keyed at all): a subpath map
+	// (`{".": ..., "./foo": ...}`, handled below by the plain `asMap[key]`
+	// lookup) versus a *conditions* map for the "." entry itself, written
+	// without the "." key at all — `{"require": ..., "import": ...}` is
+	// real Node's documented shorthand for
+	// `{".": {"require": ..., "import": ...}}` when the package has no
+	// other subpaths to export. Missing this case entirely fell through
+	// to the "not found" return below, which then fell through further to
+	// this resolver's own `pkg.Main` fallback - silently picking the
+	// wrong file for the caller's condition (e.g. `require()`) instead of
+	// erroring or resolving correctly. Found via real,
+	// unmodified @eslint/plugin-kit@0.x, whose own package.json is
+	// exactly this shape (`"exports": {"require": {"default": "./dist/
+	// cjs/index.cjs"}, "import": {"default": "./dist/esm/index.js"}}`,
+	// no "." key) - `require("@eslint/plugin-kit")` fell back to
+	// `pkg.Main` ("dist/esm/index.js", the real ESM build) instead of the
+	// real "require" condition's own CJS build, then failed to compile
+	// with "import declarations can only appear at the top level of a
+	// module" once that real ESM source ended up wrapped in a CJS
+	// function body.
+	if key == "." {
+		hasSubpathKey := false
+		for k := range asMap {
+			if strings.HasPrefix(k, ".") {
+				hasSubpathKey = true
+				break
+			}
+		}
+		if !hasSubpathKey {
+			return resolveExportTarget(exports, cond)
+		}
+	}
+
 	value, ok := asMap[key]
 	if !ok {
 		return "", false, nil

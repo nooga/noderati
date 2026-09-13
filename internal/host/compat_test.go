@@ -216,6 +216,55 @@ func TestArrayExportsResolution(t *testing.T) {
 	}
 }
 
+// TestBareConditionsExportsResolution covers real Node's shorthand for a
+// package with no subpath exports at all: an "exports" object whose keys
+// are conditions ("require"/"import"/...) rather than subpaths (no "."
+// key anywhere) is itself the conditions map for the "." entry -
+// equivalent to wrapping it in {".": {...}}. Confirmed against real
+// @eslint/plugin-kit's own package.json (docs/real-node-plan.md, Round
+// 121), which ships exactly this shape
+// ("exports": {"require": {"default": "./dist/cjs/index.cjs"}, "import":
+// {"default": "./dist/esm/index.js"}}, no "." key) - missing this case
+// fell through all the way to this resolver's own "main" fallback,
+// silently loading the real ESM build for a require() call instead of
+// the real CJS one, which then failed to even compile ("import
+// declarations can only appear at the top level of a module") once that
+// real ESM source ended up wrapped in a CJS function body.
+func TestBareConditionsExportsResolution(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "node_modules", "bare-cond-exp", "package.json"), `{
+		"name": "bare-cond-exp",
+		"type": "module",
+		"main": "dist/esm/index.js",
+		"exports": {
+			"require": { "default": "./dist/cjs/index.cjs" },
+			"import": { "default": "./dist/esm/index.js" }
+		}
+	}`)
+	writeFile(t, filepath.Join(root, "node_modules", "bare-cond-exp", "dist", "cjs", "index.cjs"), `module.exports.tag = "cjs";`)
+	writeFile(t, filepath.Join(root, "node_modules", "bare-cond-exp", "dist", "esm", "index.js"), `export const tag = "esm";`)
+
+	appPath := filepath.Join(root, "app.ts")
+	writeFile(t, appPath, `import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+require("bare-cond-exp").tag;`)
+
+	origWD, _ := os.Getwd()
+	_ = os.Chdir(root)
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	p := New([]string{"noderati", appPath})
+	p.SetSkipTypeCheck(true)
+	source, _ := os.ReadFile(appPath)
+	val, errs := p.RunCode(string(source), driver.RunOptions{ModuleName: appPath, Filename: appPath})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "cjs" {
+		t.Errorf("bare conditions exports (require) = %q, want %q", val.ToString(), "cjs")
+	}
+}
+
 func TestCJSNamedExports(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "node_modules", "cjs-named", "package.json"), `{

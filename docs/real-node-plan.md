@@ -13694,3 +13694,118 @@ register-exhaustion causes standing between it and a clean import
 in the same dependency chain, and this round's own nested-literal-tree
 shape) - fixing one won't fix the other; both need to land before
 aws-s3 passes end to end.
+
+## Round 121: full breadth-sweep re-check (excluding babel/s3) - zod
+and handlebars confirmed genuinely fixed; a real noderati package-
+exports bug found and fixed; two new paserati bugs found and filed
+(`#472`, `#473`), both shared/broadly-impactful
+
+Prompted directly: re-check every Round 104 package except babel/s3
+(already tracked separately, `#470`/`#471`) against paserati `main`
+(still `9929d915`, unchanged since Round 120) and noderati's own
+current tree, since several fixes had landed since the last full
+sweep.
+
+**Confirmed genuinely fixed and passing, verified against both the
+real package probe and each issue's own standalone repro** (not just
+"the issue shows closed on GitHub" - each repro was re-run directly):
+- **zod** (`paserati#451` - var-hoisting across module boundary) -
+  `p07-zod.mjs` now prints `ok zod`.
+- **handlebars** (`paserati#454` - compound assignment in array
+  literal) - `p05-handlebars.mjs` now prints `ok handlebars`.
+- `paserati#452` (prettier's own args.slice/factory-closure anomaly)
+  and `paserati#453` (eslint-scope's `extends obj["key"].prop`) are
+  also both confirmed fixed via their own standalone repros - but
+  prettier and eslint themselves still fail overall, each on a *new*
+  blocker one layer deeper (see below) - "the issue that found this
+  bug is closed" and "the package now passes" are different questions,
+  worth checking separately every time.
+
+**Found and fixed, this round, a real noderati bug - not paserati's**:
+package.json's `"exports"` field can be a bare *conditions* map with no
+`"."` key at all (`{"require": {...}, "import": {...}}`), real Node's
+documented shorthand for `{".": {"require": {...}, "import": {...}}}`
+when a package has no other subpaths. `internal/host/nodemodules.go`'s
+`entryFromExports` only ever looked up `asMap["."]` directly - when
+that key was simply absent (not malformed, just legitimately not
+present in this valid shape), it silently fell through all the way to
+this resolver's own `pkg.Main` fallback, picking the wrong file for
+the caller's condition. Found via real, unmodified
+`@eslint/plugin-kit`'s own package.json (`"exports": {"require": {...
+cjs...}, "import": {...esm...}}`, no `"."` key) -
+`require("@eslint/plugin-kit")` (eslint's own real `lib/api.js` does
+this) resolved to the package's `"main"` field (the real ESM build)
+instead of the real CJS one, which then failed to even compile
+(`"import declarations can only appear at the top level of a
+module"`) once that genuine ESM source got wrapped in a CJS function
+body. Fixed: `entryFromExports` now checks, when resolving `"."`,
+whether *any* of the exports object's own keys start with `"."` - if
+none do, the whole object is itself the conditions map, handled by
+recursing into `resolveExportTarget` directly rather than requiring an
+explicit `"."` wrapper. New test,
+`TestBareConditionsExportsResolution`. Verified against the real
+package: eslint's own require chain now resolves the correct file and
+progresses past this point entirely.
+
+**Two new paserati bugs found and filed, both broadly shared across
+what's left failing:**
+
+- [paserati#472](https://github.com/nooga/paserati/issues/472) - a
+  **named** function expression assigned to a `var`, inside an
+  enclosing function, is invisible to a *sibling* function defined
+  afterward in the same scope (`TypeError: undefined is not a
+  constructor`/`is not a function`) - the identical shape with an
+  *anonymous* function expression works fine; the identical shape at
+  true top-level/module scope also works fine (this is not `#451`'s
+  own forward-reference-across-module-scope shape - `TokenType` here
+  is declared textually *before* `binop`, and it's a sibling function,
+  not the enclosing scope itself, that can't see it). Root-caused to
+  real, unmodified `acorn`'s own bundled tokenizer
+  (`var TokenType = function TokenType(label, conf) {...}; function
+  binop(name, prec) { return new TokenType(...); }`) - this single bug
+  is the *shared* remaining blocker for both `eslint` (via
+  `eslint-scope`'s own transitive `acorn` dependency) and `webpack`
+  (its own bundled `acorn`), confirmed identical stack traces
+  (`binop`) in both. Minimal, single-file, six-line repro included in
+  the issue. With the exports fix above landing, eslint now reaches
+  this exact bug directly - previously masked by the wrong-file
+  resolution bug fixed this round.
+- [paserati#473](https://github.com/nooga/paserati/issues/473) - a
+  computed property key (`[expr]: name`) inside a *nested* object
+  destructuring sub-pattern fails to parse
+  (`"invalid destructuring property key: [r] (only identifiers,
+  numbers, and bigints supported)"`) - the identical computed key at
+  the destructuring pattern's own *top level* (`const { [key]: value }
+  = obj;`) already works correctly; only nesting it inside another
+  property's own sub-pattern (`const { outer: { [key]: value } } =
+  obj;`) fails, suggesting two different code paths for the two
+  positions and only one of them was ever extended to accept a
+  computed key. Found via real, unmodified `prettier@3.6.2`'s own
+  bundled `estree.mjs` (`let { node: { [r]: n } } = e;`, one of its
+  own core, frequently-reused AST-helper functions) - blocks loading
+  prettier's `estree` plugin entirely, needed for any real formatting
+  call.
+
+Neither `#472` nor `#473` fixed here (per this investigation's own
+standing instruction not to touch paserati source without it being
+asked for again).
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean (one
+transient failure of the already-documented, pre-existing
+`TestURLSearchParamsIteration` order-dependent flake - confirmed
+non-reproducing on immediate re-run, unrelated to this round's
+changes); scoreboard clean. New test `TestBareConditionsExportsResolution`
+added alongside the fix.
+
+**Status - the full breadth-sweep slate, excluding babel/s3 (tracked
+separately via `#470`/`#471`), now stands at 7 of 11 passing**:
+commander, ajv, graphql, zod, handlebars, both AI SDKs. Remaining:
+eslint and webpack now share one single root cause (`#472`) rather
+than two separate ones; prettier has its own, separately-filed
+`#473`; sql.js is unchanged since Round 116's own WASM-runtime
+investigation (an "out of memory" from the real WASM binary's own
+allocator, a different subsystem entirely, still not root-caused).
+Fixing `#472` alone would very plausibly move both eslint and webpack
+forward simultaneously - the single highest-leverage remaining item on
+this whole slate.
