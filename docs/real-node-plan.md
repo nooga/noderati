@@ -12913,3 +12913,48 @@ net unchanged at the slate level since `#449` cancels out `ajv`'s own
 gain for this round's headline count, though the underlying chain of
 real fixes landed is substantial. `#449` is the next thing to watch for
 before re-running the two SDK probes.
+
+## Round 109: paserati#449 confirmed merged and fixed - both official
+AI provider SDKs pass again; breadth-sweep slate now 6/13
+
+Pulled paserati `main` (now `18fd0af5` - `2f4d1f00` fixes `#449`
+directly, "top-level self-reassigning closure no longer corrupts its
+own upvalue"; a same-day follow-up removed now-dead code the fix
+obsoleted). Rebuilt noderati clean.
+
+**Confirmed fixed and verified**: this round's own minimal repro
+(`let a = function () { a = () => "cached"; return "first"; };
+console.log(a()); console.log(a());`) now prints `first`/`cached`,
+matching real Node exactly - it used to fail to even compile. Real,
+unmodified `@anthropic-ai/sdk@0.68.0` and `openai@6.7.0` both pass
+their probes again (`ok anthropic-sdk`, `ok openai-sdk`), undoing
+Round 108's regression.
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean; scoreboard's
+`all-fakes-off` still matches `baseline` exactly (both now hit a
+different, unrelated `jiti`/`babel.cjs` require error in
+`pi-coding-agent`'s own bundled tree than Round 108 saw - an expected
+symptom of paserati moving underneath it, not a new discrepancy
+between the two configs, and not this round's own concern). Full
+paserati suite (`go test ./...`, all packages) also clean on the
+merged commit.
+
+**Round 104's breadth-sweep slate, re-run end to end: 6/13 now pass**
+(commander, ajv, graphql, `@anthropic-ai/sdk`, `openai`, plus the
+already-passing baseline) - up from 3/13 at Round 104 and 4/13 at
+Round 108. Still failing: prettier, eslint, babel, handlebars,
+aws-s3, sql.js, webpack - each on its own already-tracked or
+not-yet-isolated issue from prior rounds (zod/prettier ->
+`paserati#432`/`#433`; babel/aws-s3 -> the register-exhaustion
+capacity half of `paserati#426`, still open; eslint/handlebars/sql.js/
+webpack -> Round 104's own "not yet isolated" list, untouched since).
+
+**Status**: the register-freeing regression this chain has been
+chasing since Round 108 is fully closed, with no new regressions
+introduced fixing it. Next candidates for a future round, in rough
+order of how close each one already is: zod (`#432`/`#433`, both
+filed with precise root causes, just need someone to pick them up),
+then eslint's second parser blocker (Round 104, never isolated to a
+specific source line), then prettier's own reproduced-but-not-yet-
+minimized argument-splicing anomaly (Round 107).
