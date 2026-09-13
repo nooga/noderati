@@ -13544,3 +13544,72 @@ empty.
 aws-s3 blocker is the register-exhaustion ceiling already filed as
 `#455` in Round 117, confirmed (not assumed) to be the exact next
 thing hit once this round's own noderati-side fix is applied.
+
+## Round 119: paserati#455 confirmed merged; babel/aws-s3 still fail
+on register exhaustion - a third, distinct trigger found and bisected,
+filed as `paserati#470`
+
+Pulled paserati `main` (now `9929d915`, "spill callee parameters past
+the register ceiling" - `#455`'s own fix, from an unrelated
+`fix/467-callee-param-spill` branch, merged same round). Confirmed
+directly: this round's own >238-parameter and >238-call-argument
+minimal repros (Round 117) both now compile and run correctly,
+matching real Node exactly - `#455` is genuinely fixed.
+
+**Re-ran real `@babel/core@7.28.4` and `@aws-sdk/client-s3@3.918.0`
+anyway rather than assuming they'd now pass** (per a direct question:
+"what's up with s3/babel again, I thought we fixed all paserati
+blockers") - both still fail, with the identical
+`"register exhaustion: expression too deeply nested"` message, on a
+*third*, different trigger from both `#426` (fixed: sequential
+`if`/`ternary` nesting) and `#455` (fixed: >238 params/args in one
+contiguous allocation).
+
+**Isolated with the same temporary debug-print technique used in
+Rounds 112-115 (added and reverted this round, never committed)** to
+the exact failing file each time: real `@babel/types`'s own bundled
+`lib/builders/generated/uppercase.js` for babel, real
+`@aws-sdk/client-s3`'s own `dist-cjs/endpoint/ruleset.js` for s3.
+Bisected babel's own file down to a clean, minimal, dependency-free
+repro:
+```js
+let chain = [];
+for (let i = 0; i < 180; i++) chain.push("exports.N" + i);
+let decls = [];
+for (let i = 0; i < 150; i++) decls.push("M" + i + " = " + i);
+const body = "const exports = {};\n" + chain.join(" = ") + " = void 0;\nconst " + decls.join(",\n  ") + ";\nreturn M0;";
+new Function(body)(); // real Node: 0. paserati: register exhaustion
+```
+- a bare top-level chained-assignment *expression statement*
+(`exports.A = exports.B = ... = void 0;`, matching real babel's own
+generated re-export shape exactly, ~180 chain links) followed, later
+in the same top-level scope, by an unrelated multi-declarator `const`.
+Confirmed each half compiles and runs fine **in isolation** (the
+chained-assignment statement alone; a synthetic 253-declarator `const`
+block alone) - only the *combination*, in the same scope, exhausts the
+register budget. This is neither `#426`'s nor `#455`'s own shape - no
+nesting, no single construct needing >238 registers at once - it's a
+cross-statement leak specific to a plain chained-assignment expression
+statement, structurally the same *kind* of gap `#426`'s own fix closed
+for `let`/`const`/`var`/function-value declarations at global scope
+(each got a `c.regAlloc.Free()` added right after its value moved to
+its global slot) but for an ordinary expression statement, which none
+of those three functions cover. Filed as
+[paserati#470](https://github.com/nooga/paserati/issues/470) with this
+bisection and the suggested direction; not fixed here (per this
+investigation's own standing instruction not to touch paserati
+source).
+
+**Verification**: `go vet ./...` and the full suite
+(`go test ./... -skip TestEventsAddAbortListener`) both clean; the
+temporary debug print was reverted before committing - `git diff` on
+`internal/host/cjs.go` is empty.
+
+**Status**: the honest, direct answer this round confirmed (again) is
+that "closed on GitHub" and "actually works against the real package"
+are two different questions worth checking separately - `#455` is
+genuinely fixed and verified, but real babel/aws-s3 still fail today,
+now on a third distinct cause. aws-s3's own specific file
+(`endpoint/ruleset.js`) hasn't been bisected to its own minimal repro
+yet this round - worth checking whether it shares `#470`'s exact shape
+or is its own fourth thing, in a future round.
