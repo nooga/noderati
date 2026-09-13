@@ -13613,3 +13613,84 @@ now on a third distinct cause. aws-s3's own specific file
 (`endpoint/ruleset.js`) hasn't been bisected to its own minimal repro
 yet this round - worth checking whether it shares `#470`'s exact shape
 or is its own fourth thing, in a future round.
+
+## Round 120: aws-s3's own specific blocker isolated to a real, distinct
+fourth register-exhaustion trigger - a deeply/widely nested literal
+tree, filed as `paserati#471`; honestly not reduced to a synthetic
+repro this round
+
+Continuing "keep going on s3" past Round 119's babel-focused `#470`.
+Bisected aws-s3's own specific failing file, real, unmodified
+`@aws-sdk/client-s3`'s `dist-cjs/endpoint/ruleset.js` (a 7-line
+minified file), down to the exact two statements responsible: a
+`const` with ~55 short-named small-object/string-literal declarators
+(AWS's endpoint parameter-type constants), and, later in the same
+file, a single `const _data = {...}` - one real object literal
+encoding S3's actual endpoint-routing decision tree (confirmed: max
+brace/bracket nesting depth 39, ~16KB of source, real array-valued
+properties needing more than 32 elements at multiple points - the
+threshold where paserati's own array-literal compiler switches from
+direct-register to a chunked-copy strategy).
+
+**Confirmed real, isolated failure, neither half alone**: the small-
+constants `const` alone compiles and runs fine; the huge nested
+literal alone also compiles fine (fails only at *runtime* with a
+`ReferenceError` for names it references from the other statement,
+which is exactly how a successfully-*compiled* file behaves) - only
+the real, unmodified combination fails, with one of two related
+messages (`"array literal: no registers available for chunking"` or
+`"register exhaustion: expression too deeply nested"`) depending on
+exactly how much of the huge literal is present. Bisected via a
+bracket-balance-preserving truncation (cutting only at a real,
+depth-tracked comma, then closing whatever brackets are still open,
+rather than an arbitrary byte cut, to keep every candidate file
+actually valid JS) rather than blind byte-offset guessing: the real
+literal's own first ~10.5KB (of its real ~16KB) already reproduces;
+~10.0KB and below compiles fine.
+
+**Honestly did not reduce this to a hand-written synthetic repro this
+round, despite several serious attempts** - a `const` block of ~65
+small object-literal declarators followed by a recursively-generated
+`{conditions:[...], type:"tree", rules:[...]}`-shaped literal at
+various depths/breadths referencing them, at sizes exceeding the real
+file's own trigger threshold, did not reproduce. Whatever's actually
+needed is more specific than "big enough nested literal after a big
+enough preceding const block" - flagged this explicitly rather than
+presenting an under-tested synthetic case as equivalent, per this
+project's own standing discipline about not claiming more isolation
+than was actually achieved.
+
+**Likely a distinct, fourth root cause under the same error-message
+family** - not `#426` (sequential statement nesting, fixed), not
+`#455` (flat parameter/argument count, fixed), not `#470` (chained-
+assignment cross-statement leak, filed last round): `compileObjectLiteral`
+already frees each property's own temp registers eagerly per its own
+comment, specifically to avoid wide-object exhaustion, so a single
+level of many-property object literal isn't the obvious culprit. The
+more likely mechanism: each level of a recursively-nested literal
+needs its own live "hint" register while its children compile
+(correct and necessary for a register-based compiler) - a real tree 39
+levels deep, with several siblings needing chunked array compilation
+at various points, could genuinely need more simultaneously-live
+registers than the population `#455` already established as the
+per-frame budget. If so, this isn't a *leak* the way `#426`/`#470`
+were - it's a real, additional capacity limit specific to literal-tree
+nesting depth × breadth, which real engines don't have anything
+resembling. Filed as
+[paserati#471](https://github.com/nooga/paserati/issues/471) with the
+full bisection and this analysis; not fixed here (per this
+investigation's own standing instruction not to touch paserati
+source).
+
+**Verification**: no noderati code changed this round (diagnostic
+only - a temporary debug print in `cjsLoader.execFile`, reused from
+Rounds 112-115, was reverted before committing; `git diff` on
+`internal/host/cjs.go` is empty). `go vet ./...` and the full suite
+(`go test ./... -skip TestEventsAddAbortListener`) both clean.
+
+**Status**: real `@aws-sdk/client-s3` now has two distinct, filed
+register-exhaustion causes standing between it and a clean import
+(`#470`'s own chained-assignment shape, hit by a different real file
+in the same dependency chain, and this round's own nested-literal-tree
+shape) - fixing one won't fix the other; both need to land before
+aws-s3 passes end to end.
