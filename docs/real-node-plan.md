@@ -13066,3 +13066,60 @@ unminimized anomaly) is now a clean, filed, minimal repro - a genuinely
 different shape from `#438` (no tagged template, the affected closure
 in the minimal repro doesn't even call anything) despite looking
 adjacent in spirit. Re-run `p01-prettier.mjs` once `#452` lands.
+
+## Round 112: eslint's Round 104 blocker finally isolated to a specific
+file and root-caused precisely - filed as `paserati#453`
+
+Continuing "keep going on eslint" from Round 104, which bisected every
+individually-requirable file it tried without finding the trigger.
+Found it this round with one new piece of leverage: a temporary,
+noderati-only debug print in `cjsLoader.execFile` (`internal/host/
+cjs.go`, added and reverted within this round - never committed)
+logging the absolute path of whatever file paserati's own `RunScript`
+was compiling right before a parse failure. Immediately named it:
+`eslint-scope/dist/eslint-scope.cjs` - a real eslint dependency Round
+104's own file-by-file bisection pass never tried (it isn't `eslint`
+or `eslint-visitor-keys` themselves, and eslint's dependency tree is
+dozens of packages deep).
+
+**Root cause: real, unmodified `eslint-scope`'s own
+`class PatternVisitor extends esrecurse__default["default"].Visitor`**
+- an entirely ordinary runtime `extends` clause (the standard
+"unwrap a CJS default export via `[\"default\"]`" idiom, then a plain
+property access) - misparsed as a TypeScript type expression. Minimal,
+dependency-free repro:
+```js
+const lib = { default: { Base: class Base { greet() { return "base"; } } } };
+class Sub extends lib["default"].Base {
+  greet() { return "sub:" + super.greet(); }
+}
+console.log(new Sub().greet()); // real Node: "sub:base". paserati: parse error
+```
+Even the bare `class Sub extends lib["default"] {}` (no trailing
+`.Base`) already misparses, with a different symptom
+(`compilation not implemented for *parser.IndexedAccessTypeExpression`)
+- one underlying bug, two downstream errors depending on whether a
+`.prop` follows the `[...]`.
+
+**Located precisely in `pkg/parser/parse_class.go`'s `extends`-clause
+parsing**: it decides runtime-expression vs TypeScript-type parsing by
+checking whether the clause starts with an identifier followed by `(`
+(`isCallExpr`) or `.` (`isMemberCallExpr`) - never checking for an
+identifier followed by `[` (a computed member access), so
+`lib["default"]...` falls through to the type-expression parser, whose
+enum-qualified-name helper only accepts a plain identifier or
+dot-chain as its left side, not a computed access. Filed as
+[paserati#453](https://github.com/nooga/paserati/issues/453) with the
+exact location and a suggested one-condition fix; not fixed here (per
+this investigation's own standing instruction not to touch paserati
+source).
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean; the temporary
+debug print used to locate the failing file was reverted before this
+commit - `git diff internal/host/cjs.go` is empty.
+
+**Status**: 4 of the 7 remaining breadth-sweep failures now have a
+precise, filed root cause (zod -> `#451`, prettier -> `#452`, eslint ->
+`#453`, babel/aws-s3 -> the still-open capacity half of `#426`).
+Remaining, still not isolated: handlebars, sql.js, webpack.
