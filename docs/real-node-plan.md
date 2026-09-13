@@ -13333,3 +13333,74 @@ blocker open). Only babel/aws-s3's shared register-exhaustion capacity
 limit (`#426`, still open upstream) has had no further noderati-side
 work since Round 104 - every other original failure has moved forward
 at least one real layer this session.
+
+## Round 116: sql.js's new WASM "out of memory" blocker investigated -
+several real, concrete hypotheses ruled out with direct evidence, no
+root cause found yet
+
+Continuing "keep going on sql.js" past Round 115's fix (the ESM-
+detection bug). `new SQL.Database()` throws `Error: out of memory`
+from inside the real, unmodified WASM binary's own embedded string
+table (confirmed: the exact bytes for the string "out of memory" are
+present, correctly, in the module's own data section - `wasm-objdump`
+shows it plainly at segment 0, offset ~0x488) - a real
+`SQLITE_NOMEM`-shaped failure surfacing through Emscripten's own
+`abort`/error-propagation path, not a garbled or missing message.
+
+**Ruled out, each with a direct, isolated repro - not just
+argued:**
+- **Raw `memory.grow` executed from WASM bytecode itself** (a tiny
+  hand-written module: `memory (initial 1, max 100)` +
+  `(func (export "grow") ... memory.grow)`) grows correctly and
+  matches real Node exactly, including the expected failure once past
+  the declared max.
+- **The JS-visible `WebAssembly.Memory.prototype.grow()` method on an
+  *exported* memory object** (matching sql.js's own shape - the real
+  module exports its memory as `"M"`, not an imported one) - also
+  grows correctly from JS, `.buffer.byteLength` updates correctly
+  afterward, matching real Node.
+- **Passive data segments + explicit `memory.init`** (bulk-memory
+  operations) - copies correctly, matching real Node byte-for-byte.
+- **The memory-growth bridge (`wasmMemoryBridge.grow`,
+  `internal/host/webassembly_global.go`) is never even called** before
+  the OOM - confirmed directly with a temporary debug print (added and
+  reverted this round, never committed) that logs every real call to
+  it; none fired during the failing scenario. This rules out the
+  growth mechanism itself as the culprit entirely - whatever's wrong
+  happens before any growth is even attempted, on the module's own
+  initial 338 pages (~22MB, per `wasm-objdump`'s own memory-section
+  dump: `initial=338 max=32768`).
+
+**Not yet found**: what actually causes sqlite3's own allocator to
+believe it's out of that initial 22MB before ever trying to grow.
+Noted but not chased further this round: the module's real data
+section is split into 354 separate *active* segments at various fixed
+offsets (Binaryen's "memory packing" optimization - splitting one
+logical data blob into many smaller active segments to avoid encoding
+long runs of zero bytes, not passive segments needing explicit
+`memory.init` calls) - confirmed one specific segment (holding the
+"out of memory" string itself) loads correctly, but whether *every
+one* of the other 353 does too hasn't been checked exhaustively; a
+single mis-loaded segment elsewhere (a lookip table, a bookkeeping
+constant sqlite3's allocator depends on) could plausibly produce
+exactly this symptom without ever needing to grow memory at all.
+
+**Verification**: no noderati code changed this round - both temporary
+debug prints (the `wasmMemoryBridge.grow` logger, and an earlier one
+in `cjsLoader.execFile` reused from prior rounds but not needed this
+time) were reverted before committing; `git diff` on
+`internal/host/webassembly_global.go` is empty. `go vet ./...` and the
+full suite (`go test ./... -skip TestEventsAddAbortListener`) both
+clean regardless.
+
+**Status**: this is a genuinely deeper investigation than the other
+Round-104 blockers turned out to be - closer in kind to the multi-
+round WASM/Emscripten work rounds 76-96 did for the Photon image-
+resizing chain than to a single-file parser bug. Real progress was
+made (several concrete, plausible mechanisms directly tested and ruled
+out, not just assumed innocent), but the actual root cause remains
+open. A good candidate for a dedicated future investigation with more
+time budgeted specifically for WASM-level debugging (a byte-level
+memory dump comparison against real Node/wasmtime at the exact point
+of failure is the next concrete step, rather than more hypothesis
+testing from the JS-glue side).
