@@ -13809,3 +13809,152 @@ allocator, a different subsystem entirely, still not root-caused).
 Fixing `#472` alone would very plausibly move both eslint and webpack
 forward simultaneously - the single highest-leverage remaining item on
 this whole slate.
+
+## Round 122: paserati#470/#471/#472/#473 all confirmed merged - aws-s3
+now passes end to end; three real noderati fs gaps found and fixed;
+three new paserati bugs found and filed (`#476` an uncaught panic,
+`#477`, `#478`) - slate now 8/13, the best this whole investigation has
+reached
+
+Pulled paserati `main` (now `6f79c29e`, four commits past Round
+121's own `9929d915`: `ce18218a` fixes `#473`, `250f3fc8` fixes
+`#472`, `e6eab0e4` fixes `#470`, `6f79c29e` fixes `#471`). Full
+paserati suite (`go test ./...`) clean on the merged tree.
+
+**All four confirmed genuinely fixed, verified directly against each
+issue's own minimal repro** - not assumed from GitHub's closed status:
+`#470` (chained-assignment leak), `#471` (nested literal tree
+capacity), `#472` (named-function-expression sibling visibility),
+`#473` (nested computed destructuring key) all now match real Node
+exactly on their own standalone repros.
+
+**`@aws-sdk/client-s3` now passes its full probe end to end** -
+`p11-aws-s3.mjs` prints `ok aws-s3 probe reached end`, matching real
+Node. This closes the aws-s3 side of the investigation that ran
+rounds 117-120 (register-exhaustion bisection) and Round 118
+(AsyncLocalStorage) - both of its real blockers are gone.
+
+**Three real noderati bugs found and fixed this round, all the same
+shape**: real, unmodified `eslint@9.36.0`'s own transitive
+dependencies each do `util.promisify(fs.someFunction)` at their own
+module top level, unconditionally, for three different `fs` functions
+that had a `Sync`/`fs.promises` variant already implemented but no
+callback-style one - the exact gap `internal/host/fs_async.go`'s own
+`mkdir`/`stat`/`rmdir`/`utimes`/`realpath` were added for previously,
+just not extended to cover these three:
+- `eslint/lib/eslint/legacy-eslint.js`: `promisify(fs.writeFile)` -
+  **`fs.writeFile`/`fs.readFile`** were entirely missing (only the Sync
+  and Promise-based variants existed).
+- `locate-path` (a real, transitive dependency via `find-up`):
+  `promisify(fs.lstat)` - **`fs.lstat`** was missing (its sibling
+  `fs.stat` already existed).
+- `path-exists` (transitive via `find-up` too): `promisify(fs.access)`
+  - **`fs.access`** was missing.
+
+**Fixed with a real complication worth recording**: the first attempt
+at `readFile`/`writeFile` used `opts ...interface{}` (matching the
+existing Sync/Promise variants' own signature, which never need to
+distinguish an options object from a callback function) - this
+compiled and looked plausible, but hung forever the moment it was
+actually exercised via `await promisify(fs.writeFile)(...)`. Root
+cause, found by testing the pre-existing `mkdir`/`stat` (which do work
+correctly when promisified) against the new functions side by side:
+paserati's own reflection-based argument binding
+(`vmValueToReflectValue`, `native_module.go`) converts a Go `interface{}`
+parameter to a *concrete* Go type (string/float64/bool/map), and its
+own conversion table has no representation for "a callable function" -
+falling through to a Go `nil` for a function argument specifically.
+`mkdir`/`stat`/etc. never hit this because their callback parameter is
+declared as a *named, non-variadic* `vm.Value` (which the same
+reflection code has a dedicated identity-preserving case for), not
+folded into a generic `interface{}` slot. Fixed by declaring
+`opts ...vm.Value` instead - the identical identity-preserving case
+also applies to a variadic slice's own element type, so this correctly
+receives the real, uncoverted value for each trailing argument, and a
+new small helper (`fsAsyncEncodingFromValue`) reads the encoding
+option directly off the raw value where needed. New tests,
+`TestFSAsyncWriteFileReadFile`, `TestFSAsyncWriteFileError`,
+`TestFSAsyncLstatAndAccess`.
+
+**Three new paserati bugs found and filed, all found continuing to
+chase eslint deeper once the fs gaps above stopped blocking it -
+eslint itself still doesn't pass, on three more, real, unrelated
+bugs found in quick succession as each one was fixed/confirmed and the
+next one surfaced:**
+
+- [paserati#476](https://github.com/nooga/paserati/issues/476) - **an
+  uncaught Go panic**, not a returned compile error - the same severity
+  class `#426`'s own containment work was specifically about (and that
+  containment does *not* cover this path: identical code compiled via
+  `new Function()` gets a clean, catchable `SyntaxError`; compiled as
+  an ordinary script/CJS-required module - real Node's own default
+  execution path - crashes the whole process). Minimal five-line repro:
+  a `var f = function(){}` declared inside a bare block, referenced
+  after the block (ordinary `var`-hoists-out-of-a-block semantics, real
+  Node handles trivially). Found via real, unmodified
+  `@babel/preset-env@7.28.3`'s own module top level, which has exactly
+  this shape. Flagged as plausibly adjacent to this same round's own
+  `#470`/`#472`/`#471` register/closure-binding work, not verified by
+  bisection.
+- [paserati#477](https://github.com/nooga/paserati/issues/477) - an
+  async arrow function with an array-destructured 2nd parameter and a
+  block body, passed as an argument to `Array.prototype.reduce`, fails
+  to parse (`"unexpected token after 'async': ("`). Narrowed to a
+  precise, if slightly startling, combination: needs the arrow passed
+  as a call argument to a real built-in array method specifically (an
+  identical hand-written object method of the same name does not
+  reproduce), needs the receiver array's own elements to themselves be
+  destructurable, and needs a block body (implicit-return arrows don't
+  reproduce) - the parse-time failure depending on a *runtime* element
+  type strongly suggests some speculative/lookahead disambiguation
+  during parsing that consults the checker's own generic-signature
+  machinery for a builtin like `.reduce`. Found via real, unmodified
+  `webpack@5.102.1`'s own bundled `terser-webpack-plugin` dependency
+  (webpack's own default minimizer, loaded unconditionally).
+- [paserati#478](https://github.com/nooga/paserati/issues/478) - a
+  class with a private field, extending a built-in like `Array` or
+  `Map`, throws `"Cannot add private field"` on every construction -
+  reproduces with zero constructor arguments and no user-defined
+  constructor at all (just the implicit default one calling
+  `super(...)`); does *not* reproduce extending `Error` or an ordinary
+  user-defined base class, only real built-ins with internal state.
+  Found via real, unmodified `@eslint/config-array`'s own
+  `class ConfigArray extends Array { #namespacedBasePath; ... }` -
+  eslint's own real, load-bearing config-resolution class.
+
+None of the three fixed here (per this investigation's own standing
+instruction not to touch paserati source without it being asked for
+again).
+
+**Prettier**: past `#452`'s own fix (confirmed), but now produces
+visibly wrong *output* rather than an error - `prettier.format("const
+x={a:1,b:2}\n", {parser:"babel"})` returns every object literal broken
+across multiple lines with no indentation and no semicolon, where real
+Node's own prettier returns the correct single-line `const x = { a: 1,
+b: 2 };`. This is a silent-wrong-output bug, not a crash - genuinely
+deeper (prettier's own doc-printer `fits()`/width-measurement logic,
+not a parse/compile-time issue) and not chased further this round;
+flagged for a dedicated future pass rather than a quick follow-on.
+
+**sql.js**: unchanged since Round 116 (the real WASM binary's own
+allocator, a different subsystem).
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean, including
+all three new `TestFSAsync*` tests; scoreboard clean. Every temporary
+debug print used to trace each of the three fs gaps and the three new
+paserati bugs (`DEBUG-REQUIRE`, `DEBUG-PARSE-FAIL`, `DEBUG-PROMISIFY-
+BAD-ARG`) was reverted before committing - `git diff` on
+`internal/host/cjs.go` and `internal/host/util.go` is empty.
+
+**Status**: **8 of 13** original breadth-sweep packages now pass -
+ajv, handlebars, graphql, zod, commander, both AI SDKs, and now
+aws-s3. This is the highest this slate has reached across the whole
+investigation (started at 3/13 in Round 104). Remaining: prettier
+(output-correctness bug, not yet isolated), eslint (now blocked on
+`#478`, a private-field/built-in-subclass VM bug, having already moved
+past the exports-resolution fix and all three fs gaps from this same
+round), babel (`#476`'s uncaught panic), webpack (`#477`'s async-arrow
+parse bug, having already moved past its own `require(".")`
+resolution fix and `#472`), sql.js (Round 116's own separate WASM
+investigation, untouched this round).
