@@ -373,6 +373,57 @@ func TestNodeModulesResolverResolveSubpath(t *testing.T) {
 	}
 }
 
+// TestNodeModulesResolverResolveJSONSubpath guards real Node's own
+// require()/import extension-resolution order (.js/.json/.node, checked
+// in exactly that order) reaching a real .json file at a bare subpath
+// with no matching .js/.mjs/.ts sibling and no package.json "exports"
+// map entry for it. Confirmed against real, unmodified
+// @babel/preset-env@7.28.3 (docs/real-node-plan.md, Round 123): its own
+// bundled `require("core-js-compat/data")` resolves to real
+// core-js-compat's own `data.json` (no `data.js` exists at all) - this
+// resolver's own candidate list (tryExistingFile, nodemodules.go) never
+// tried a .json extension, so a subpath specifier landing on a real
+// .json sibling with no other match failed with "Cannot find module"
+// even though the file genuinely exists on disk.
+func TestNodeModulesResolverResolveJSONSubpath(t *testing.T) {
+	root := t.TempDir()
+
+	writeFile(t, filepath.Join(root, "node_modules", "demo-pkg", "package.json"), `{
+		"name": "demo-pkg",
+		"main": "index.js"
+	}`)
+	writeFile(t, filepath.Join(root, "node_modules", "demo-pkg", "index.js"), `module.exports = {};`)
+	writeFile(t, filepath.Join(root, "node_modules", "demo-pkg", "data.json"), `{"answer": 42}`)
+
+	appPath := filepath.Join(root, "app.cjs")
+	writeFile(t, appPath, `module.exports = require("demo-pkg/data").answer;`)
+
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(root); err != nil {
+		t.Fatalf("Chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(origWD)
+	})
+
+	p := New([]string{"noderati", appPath})
+	p.SetSkipTypeCheck(true)
+	source, err := os.ReadFile(appPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	val, errs := RunCJS(p, string(source), appPath)
+	if len(errs) > 0 {
+		t.Fatalf("RunCJS: %v", errs[0])
+	}
+	if val.ToFloat() != 42 {
+		t.Errorf("json subpath result = %v, want 42", val)
+	}
+}
+
 func TestNodeModulesCJSDefaultImport(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "node_modules", "cjs-pkg", "package.json"), `{

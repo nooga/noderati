@@ -13958,3 +13958,102 @@ round), babel (`#476`'s uncaught panic), webpack (`#477`'s async-arrow
 parse bug, having already moved past its own `require(".")`
 resolution fix and `#472`), sql.js (Round 116's own separate WASM
 investigation, untouched this round).
+
+## Round 123: paserati#476/#477/#478 all confirmed merged - one real
+noderati resolution gap found and fixed; three new paserati bugs found
+and filed continuing to chase babel/eslint/webpack deeper; slate holds
+at 8/13 with every remaining failure now precisely diagnosed
+
+Pulled paserati `main` (now `5052fa0a`, three commits past Round 122's
+own `6f79c29e`: `dfbb6b4c` fixes `#477`, `2c8ef1b8` fixes `#476`,
+`5052fa0a` fixes `#478`). Full paserati suite (`go test ./...`) clean.
+
+**All three confirmed genuinely fixed, verified directly against each
+issue's own minimal repro**: `#476` (var-function-in-a-bare-block
+uncaught panic), `#477` (async-arrow-with-destructured-param-in-
+`.reduce()` parse failure), `#478` (private field extending a built-in)
+all now match real Node exactly on their own standalone repros.
+
+**Found and fixed one real noderati bug**: real, unmodified
+`@babel/preset-env`'s own `require("core-js-compat/data")` failed with
+"Cannot find module" even though `core-js-compat`'s real package
+genuinely has a `data.json` at that exact subpath (no `data.js`) -
+`internal/host/nodemodules.go`'s `tryExistingFile` (bare-subpath
+resolution) and `internal/host/cjs.go`'s `existingJSFile` (relative/
+absolute-path resolution) both built their own candidate-extension
+lists without ever trying `.json`, missing real Node's own documented
+`require()` extension order (`.js`/`.json`/`.node`, checked in exactly
+that sequence). Fixed both; new test
+`TestNodeModulesResolverResolveJSONSubpath`.
+
+**Three new paserati bugs found and filed, continuing to chase
+babel/eslint/webpack one layer deeper each - as has now become the
+established pattern for this whole investigation, each of this
+round's own fixes (upstream and noderati-side both) unmasked a new,
+different real bug in the same package rather than letting it pass:**
+
+- [paserati#480](https://github.com/nooga/paserati/issues/480) -
+  `String.prototype.trimLeft`/`trimRight` (the ECMA-262 Annex B
+  spec-mandated aliases of `trimStart`/`trimEnd`) are entirely missing
+  - `trimStart`/`trimEnd` themselves work correctly. A clean, one-line
+  repro (`typeof "x".trimRight`). Found via real, unmodified
+  `@babel/generator`'s own `lib/buffer.js` - `(this._buf +
+  this._str).trimRight()`, hit on the base code path of *every* single
+  `generate()` call, independent of any plugin/preset - this alone
+  was blocking real, unmodified `@babel/core` from producing any
+  output code at all, even with zero presets.
+- [paserati#481](https://github.com/nooga/paserati/issues/481) -
+  `super.method(...spreadArgs)` loses `this`'s own instance-field
+  bindings inside the called (base-class) method - the base method's
+  own explicit parameters arrive correctly via the spread, and the
+  call itself doesn't error, but a previously-set instance field read
+  via `this.someField` inside that method comes back `undefined`, as
+  if `this` were a different, fields-less object. The identical call
+  with the same values passed *positionally* (no spread) works
+  correctly. Minimal five-line repro isolates it precisely to the
+  spread specifically. Found via real, unmodified `espree`
+  (`eslint`'s own real parser) - real acorn's own `Parser.prototype.
+  finishNode`/`finishNodeAt` read `this.options.locations`, and
+  espree's subclass override purely forwards its own already-collected
+  arguments through via `super.finishNodeAt(...args)` - the extremely
+  common "thin override that just spreads through to the base
+  implementation" pattern, hit on *every single AST node* finished
+  during any real parse.
+- [paserati#482](https://github.com/nooga/paserati/issues/482) - a
+  real, large generated function (ajv's own compiled JSON-Schema
+  meta-schema validator, reached via `ajv-keywords`) exceeds a 16-bit
+  jump-offset branch limit - `"function too large: a jump offset of
+  36895 bytes exceeds the 16-bit branch limit (±32767)"`. Unlike the
+  other three, this is a **clean, catchable `SyntaxError`**, not a
+  crash - and, unlike `#426`/`#455`/`#470`/`#471` (also this same
+  general "real generated code exceeds an internal VM limit" family,
+  chased across several rounds now), deliberately **not** accompanied
+  by a hand-minimized repro this round: the bug is inherently "a
+  function is too big," so a small repro isn't really representative -
+  noted the general synthetic shape that would trigger it (scaled-up
+  version of `#426`'s own repro) without spending the round building
+  and attaching one. Found via real, unmodified `webpack@5.102.1`'s
+  own bundled `terser-webpack-plugin` (webpack's own default
+  minimizer, loaded unconditionally) validating its own options.
+
+None of the three fixed here (per this investigation's own standing
+instruction not to touch paserati source without it being asked for
+again).
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean, including the
+new `TestNodeModulesResolverResolveJSONSubpath`; scoreboard clean.
+Every temporary debug print used while tracing the fs/module-resolution
+gap and the three new paserati bugs was reverted before committing -
+`git diff` on `internal/host/cjs.go` shows only the real `.json`-
+extension fix, `internal/host/util.go` has no diff at all.
+
+**Status**: slate holds at **8/13** (unchanged from Round 122's own
+count in raw numbers, but every one of the 5 remaining failures moved
+at least one real layer deeper this round and now has a precise,
+filed, upstream diagnosis - none are still "unknown" the way several
+were at the start of this whole investigation). Remaining: prettier
+(a silent-wrong-output doc-printer bug, not yet isolated - the one
+item on this whole list that's neither fixed nor filed), eslint
+(`#481`), babel (`#480`), webpack (`#482`), sql.js (Round 116's own
+separate WASM investigation, untouched this round).

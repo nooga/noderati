@@ -454,9 +454,22 @@ func tryExistingFile(pkgDir, subpath string) (string, bool) {
 		subpath + ".js",
 		subpath + ".mjs",
 		subpath + ".ts",
+		// Real Node's own require() extension-resolution order
+		// (Module._extensions, checked in exactly this order:
+		// .js/.json/.node) tries .json right after .js, before ever
+		// falling back to a directory index - a subpath specifier with
+		// no matching .js/.mjs/.ts file but a real .json sibling should
+		// resolve to that JSON file, not "not found". Found via real,
+		// unmodified `@babel/preset-env`'s own bundled
+		// `require("core-js-compat/data")` (docs/real-node-plan.md,
+		// Round 123) - `core-js-compat`'s real package has a
+		// `data.json`, not a `data.js`, at that subpath, and this list
+		// never tried the `.json` extension at all.
+		subpath + ".json",
 		filepath.Join(subpath, "index.js"),
 		filepath.Join(subpath, "index.mjs"),
 		filepath.Join(subpath, "index.ts"),
+		filepath.Join(subpath, "index.json"),
 	}
 
 	for _, candidate := range candidates {

@@ -582,8 +582,19 @@ func existingJSFile(target string) (string, error) {
 		target,
 		target + ".js",
 		target + ".cjs",
+		// Same real Node require() extension order (.js/.json/.node) as
+		// nodemodules.go's own tryExistingFile - see that function's
+		// comment for the real package (core-js-compat/data.json) that
+		// found this gap. This path handles the relative/absolute
+		// require() case; tryExistingFile handles the bare-subpath one -
+		// kept as two separate lists (this file predates that one and
+		// has its own .cjs entry tryExistingFile doesn't) rather than
+		// unifying them, so fixing one doesn't risk silently changing
+		// the other's already-verified behavior.
+		target + ".json",
 		filepath.Join(target, "index.js"),
 		filepath.Join(target, "index.cjs"),
+		filepath.Join(target, "index.json"),
 	}
 	for _, c := range candidates {
 		info, err := os.Stat(c)
