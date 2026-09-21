@@ -14725,3 +14725,163 @@ investigation, deliberately not revisited in any of the rounds since
 between all took priority as they were each closer to a real,
 reachable fix) - the last, and now only, item on the entire 13-package
 slate.
+
+## Round 130: sql.js's "out of memory" root-caused and fixed - a real
+noderati bug in the WASM host-import memory bridge, not paserati's;
+13/13 on the breadth-sweep slate for the first time
+
+Picked up Round 116's own explicit hand-off ("a good candidate for a
+dedicated future investigation with more time budgeted specifically
+for WASM-level debugging"). Rebuilt noderati and reran Round 116's own
+probe (`p12-sqljs.mjs`, scratchpad-local sql.js@1.13.0 install,
+regenerated fresh this round since the prior scratchpad's
+`node_modules` had been stripped between sessions, per this
+investigation's own recurring caveat) - confirmed the exact same
+failure Round 116 documented: `new SQL.Database()` throws real
+`Error: out of memory` from inside the real, unmodified WASM binary's
+own embedded string table, while real Node succeeds and returns
+correct query results for the same script.
+
+**Diagnosis approach**: rather than more JS-glue-side hypothesis
+testing (Round 116's own approach, which correctly ruled out several
+mechanisms but never found the actual cause), instrumented the real,
+unmodified `sql.js@1.13.0` package directly - wrapping every one of
+its 38 WASM host-import functions and every exported WASM function
+with a call-logging shim (added to the scratchpad's own vendored copy
+only, reverted before committing, same technique Round 87 and Round
+128 each used on llhttp/prettier's own vendored source) - then ran the
+identical script under real Node and under noderati and diffed the
+call traces. Real Node made **105** import calls and **11** export
+calls before `new SQL.Database()` returned successfully; noderati made
+only **3** import calls and **7** export calls before throwing -
+pinpointing the exact divergence to a specific internal function
+(export key `Ca`, sql.js's own locale/allocator setup routine, called
+early during `sqlite3_initialize`) returning `0` (success) under real
+Node but `14` under noderati, on **byte-for-byte identical input
+pointers**.
+
+Traced `Ca`'s own disassembly (`wasm2wat`/`wasm-objdump` against the
+real binary) to find it internally calls `sqlite3Malloc64(536)`
+(export-patched a temporary debug entry point onto the real, unmodified
+`.wasm` binary via direct binary-level Export-section surgery - a
+small Python LEB128 patcher, not a source rebuild - to call it and its
+locale-check sibling directly and compare results in isolation; both
+matched between engines when driven with synthetic stub imports,
+ruling out wazero's own bytecode execution, malloc, table, and memory-
+size handling as the cause entirely). Dumped the actual bytes at the
+real destination pointer sql.js's own `environ_get` import (WASI-
+shaped, one of the 38 real imports) is supposed to have written
+environment-variable text into, immediately before `Ca` runs: real
+Node showed the genuine `"USER=web_user\0LOGNAME=web_user\0..."` text;
+noderati showed all zero bytes. The write was being silently
+discarded.
+
+**Root cause**: `internal/host/webassembly_global.go`'s
+`wasmMemoryBridge` - the copy-based JS<->wasm linear-memory bridge
+(no way to alias wazero's real memory as paserati's own
+`ArrayBufferObject` backing store, so JS and wasm each see a separate
+copy, synced explicitly at crossing points) - only ever synced its
+cached `ArrayBuffer` back into wazero's real memory (`syncIn`,
+gated on `!dirty`) at the very *outer* boundary, immediately before an
+exported wasm function is called from top-level JS. `makeHostImportTrampoline`
+- the *inner* boundary, wasm calling back into a JS import function
+mid-execution - never synced at all. Since `markDirty()` is called
+once, right before the outer call begins, and nothing ever resets it
+back to `false` except an actual `.buffer` property read, the
+dirty flag stays permanently `true` from that point on - so any JS
+import callback that writes into `memory.buffer` (which is the entire
+purpose of imports like `environ_get`, `getcwd`, and every other WASI-
+shaped syscall real Emscripten output needs) has its write land only
+in the bridge's cache, never in wazero's real linear memory, which is
+what wasm bytecode actually reads. This had never surfaced before
+because every prior real WASM consumer this bridge supports (undici's
+llhttp, photon's wasm-bindgen glue) only ever uses import callbacks to
+*read* data wasm already wrote into its own memory, never to write
+data *into* wasm memory from JS - a direction this bridge's design
+never exercised until sql.js's own libc/Emscripten-runtime imports.
+
+Confirmed with a minimal, dependency-free repro - a hand-written `.wat`
+module, no vendored package involved at all:
+```wat
+(module
+  (import "env" "write" (func $write (param i32)))
+  (memory (export "mem") 1)
+  (func (export "run") (param $ptr i32) (result i32)
+    local.get $ptr
+    call $write
+    local.get $ptr
+    i32.load8_u))
+```
+with a JS import `write(ptr)` that does
+`new Uint8Array(instance.exports.mem.buffer)[ptr] = 0x42` and an
+exported `run(ptr)` that calls it then reads the same byte back: real
+Node returns `66` (`0x42`); noderati returned `0` - the import's write
+never reached wasm's own view of memory.
+
+**Fix**: bracket every host-import call (not just the outer exported-
+call boundary) with an unconditional pull-then-push sync, added as
+`wasmMemoryBridge.forceSyncIn()` alongside the existing `syncOut()`:
+`syncOut()` immediately before handing control to the JS import
+function (so whatever the import reads/writes reflects an accurate,
+current snapshot of real wasm memory), `forceSyncIn()` immediately
+after it returns (so anything the import wrote lands back in real wasm
+memory before execution resumes). A first attempt reused the existing
+dirty-gated `syncIn()` (bracketing with `markDirty()`+`syncIn()`
+instead) and fixed the minimal `.wat` repro above, but *not* real
+sql.js: real Emscripten-generated glue never re-reads `.buffer` per
+call the way the minimal repro's `write()` does - it fetches the live
+view exactly once, right after instantiation, caches it in a module-
+level variable, and reuses that same cached view for the module's
+entire lifetime (the same caching shape `detachIfGrownLocked`'s own
+existing doc comment already described for the *grow* case). Under
+that shape, `.buffer` is never read again after the first access, so
+the dirty flag this bridge's freshness tracking depends on never
+resets to `false`, and a guard checking it never opens. `forceSyncIn()`
+sidesteps this entirely by not depending on the dirty flag at all - it
+is unconditionally safe specifically because `syncOut()` always runs
+immediately before it in the same bracket, guaranteeing the cache was
+an accurate baseline the instant JS was handed it.
+
+Added two Go tests (`internal/host/webassembly_global_test.go`) against
+the existing hand-written WASM fixture (`testdata/wasm_fixture.wat`,
+already exposes a `host_add` import and `read_byte`/`write_byte`
+exports): `TestWebAssemblyHostImportWriteViaFreshBufferFetch` (the
+minimal-repro shape) and `TestWebAssemblyHostImportWriteViaCachedView`
+(the real sql.js shape - a view fetched once, outside the callback,
+reused across calls). Confirmed both fail against the pre-fix code
+with the exact real symptom (`readBack: 0`, the write silently
+discarded) via `git stash` before implementing the fix, and both pass
+after.
+
+**Verification**: rebuilt noderati and reran the real, completely
+unmodified `sql.js@1.13.0` probe directly (`sql-wasm.js`/
+`sql-wasm.wasm` restored byte-identical to their pristine npm-installed
+state, confirmed via `diff` against a pre-instrumentation backup) -
+`new SQL.Database()` now succeeds, `CREATE TABLE`/`INSERT`/`SELECT`
+all run correctly, and the query result matches real Node's own output
+exactly (`[[1,"x"],[2,"y"]]`). `go vet ./...` clean. Full suite
+(`go test ./... -skip TestEventsAddAbortListener -count=1`) clean,
+including the two new tests; `TestEventsAddAbortListener` itself and
+(intermittently, confirmed pre-existing and unrelated via `git stash`
+- reproduces identically on unmodified `main`) `TestURLSearchParamsIteration`
+remain the same known test-ordering flakiness every recent round has
+already excluded/noted, not something this round's change touches.
+Scoreboard (`go run ./cmd/scoreboard`) shows the same
+baseline/all-fakes-off pairing as every prior round. Re-ran the other
+12 packages' own scratchpad probes directly against the rebuilt
+binary - all still pass. `p13-webpack.mjs` failed in this session's
+scratchpad specifically ("promise remains pending", a top-level-await
+diagnostic, not a WASM-related error) - confirmed via a side-by-side
+build of the pre-fix binary that this reproduces byte-for-byte
+identically with or without this round's change, i.e. a pre-existing
+scratchpad-environment issue (most likely stale/partial
+`node_modules` from an earlier session, the same recurring caveat
+noted at the top of this round and in Round 116's own hand-off), not a
+regression - Round 127 already confirmed real webpack passes with a
+correctly-provisioned probe.
+
+**Status**: **13/13**. Every package on the original breadth-sweep
+slate (prettier, eslint, babel, webpack, ajv, handlebars, graphql,
+zod, commander, anthropic-sdk, openai-sdk, aws-s3, sql.js) now passes
+against real, unmodified npm packages under noderati. This closes the
+entire slate this investigation was built around.

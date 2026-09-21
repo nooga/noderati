@@ -223,6 +223,95 @@ func TestWebAssemblyHostImportReentrancy(t *testing.T) {
 	}
 }
 
+// TestWebAssemblyHostImportWriteViaFreshBufferFetch exercises a JS host
+// import callback that writes into wasm memory *during* a wasm exported-
+// function call, via a `.buffer` access made fresh inside the callback -
+// the sql.js "out of memory" investigation's own root cause
+// (docs/real-node-plan.md): the write must be visible to wasm bytecode
+// as soon as the import returns (the wasm-internal `read_byte` call this
+// test makes is nested inside the *same* outer JS->wasm call as the
+// write, via a second exported call right after - see the cached-view
+// variant below for a write observed from *within* the same call that
+// made it), not silently dropped because the memory bridge's cache was
+// never pushed back into wazero's real linear memory.
+func TestWebAssemblyHostImportWriteViaFreshBufferFetch(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	installWasmFixtureBuffer(t, p)
+	val, errs := p.RunCode(`
+		const mod = new WebAssembly.Module(FIXTURE_WASM_BYTES);
+		let inst;
+		inst = new WebAssembly.Instance(mod, {
+			env: { host_add: (a, b) => {
+				// Fresh .buffer fetch every call - not cached across calls.
+				new Uint8Array(inst.exports.memory.buffer)[500] = 0xAB;
+				return a + b;
+			} }
+		});
+		const sum = inst.exports.add_via_host(1, 2);
+		const readBack = inst.exports.read_byte(500);
+		JSON.stringify({ sum, readBack })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"sum":3,"readBack":171}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
+// TestWebAssemblyHostImportWriteViaCachedView is
+// TestWebAssemblyHostImportWriteViaFreshBufferFetch's harder sibling,
+// and the one that actually caught the real bug: real Emscripten-
+// generated glue (sql.js, and every other emscripten package this
+// investigation has touched) never re-fetches `.buffer` per call the
+// way the fresh-fetch variant above does - it fetches the live view
+// exactly *once*, right after instantiation
+// (`updateMemoryViews()`-shaped code), caches it in a module-level
+// variable, and reuses that same view for every subsequent import call
+// for the module's entire lifetime. A first fix attempt (bracketing the
+// host import trampoline with the *same* dirty-flag-gated
+// markDirty()/syncIn() pair the outer JS-calls-an-export boundary uses)
+// passed the fresh-fetch variant above but failed this one silently
+// (real sql.js's own environ_get wrote zero bytes instead of real
+// environment-variable text, eventually surfacing many calls later as
+// a spurious sqlite3 "out of memory") - because with a pre-cached view,
+// `.buffer` is never accessed again after the first call, so the dirty
+// flag this bridge's freshness-tracking depends on never resets to
+// false, and the guarded push never fires. See
+// wasmMemoryBridge.forceSyncIn's own doc comment for the actual fix
+// (an unconditional pull-then-push bracket instead of a dirty-gated
+// one).
+func TestWebAssemblyHostImportWriteViaCachedView(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	installWasmFixtureBuffer(t, p)
+	val, errs := p.RunCode(`
+		const mod = new WebAssembly.Module(FIXTURE_WASM_BYTES);
+		let cachedView;
+		const inst = new WebAssembly.Instance(mod, {
+			env: { host_add: (a, b) => {
+				// Reuses a view fetched once, outside this callback entirely -
+				// the real Emscripten-glue shape, never re-touching .buffer.
+				cachedView[501] = 0xCD;
+				return a + b;
+			} }
+		});
+		cachedView = new Uint8Array(inst.exports.memory.buffer);
+		const sum = inst.exports.add_via_host(1, 2);
+		const readBack = inst.exports.read_byte(501);
+		JSON.stringify({ sum, readBack })
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"sum":3,"readBack":205}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
 // TestWebAssemblyMemoryReadWrite exercises the exported-memory bridge:
 // a byte written via JS's `.buffer` must be visible to wasm code after
 // crossing into an exported call, and a byte written by wasm must be

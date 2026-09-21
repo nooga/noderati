@@ -470,6 +470,51 @@ func (b *wasmMemoryBridge) markDirty() {
 	b.mu.Unlock()
 }
 
+// forceSyncIn unconditionally pushes the cached ArrayBuffer's current
+// bytes into real wasm memory - the counterpart to syncOut() (which
+// unconditionally pulls the other way), used to bracket a host *import*
+// call (wasm calling into JS mid-execution, not the outer JS-calls-an-
+// export boundary syncIn()/syncOut() already bracket).
+//
+// Unlike syncIn(), this ignores the dirty flag entirely, on purpose:
+// real Emscripten-generated glue (confirmed directly against real
+// sql.js's own environ_get/getcwd/etc. import implementations) never
+// re-reads `.buffer` per call the way this bridge's dirty-flag
+// freshness tracking assumes - it fetches the live view exactly once,
+// right after instantiation (`updateMemoryViews()`), caches it in a
+// module-level variable, and reuses that same view for the module's
+// entire lifetime (matching the doc comment on detachIfGrownLocked:
+// real callers only re-touch `.buffer` after detecting a grow, not on
+// every call). So `dirty` stays permanently true from the very first
+// markDirty() onward, and a syncIn() gated on `!dirty` (correct for
+// the outer export-call boundary's own JS-writes-via-fresh-.buffer-
+// read case) never fires for this far more common caching pattern -
+// confirmed directly: a minimal .wat repro using a fresh `.buffer`
+// fetch inside the import round-tripped correctly through a
+// dirty-gated syncIn(), but real sql.js's own environ_get (writing
+// through a long-cached view) did not, leaving wasm's real memory
+// holding zero bytes where real environment-variable text should be,
+// eventually surfacing many calls later as sqlite3's own spurious
+// "out of memory" (garbage/zeroed state its allocator init depends on).
+// Safe to call unconditionally specifically because callers always
+// pair it with a matching syncOut() immediately before invoking the
+// same import (see makeHostImportTrampoline): that pull guarantees the
+// cache is an accurate, wasm-fresh baseline the instant JS is handed
+// it, so anything different by the time this runs can only be a real
+// write that same JS call just made - never stale data clobbering a
+// wasm-internal write made outside this bracket.
+func (b *wasmMemoryBridge) forceSyncIn() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ab == nil {
+		return
+	}
+	data := b.ab.GetData()
+	if len(data) > 0 {
+		b.mem.Write(0, data)
+	}
+}
+
 // detachIfGrownLocked detaches the currently-vended ArrayBuffer (if any)
 // the moment a real memory.grow is observed (currentSize != b.size),
 // instead of waiting for the next `.buffer` property read to notice.
@@ -1050,7 +1095,51 @@ func (e *wasmJSCallPanic) Unwrap() error { return e.err }
 // wasmJSCallPanic instead, letting wrapWasmExportedFunction recover the
 // original JS exception value out of fn.Call's error and re-throw it
 // faithfully.
-func makeHostImportTrampoline(vmInst *vm.VM, jsFn vm.Value, params, results []api.ValueType) api.GoFunc {
+//
+// Also brackets the call with syncOut()/forceSyncIn() (pull-then-push),
+// the same pair of primitives wrapWasmExportedFunction uses at the
+// *outer* JS->wasm boundary, applied here to the *inner* wasm->JS->wasm
+// boundary a host import call represents - fixing a real, previously-
+// undiagnosed noderati bug (this investigation's own
+// docs/real-node-plan.md, the sql.js "out of memory" round): without
+// this, a JS import callback that writes into `memory.buffer` (real
+// Emscripten glue's environ_get/getcwd/fd_read/etc. all do exactly
+// this - the entire point of those imports is to hand wasm data it
+// can't fetch itself) only ever lands in wasmMemoryBridge's *cached*
+// ArrayBuffer, never in wazero's own real linear memory - because the
+// only place that cache was ever pushed back (syncIn) was immediately
+// before the *outer* exported-function call begins, gated on
+// `!dirty`, and markDirty() (called right before that same outer call)
+// leaves it permanently dirty from that point on, so the gate never
+// opens again. wasm bytecode reads real memory directly, so it never
+// observes the write at all.
+//
+// A first attempt just called markDirty()+syncIn() (the dirty-gated
+// pair) around the import call instead of syncOut()+forceSyncIn() -
+// confirmed directly with a minimal, dependency-free .wat repro (one
+// import that writes a byte via a *freshly re-fetched*
+// `new Uint8Array(memory.buffer)`, one export that calls it then reads
+// the same byte back) that this fixed *that* shape. But real sql.js's
+// own environ_get et al don't re-fetch `.buffer` per call the way that
+// repro did - real Emscripten glue fetches the live view exactly once,
+// right after instantiation, caches it in a module-level variable, and
+// reuses that same view for the module's entire lifetime (matching the
+// existing doc comment on detachIfGrownLocked). So `dirty` never gets
+// reset by a fresh `.buffer` read during any later import call, stays
+// permanently true, and syncIn()'s own `!dirty` guard never opens -
+// confirmed directly by dumping the real bytes environ_get was supposed
+// to have written into wasm memory a few calls later (real Node: the
+// actual "USER=web_user..." text; noderati with the markDirty()+
+// syncIn() fix: still all zero bytes). syncOut()+forceSyncIn() fixes
+// this because it doesn't rely on JS having touched `.buffer` at all:
+// syncOut() unconditionally pulls a fresh, accurate cache from real
+// memory right before handing control to JS (so whichever way JS
+// writes - a live cached view or a fresh fetch - lands on an accurate
+// baseline), and forceSyncIn() unconditionally pushes that cache back
+// afterward. See forceSyncIn's own doc comment for why the
+// unconditional push is safe specifically because syncOut() always
+// runs immediately before it in this same bracket.
+func makeHostImportTrampoline(vmInst *vm.VM, jsFn vm.Value, params, results []api.ValueType, bridges *[]*wasmMemoryBridge) api.GoFunc {
 	if len(results) > 1 {
 		// Not needed by any real call site this bridge targets (every
 		// wasm_on_* import here is single-result-or-void per
@@ -1065,7 +1154,13 @@ func makeHostImportTrampoline(vmInst *vm.VM, jsFn vm.Value, params, results []ap
 		for i, t := range params {
 			args[i] = wazeroU64ToJSValue(stack[i], t)
 		}
+		for _, b := range *bridges {
+			b.syncOut()
+		}
 		result, err := vmInst.Call(jsFn, vm.Undefined, args)
+		for _, b := range *bridges {
+			b.forceSyncIn()
+		}
 		if err != nil {
 			panic(&wasmJSCallPanic{err: err})
 		}
@@ -1139,6 +1234,19 @@ func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal, tabl
 		return vm.Undefined, throwWasmError(vmInst, errs.compileError, "WebAssembly.Instance: "+err.Error())
 	}
 
+	// Declared before the import-building loop below (not just before
+	// the exported-memory-discovery loop further down, where it used to
+	// live) because makeHostImportTrampoline needs to bracket every
+	// nested wasm->JS import call with the same
+	// markDirty()/syncIn() pair the outer exported-call boundary uses
+	// (see its own doc comment) - and those trampolines are built here,
+	// before any exported memory (and its bridge) has been discovered.
+	// Passed to the trampoline maker as a pointer so each closure sees
+	// this slice fully populated once the loop below fills it in,
+	// rather than the empty snapshot that existed at trampoline-build
+	// time.
+	var bridges []*wasmMemoryBridge
+
 	// Group the module's declared function imports by their own
 	// module namespace (e.g. "env"), building one wazero host
 	// module per namespace and one trampoline per function, each
@@ -1177,7 +1285,7 @@ func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal, tabl
 			params := fd.ParamTypes()
 			resultsT := fd.ResultTypes()
 			builder = builder.NewFunctionBuilder().
-				WithGoFunction(api.GoFunc(makeHostImportTrampoline(vmInst, jsFn, params, resultsT)), params, resultsT).
+				WithGoFunction(api.GoFunc(makeHostImportTrampoline(vmInst, jsFn, params, resultsT, &bridges)), params, resultsT).
 				Export(fname)
 		}
 		if _, ierr := builder.Instantiate(ctx); ierr != nil {
@@ -1193,7 +1301,6 @@ func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal, tabl
 	}
 
 	exportsObj := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
-	var bridges []*wasmMemoryBridge
 
 	for name := range compiled.ExportedMemories() {
 		mem := mod.ExportedMemory(name)
