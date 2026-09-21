@@ -7,7 +7,24 @@ import (
 	"strings"
 
 	"github.com/nooga/paserati/pkg/driver"
+	"github.com/nooga/paserati/pkg/vm"
 )
+
+// newPathParseResult builds the object path.parse() returns, in real
+// Node's own property order (root, dir, base, ext, name) - a Go map
+// would round-trip the same key/value pairs but iterate (and so
+// JSON.stringify/Object.keys) in random order, since Go map iteration
+// order isn't stable. Property order is part of path.parse()'s real,
+// observable contract.
+func newPathParseResult(root, dir, base, ext, name string) vm.Value {
+	obj := vm.NewObject(vm.DefaultObjectPrototype).AsPlainObject()
+	obj.SetOwn("root", vm.NewString(root))
+	obj.SetOwn("dir", vm.NewString(dir))
+	obj.SetOwn("base", vm.NewString(base))
+	obj.SetOwn("ext", vm.NewString(ext))
+	obj.SetOwn("name", vm.NewString(name))
+	return vm.NewValueFromPlainObject(obj)
+}
 
 func declarePath(p *driver.Paserati) {
 	p.DeclareModule("path", func(m *driver.ModuleBuilder) {
@@ -62,6 +79,18 @@ func declarePath(p *driver.Paserati) {
 			return rel
 		})
 		m.Function("toNamespacedPath", func(p string) string { return p })
+		m.Function("parse", func(p string) vm.Value {
+			if os.PathSeparator == '\\' {
+				return win32Parse(p)
+			}
+			return posixParse(p)
+		})
+		m.Function("format", func(obj map[string]interface{}) string {
+			if os.PathSeparator == '\\' {
+				return formatPath(`\`, obj)
+			}
+			return formatPath("/", obj)
+		})
 		m.Namespace("win32", func(ns *driver.NamespaceBuilder) {
 			ns.Const("sep", `\`)
 			ns.Const("delimiter", ";")
@@ -74,6 +103,8 @@ func declarePath(p *driver.Paserati) {
 			ns.Function("resolve", win32Resolve)
 			ns.Function("relative", win32Relative)
 			ns.Function("toNamespacedPath", func(p string) string { return p })
+			ns.Function("parse", win32Parse)
+			ns.Function("format", func(obj map[string]interface{}) string { return formatPath(`\`, obj) })
 		})
 		m.Namespace("posix", func(ns *driver.NamespaceBuilder) {
 			ns.Const("sep", "/")
@@ -87,6 +118,8 @@ func declarePath(p *driver.Paserati) {
 			ns.Function("resolve", posixResolve)
 			ns.Function("relative", posixRelative)
 			ns.Function("toNamespacedPath", func(p string) string { return p })
+			ns.Function("parse", posixParse)
+			ns.Function("format", func(obj map[string]interface{}) string { return formatPath("/", obj) })
 		})
 		m.Default(nil)
 	})
@@ -296,6 +329,239 @@ func win32Resolve(parts ...string) string {
 		}
 	}
 	return win32Normalize(resolved)
+}
+
+// posixParse is a direct transliteration of real Node's lib/path.js
+// posix.parse, kept close to the original so it stays obviously
+// correct against the reference implementation rather than an
+// independent (and easy to get subtly wrong) reimplementation.
+func posixParse(p string) vm.Value {
+	root, dir, base, ext, name := "", "", "", "", ""
+	if p == "" {
+		return newPathParseResult(root, dir, base, ext, name)
+	}
+	isAbsolute := p[0] == '/'
+	start := 0
+	if isAbsolute {
+		root = "/"
+		start = 1
+	}
+
+	startDot := -1
+	startPart := 0
+	end := -1
+	matchedSlash := true
+	preDotState := 0
+
+	for i := len(p) - 1; i >= start; i-- {
+		c := p[i]
+		if c == '/' {
+			if !matchedSlash {
+				startPart = i + 1
+				break
+			}
+			continue
+		}
+		if end == -1 {
+			matchedSlash = false
+			end = i + 1
+		}
+		if c == '.' {
+			if startDot == -1 {
+				startDot = i
+			} else if preDotState != 1 {
+				preDotState = 1
+			}
+		} else if startDot != -1 {
+			preDotState = -1
+		}
+	}
+
+	if startDot == -1 || end == -1 || preDotState == 0 ||
+		(preDotState == 1 && startDot == end-1 && startDot == startPart+1) {
+		if end != -1 {
+			if startPart == 0 && isAbsolute {
+				base = p[1:end]
+				name = p[1:end]
+			} else {
+				base = p[startPart:end]
+				name = p[startPart:end]
+			}
+		}
+	} else {
+		if startPart == 0 && isAbsolute {
+			name = p[1:startDot]
+			base = p[1:end]
+		} else {
+			name = p[startPart:startDot]
+			base = p[startPart:end]
+		}
+		ext = p[startDot:end]
+	}
+
+	if startPart > 0 {
+		dir = p[:startPart-1]
+	} else if isAbsolute {
+		dir = "/"
+	}
+
+	return newPathParseResult(root, dir, base, ext, name)
+}
+
+// win32Parse is a direct transliteration of real Node's lib/path.js
+// win32.parse (root/UNC detection, then the same dot/slash walk as
+// posixParse but bounded by rootEnd instead of a fixed 0/1 start).
+func win32Parse(p string) vm.Value {
+	root, dir, base, ext, name := "", "", "", "", ""
+	length := len(p)
+	if length == 0 {
+		return newPathParseResult(root, dir, base, ext, name)
+	}
+
+	isSep := func(b byte) bool { return b == '\\' || b == '/' }
+
+	rootEnd := 0
+	code := p[0]
+
+	if length == 1 {
+		if isSep(code) {
+			root = p
+			dir = p
+		} else {
+			base = p
+			name = p
+		}
+		return newPathParseResult(root, dir, base, ext, name)
+	}
+
+	if isSep(code) {
+		rootEnd = 1
+		if isSep(p[1]) {
+			j := 2
+			last := j
+			for j < length && !isSep(p[j]) {
+				j++
+			}
+			if j < length && j != last {
+				last = j
+				for j < length && isSep(p[j]) {
+					j++
+				}
+				if j < length && j != last {
+					last = j
+					for j < length && !isSep(p[j]) {
+						j++
+					}
+					if j == length {
+						rootEnd = j
+					} else if j != last {
+						rootEnd = j + 1
+					}
+				}
+			}
+		}
+	} else if isDriveLetter(code) && length > 1 && p[1] == ':' {
+		rootEnd = 2
+		if length > 2 {
+			if isSep(p[2]) {
+				if length == 3 {
+					root = p
+					dir = p
+					return newPathParseResult(root, dir, base, ext, name)
+				}
+				rootEnd = 3
+			}
+		} else {
+			root = p
+			dir = p
+			return newPathParseResult(root, dir, base, ext, name)
+		}
+	}
+	if rootEnd > 0 {
+		root = p[:rootEnd]
+	}
+
+	startDot := -1
+	startPart := rootEnd
+	end := -1
+	matchedSlash := true
+	preDotState := 0
+
+	for i := length - 1; i >= rootEnd; i-- {
+		c := p[i]
+		if isSep(c) {
+			if !matchedSlash {
+				startPart = i + 1
+				break
+			}
+			continue
+		}
+		if end == -1 {
+			matchedSlash = false
+			end = i + 1
+		}
+		if c == '.' {
+			if startDot == -1 {
+				startDot = i
+			} else if preDotState != 1 {
+				preDotState = 1
+			}
+		} else if startDot != -1 {
+			preDotState = -1
+		}
+	}
+
+	if startDot == -1 || end == -1 || preDotState == 0 ||
+		(preDotState == 1 && startDot == end-1 && startDot == startPart+1) {
+		if end != -1 {
+			base = p[startPart:end]
+			name = p[startPart:end]
+		}
+	} else {
+		name = p[startPart:startDot]
+		base = p[startPart:end]
+		ext = p[startDot:end]
+	}
+
+	if startPart > 0 && startPart != rootEnd {
+		dir = p[:startPart-1]
+	} else {
+		dir = root
+	}
+
+	return newPathParseResult(root, dir, base, ext, name)
+}
+
+// formatPath mirrors real Node's shared, sep-parameterized `_format`
+// (used by path.format, path.posix.format, path.win32.format alike):
+// dir||root, joined to base||(name+ext), with sep only inserted when
+// dir isn't already exactly the root.
+func formatPath(sep string, obj map[string]interface{}) string {
+	strField := func(key string) string {
+		if v, ok := obj[key]; ok {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+		return ""
+	}
+
+	root := strField("root")
+	dir := strField("dir")
+	if dir == "" {
+		dir = root
+	}
+	base := strField("base")
+	if base == "" {
+		base = strField("name") + strField("ext")
+	}
+	if dir == "" {
+		return base
+	}
+	if dir == root {
+		return dir + base
+	}
+	return dir + sep + base
 }
 
 func win32Relative(from, to string) string {

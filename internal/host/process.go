@@ -3,6 +3,7 @@ package host
 import (
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -161,9 +162,15 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		os.Exit(code)
 		return vm.Undefined, nil
 	}))
-	processObj.SetOwn("hrtime", vm.NewNativeFunction(1, false, "hrtime", func(args []vm.Value) (vm.Value, error) {
+	hrtimeFn := vm.NewNativeFunctionWithProps(1, false, "hrtime", func(args []vm.Value) (vm.Value, error) {
 		return hrtimeValue(args), nil
-	}))
+	})
+	if props := hrtimeFn.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+		props.Properties.SetOwn("bigint", vm.NewNativeFunction(0, false, "bigint", func(args []vm.Value) (vm.Value, error) {
+			return hrtimeBigintValue(), nil
+		}))
+	}
+	processObj.SetOwn("hrtime", hrtimeFn)
 	installProcessKill(vmInstance, processObj)
 	startSignalBridge(vmInstance, processObj)
 
@@ -206,6 +213,16 @@ func hrtimeValue(args []vm.Value) vm.Value {
 	arr.Append(vm.NumberValue(float64(sec)))
 	arr.Append(vm.NumberValue(float64(nsec)))
 	return result
+}
+
+// hrtimeBigintValue implements process.hrtime.bigint(): the same
+// monotonic clock as hrtimeValue, but as a single BigInt nanosecond
+// count rather than a [seconds, nanoseconds] tuple - real Node keeps
+// both forms on the same underlying clock, so this shares
+// processStartTime with hrtimeValue rather than taking its own reading.
+func hrtimeBigintValue() vm.Value {
+	elapsed := time.Since(processStartTime)
+	return vm.NewBigInt(big.NewInt(elapsed.Nanoseconds()))
 }
 
 func stdoutColumnsAndTTY() (columns vm.Value, isTTY vm.Value) {

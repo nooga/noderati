@@ -14885,3 +14885,368 @@ slate (prettier, eslint, babel, webpack, ajv, handlebars, graphql,
 zod, commander, anthropic-sdk, openai-sdk, aws-s3, sql.js) now passes
 against real, unmodified npm packages under noderati. This closes the
 entire slate this investigation was built around.
+
+## Next candidate slate (post-13/13), recorded 2026-09-21
+
+The original breadth-sweep slate is closed. Candidates for the next
+round of real-package probes, by what each would newly stress (none
+of these have been attempted yet under this doc's methodology unless
+noted):
+
+- **Bundlers/build tools, beyond webpack's pure-JS path**: `esbuild`
+  (spawns a real native binary via `child_process.spawnSync` - a code
+  path the webpack pass never exercised), `vite`, `rollup`,
+  `postcss` + `tailwindcss`, `terser`.
+- **Servers/networking, beyond fetch-only undici**: `express` or
+  `fastify` with a real client hitting it; `ws` (websocket
+  server+client); `http-proxy`.
+- **Test runners** (module resolution + worker/child-process
+  patterns): `vitest` or `jest` running a trivial real suite.
+- **CLI/UX libs**: `yargs`/`inquirer` (readline-heavy), `execa`
+  (child_process), `chokidar` (needs real `fs.watch`),
+  `tar`/`archiver` (needs zlib).
+- **Crypto/auth**: `jsonwebtoken`, `bcryptjs` (pure-JS - contrast
+  with native `bcrypt`, expected to hit the native-addon wall),
+  `argon2` (native - expected to fail, useful as a documented
+  blocker).
+- **Database clients** (pure-JS TCP protocol implementations, a good
+  `net` stress test): `pg` or `mysql2` against a real local DB,
+  `ioredis`.
+- **Markdown/templating**: `marked`/`remark`, `ejs`/`pug`.
+- **Self-hosting**: compiling TypeScript's own source with `tsc` -
+  already flagged above as the one remaining Phase 6 item, never
+  attempted.
+
+Known likely dead ends, worth documenting as blockers rather than
+chasing blind: anything needing native `.node` addons (`sharp`,
+`better-sqlite3`, real `bcrypt`, `canvas` - see "Native `.node` addon
+loading" above, still unexplored) and `cluster`/multi-process
+concurrency.
+
+`eslint` itself already passes (Round 124) and isn't a fresh slate
+item - the next eslint-shaped probe worth trying is the plugin
+ecosystem it's usually run with (`typescript-eslint`,
+`eslint-plugin-import`, `eslint-plugin-react`), a heavier and
+differently-shaped consumer than bare `eslint.lint()`.
+
+## Round 131: typescript-eslint@8's recommended config crashes - a real, unimplemented engine feature (V8's stack trace API), filed upstream
+
+First probe off the new post-13/13 candidate slate above: real,
+unmodified `eslint@9.36.0` + `typescript-eslint@8` +
+`@eslint/js@9`, linting a real `.ts` fixture through
+`tseslint.config(...tseslint.configs.recommended)` - the standard way
+typescript-eslint is actually configured, one layer past bare
+`eslint.lint()` (already passing since Round 124).
+
+Fails immediately, before a single rule runs:
+
+```
+TypeError: undefined is not a function
+    at getTSConfigRootDirFromStack (<getTSConfigRootDirFromStack>:31:1)
+    at get (<get>:162:1)
+```
+
+**Root cause**: `typescript-eslint`'s own
+`getTSConfigRootDirFromStack.js` (called from the `configs.recommended`
+getter) uses V8's documented "Stack Trace API"
+(https://v8.dev/docs/stack-trace-api): it sets
+`Error.prepareStackTrace = (err, stack) => stack`, calls
+`Error.captureStackTrace(dummyObject, ...)`, then iterates
+`dummyObject.stack` expecting an array of `CallSite` objects
+(`.getFileName()`, `.getLineNumber()`, etc.). paserati doesn't
+implement any of this: `Error.captureStackTrace`
+(`pkg/builtins/error_init.go` ~line 208) always calls
+`CaptureStackTraceExcluding` and writes the resulting *formatted
+string* straight to `.stack`, never consulting
+`Error.prepareStackTrace`; `Error.stackTraceLimit` isn't a real
+property at all. So `dummyObject.stack` is a plain string, the
+`for...of` loop iterates individual characters, and
+`callSite.getFileName` (actually a `String.prototype` lookup on a
+one-character string) is `undefined` - hence "undefined is not a
+function".
+
+Confirmed with a minimal, dependency-free repro (no typescript-eslint
+involved):
+
+```js
+const obj = {};
+Error.prepareStackTrace = (err, stack) => stack;
+Error.captureStackTrace(obj, function () {});
+console.log(typeof obj.stack, Array.isArray(obj.stack));
+// real Node: "object" true   (an Array<CallSite>)
+// paserati:  "string" false  (prepareStackTrace silently ignored)
+```
+
+Also confirmed `typeof Error.stackTraceLimit` is `"undefined"` under
+paserati vs. `"number"` (default `10`) on real Node.
+
+Engine-side note for whoever picks this up: `pkg/vm/exceptions.go`'s
+`getStackFramesExcluding` already builds a `[]StackFrame{FunctionName,
+FileName, Line, Column}` slice per capture - the raw data structured
+`CallSite` objects would need already exists internally, it's just
+never exposed to JS; today it's only ever consumed by
+`formatStackFrames` to produce the one string.
+
+Not a noderati-side fix - filed upstream as
+[paserati#492](https://github.com/nooga/paserati/issues/492). Added
+`examples/eslint_typescript_eslint_probe.mjs` +
+`examples/eslint-ts-sample.ts` as the canonical repro to re-run once
+`#492` lands (added `eslint`, `@eslint/js`, `typescript-eslint` to
+`examples/package.json`).
+
+**Status**: blocked on paserati#492, not yet attempted further (the
+rest of typescript-eslint's recommended config - actual rule
+execution, type-aware linting - is unreached).
+
+## Round 132: paserati#492 confirmed merged; found and fixed a real noderati `path.parse`/`path.format` gap, then found and filed a second real paserati bug (`[...someMap]` spread)
+
+Pulled latest paserati (`0571948a` "Fix #492: implement V8 Stack Trace
+API", plus a same-day follow-up bounding capture by
+`stackTraceLimit`) and rebuilt. Confirmed the Round 131 minimal repro
+directly: `Error.prepareStackTrace`/`Error.captureStackTrace` now hand
+back a real `Array` of `CallSite`-shaped objects with working
+`getFileName()` etc., and `typeof Error.stackTraceLimit` is now
+`"number"` `10`, matching real Node exactly.
+
+Re-ran `examples/eslint_typescript_eslint_probe.mjs` - past the
+Round 131 crash, into a new one:
+
+```
+TypeError: undefined is not a function
+    at getTSConfigRootDirFromStack (.../typescript-eslint/dist/getTSConfigRootDirFromStack.js:41:9)
+```
+
+Line 41 is `node_path_1.default.parse(stackFrameFilePath)` - real,
+unmodified `typescript-eslint` calling `path.parse()`. Checked
+directly: **noderati's own `path` module never implemented
+`path.parse`/`path.format` at all** (`internal/host/path.go`) - a
+genuine noderati-side gap, not paserati's, in a module this doc's own
+ledger lists as "real Node builtins - keep, harden, fill gaps."
+
+**Fixed directly**: added `parse`/`format` to the top-level module and
+both the `posix`/`win32` namespaces. `parse` is a line-by-line
+transliteration of real Node's own `lib/path.js` `parsePosix`/
+`win32Parse` (root/dir/base/ext/name via the same dot-tracking
+backward walk, including the win32 UNC-root detection state machine),
+kept close to the original rather than reimplemented independently,
+specifically to stay obviously correct against the reference rather
+than an easy-to-get-subtly-wrong rewrite; `format` is the same
+sep-parameterized `_format` helper real Node shares across
+`path`/`path.posix`/`path.win32`.
+
+First implementation returned a Go `map[string]string`, which the
+existing generic `m.Function` reflection path converts into a plain JS
+object - but Go map iteration order is random, so `Object.keys()`/
+`JSON.stringify()` on the result came back in random key order instead
+of real Node's stable `root, dir, base, ext, name`. Property order is
+part of `path.parse()`'s real, observable contract (found comparing
+raw `JSON.stringify` output directly against real Node - the values
+matched exactly, only key order differed). Switched to building the
+result as an ordered `vm.PlainObject` directly (`newPathParseResult`,
+using the package-level `vm.DefaultObjectPrototype` so no `*vm.VM`
+instance is needed at declare-time - the same pattern
+`fs_errors.go` already uses for ordered Error properties), inserting
+`SetOwn` calls in real Node's exact order.
+
+**Verification**: a batch of posix/win32 `parse`/`format` cases
+(empty string, bare dot/dotdot, dotfiles, multi-dot extensions, root
+`/`, trailing slashes, UNC paths, bare drive letters, drive-relative
+`C:file.txt`, ...) diffed byte-for-byte identical against real Node
+after the ordering fix (before it, only key order differed - every
+value already matched). `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener -count=1`) clean.
+
+Rebuilt and reran the eslint probe again - past `path.parse`, into a
+**third** blocker, this time inside real eslint itself (not
+typescript-eslint):
+
+```
+TypeError: Cannot destructure 'undefined'
+    at eslint-helpers.js:447 (globMultiSearch)
+    ...({ patterns, rawPatterns }) from [...searches].map(([basePath, {patterns, rawPatterns}]) => ...)
+```
+
+`searches` is a real `Map`. Isolated with a minimal, dependency-free
+repro (no eslint involved):
+
+```js
+const m = new Map([["a", 1]]);
+const spread = [...m];
+console.log(spread[0].length, spread[0][0], spread[0][1]);
+// real Node: 2 a 1
+// paserati:  0 a 1   <- length wrong, indices fine
+```
+
+Narrowed further: `[...m.entries()]` and `m[Symbol.iterator]().next()`
+called manually both produce correct, length-2 pair arrays; only the
+literal `[...someMapObject]` spread path is affected, and only for
+`Map` (`[...someSet.entries()]`, which builds the same shape of `[v,
+v]` pair array, is fine). **Root-caused directly**:
+`pkg/vm/vm.go`'s `extractSpreadArguments`, `case TypeMap:` (~line
+19475), builds each pair via `pairArr.elements = []Value{key, value}`
+- a direct write to `ArrayObject`'s private `elements` slice field,
+bypassing the separate `length` field entirely (which stays at its
+zero-value default), unlike every other pair-array construction site
+in the codebase (e.g. `array_iterator.go`'s `Step()`, used by
+`Map.prototype.entries()`'s real iterator), which builds the same
+shape via `Append()`/`Append()` and keeps both fields in sync
+correctly.
+
+Not a noderati-side fix - filed upstream as
+[paserati#494](https://github.com/nooga/paserati/issues/494), root
+cause and a concrete one-line fix included (swap the direct
+`.elements` write for two `Append()` calls, matching every other call
+site).
+
+**Status**: `examples/path_parse_format` gap closed (noderati-side,
+fixed and verified this round - no example script added since the
+verification was a scratchpad-only batch of cases, not a real-package
+probe). eslint/typescript-eslint probe blocked on paserati#494 - three
+real bugs deep into this single probe now (paserati#492, this round's
+`path.parse`/`format`, paserati#494), none of them yet the actual
+rule-execution code this probe was originally aimed at.
+
+## Round 133: paserati#494 confirmed merged; found and fixed a real noderati `process.hrtime.bigint` gap; found and filed a fourth real paserati bug (nested-destructuring-parameter closure capture) - the eslint probe reaches real rule execution for the first time
+
+Pulled latest paserati. Local `main` and `origin/main` had diverged at
+identical content (`ac3c3aff` vs `64990379`, same author/timestamp/diff
+- a rebase-produced hash mismatch, not a real conflict); reset local to
+`origin/main` since the trees were identical (confirmed via `git diff`
+before doing so). Rebuilt, confirmed the Round 132 minimal repro
+directly: `[...new Map([["a",1]])][0].length` is now `2`, matching
+real Node.
+
+Re-ran the eslint probe - past the Map-spread crash, into a new one:
+
+```
+TypeError: undefined is not a function
+    at readAndVerifyFile (.../eslint/lib/eslint/eslint-helpers.js:1304:3)
+```
+
+Line 1304 is `const readFileEnterTime = hrtimeBigint();`, where
+`eslint-helpers.js` does `const hrtimeBigint = process.hrtime.bigint;`
+at module scope. Checked directly: **`process.hrtime.bigint` didn't
+exist at all** under noderati (`process.hrtime()` - the legacy
+`[seconds, nanoseconds]` tuple form - was implemented; the BigInt
+nanosecond-count form real Node also exposes as a property of the same
+function was simply missing). A genuine noderati-side gap (`process`
+is noderati's own, per this doc's ledger), not paserati's.
+
+**Fixed directly**: switched `process.hrtime` from a plain
+`NewNativeFunction` to `NewNativeFunctionWithProps` (the same pattern
+`assert.go`/`cjs.go`/`buffer.go` already use to hang extra properties
+off a function value) and added a `bigint` property function sharing
+`hrtimeValue`'s existing `processStartTime` monotonic anchor, returning
+`vm.NewBigInt(big.NewInt(elapsed.Nanoseconds()))`. Verified directly:
+`typeof process.hrtime.bigint() === "bigint"`, and two successive
+calls compare correctly ordered with a plausible (nanosecond-scale)
+delta. `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener -count=1`) clean.
+
+Rebuilt and reran the eslint probe again - past `hrtime.bigint`, and
+for the first time, **into real rule execution**: ESLint actually
+parsed the fixture, ran the configured rule set against it, and got as
+far as reporting from inside a real rule body before hitting the next
+blocker:
+
+```
+ReferenceError: allowShortCircuit is not defined
+Rule: "@typescript-eslint/no-unused-expressions"
+    at isValidExpression (.../no-unused-expressions.js:32:35)
+```
+
+The real rule's own source:
+`create(context, [{ allowShortCircuit = false, allowTernary = false }])`
+- a function parameter destructured through **two levels of nesting**
+(an array pattern containing an object pattern) - with `allowShortCircuit`
+read inside `isValidExpression`, a function nested inside `create`'s
+own body (a closure over the parameter binding).
+
+Isolated with a minimal, dependency-free repro, narrowing across five
+variants to pin down the exact trigger:
+
+```js
+function makeD([{a}]) { function inner(){ console.log(a); } inner(); }
+makeD([{a: 1}]);
+// real Node: 1
+// paserati:  ReferenceError: a is not defined
+```
+
+Confirmed: a *single* level of nesting, either kind, works fine even
+with the same closure shape (`function makeA({a}) {...}` and
+`function makeB([a]) {...}` both print `1`); the doubly-nested pattern
+also works fine read *directly* from the outer function's own body
+(no closure - `console.log(a)` right inside `makeC`); and the
+*identical* doubly-nested pattern works fine as a `const` declaration
+(`const [{a}] = [{a: 1}]`) even when a separate closure captures it
+afterward. Only "function-parameter, exactly two levels of nesting,
+read from a nested closure" fails - and it fails as a hard
+`ReferenceError`, not a stale/undefined value, meaning whatever
+resolves the binding for the inner closure doesn't find it at all.
+Default values aren't required (all variants above have none) and a
+second bound name reproduces identically.
+
+Not a noderati-side fix - filed upstream as
+[paserati#496](https://github.com/nooga/paserati/issues/496), with the
+five-variant isolation included so whoever picks it up doesn't have to
+re-derive which of "parameter vs. declaration", "one level vs. two",
+and "closure vs. direct access" actually matters (likely a
+closure-upvalue-capture pass that doesn't walk all the way through a
+nested array-then-object parameter pattern).
+
+**Status**: eslint/typescript-eslint probe blocked on paserati#496 -
+four real bugs deep now (paserati#492, Round 132's `path.parse`/
+`format`, paserati#494, this round's `process.hrtime.bigint` fix +
+paserati#496), but this is the first round in this probe to reach
+actual rule execution rather than crashing during setup/file
+discovery - real progress, not just another layer peeled off the same
+onion.
+
+## Round 134: paserati#496 confirmed merged - the eslint/typescript-eslint probe passes end to end, byte-for-byte identical to real Node
+
+Pulled latest paserati (`02cd6550` "Fix #496: nested parameter-pattern
+names invisible to closures", a fast-forward onto `64990379`). Rebuilt
+and confirmed the Round 133 minimal repro directly:
+`function makeD([{a}]) { function inner(){ console.log(a); } inner();
+} makeD([{a: 1}])` now prints `1`, matching real Node.
+
+`go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener -count=1`) clean.
+
+Reran `examples/eslint_typescript_eslint_probe.mjs` - no crash at all
+this time:
+
+```
+file: .../examples/eslint-ts-sample.ts
+  2:9 warn 'unused' is assigned a value but never used. (@typescript-eslint/no-unused-vars)
+  6:5 error 'x' is never reassigned. Use 'const' instead. (prefer-const)
+  6:8 error Unexpected any. Specify a different type. (@typescript-eslint/no-explicit-any)
+errorCount: 2
+warningCount: 1
+```
+
+Diffed directly against real Node's own output on the same probe
+script (`diff <(node ...) <(./noderati ...)`, run from `examples/` so
+both share the same cwd for the relative fixture path) - **zero
+diff**. Real, unmodified `eslint@9.36.0` + `typescript-eslint@8` +
+`@eslint/js@9`, using the actual `tseslint.config(...tseslint.configs.recommended)`
+setup real projects use, now lints a real `.ts` file under noderati
+byte-for-byte identically to real Node - the deepest layer of the
+eslint probe (Round 131's original target, actual rule execution
+including type-aware `@typescript-eslint` rules) now passes.
+
+Four real, independent bugs found and fixed/filed chasing this one
+probe end to end: paserati#492 (V8 stack trace API, entirely
+unimplemented), this doc's own `path.parse`/`path.format` (noderati-side,
+entirely unimplemented), paserati#494 (`[...someMap]` losing pair-array
+length), `process.hrtime.bigint` (noderati-side, entirely unimplemented),
+and paserati#496 (nested parameter-destructuring pattern invisible to a
+closure). None of the four had anything to do with each other beyond
+happening to sit one after another on the same real-package call path -
+each was independently isolated with its own minimal, dependency-free
+repro before being fixed or filed.
+
+**Status**: eslint/typescript-eslint probe **closed** - the second
+target from the post-13/13 candidate slate (after the sql.js close-out
+that finished the original 13) to reach a genuine, byte-for-byte-
+matching-real-Node pass.
