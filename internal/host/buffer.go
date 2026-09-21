@@ -639,6 +639,65 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 		return vm.NumberValue(float64(n)), nil
 	}))
 
+	// copy(target[, targetStart[, sourceStart[, sourceEnd]]]) - missing
+	// entirely (docs/real-node-plan.md, this round): real, unmodified
+	// webpack's own default hash function (xxhash64, `lib/util/hash/
+	// wasm-hash.js`) calls `data.copy(mem, buffered, 0, length)`
+	// unconditionally on every hash update - `mem` there is a real
+	// Buffer view directly over the hash WASM instance's own linear
+	// memory (`Buffer.from(exports.memory.buffer, 0, 65536)`) - so a
+	// missing `.copy()` broke real webpack's own module-build hashing
+	// step (`NormalModule._initBuildHash`), one layer past every prior
+	// fix this investigation made to get this far. Real Node's own
+	// semantics: copies bytes from `this` into `target`, correctly
+	// handling the case where `target` and `this` share the same
+	// underlying buffer with overlapping ranges (Go's builtin copy()
+	// already has memmove-safe overlap semantics, so no special-casing
+	// needed here) - which the WASM-memory-view case above genuinely
+	// exercises, since intermediate hash state can alias the same
+	// linear memory buffer across calls.
+	bufferProto.SetOwnNonEnumerable("copy", vm.NewNativeFunction(1, true, "copy", func(args []vm.Value) (vm.Value, error) {
+		thisVal := vmInst.GetThis()
+		srcTA := thisVal.AsTypedArray()
+		if srcTA == nil || len(args) == 0 {
+			return vm.NumberValue(0), nil
+		}
+		dstTA := args[0].AsTypedArray()
+		if dstTA == nil {
+			return vm.NumberValue(0), nil
+		}
+		targetStart, sourceStart := 0, 0
+		sourceEnd := srcTA.GetByteLength()
+		if len(args) >= 2 && args[1].IsNumber() {
+			targetStart = int(args[1].ToFloat())
+		}
+		if len(args) >= 3 && args[2].IsNumber() {
+			sourceStart = int(args[2].ToFloat())
+		}
+		if len(args) >= 4 && args[3].IsNumber() {
+			sourceEnd = int(args[3].ToFloat())
+		}
+		if sourceEnd > srcTA.GetByteLength() {
+			sourceEnd = srcTA.GetByteLength()
+		}
+		n := sourceEnd - sourceStart
+		if remaining := dstTA.GetByteLength() - targetStart; n > remaining {
+			n = remaining
+		}
+		if n <= 0 || sourceStart < 0 || targetStart < 0 {
+			return vm.NumberValue(0), nil
+		}
+		srcBuf, dstBuf := srcTA.GetBuffer(), dstTA.GetBuffer()
+		if srcBuf == nil || srcBuf.IsDetached() || dstBuf == nil || dstBuf.IsDetached() {
+			return vm.NumberValue(0), nil
+		}
+		srcData, dstData := srcBuf.GetData(), dstBuf.GetData()
+		srcStart := srcTA.GetByteOffset() + sourceStart
+		dstStart := dstTA.GetByteOffset() + targetStart
+		copy(dstData[dstStart:dstStart+n], srcData[srcStart:srcStart+n])
+		return vm.NumberValue(float64(n)), nil
+	}))
+
 	return ctor
 }
 

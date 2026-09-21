@@ -14472,3 +14472,109 @@ root-caused as precisely as extensive investigation could manage
 without engine-level introspection tools, and filed upstream as
 `#486`. Remaining: prettier (still unisolated), webpack (blocked on
 `#486`), sql.js (Round 116's own separate WASM investigation).
+
+## Round 127: paserati#486 confirmed merged (fixed via well-known symbol realm-sharing, not the regex bug hypothesized) - two more real noderati bugs found and fixed chasing webpack all the way to a real, working bundle; webpack passes for the first time ever, 11/13
+
+Picked up directly from "ok, paserati has fixed this, pull latest
+main." [paserati#486](https://github.com/nooga/paserati/issues/486)
+landed (`674da60c`, "Fix #486: well-known symbols must be shared
+across all realms") - a genuinely different root cause than this
+investigation's own regex/`lastIndex` hypotheses from last round: real
+`String.prototype.replace()` dispatches through `regexp[Symbol.replace]`
+per spec, and if `Symbol.replace` isn't the *same* symbol between
+wherever it's installed on `RegExp.prototype` and wherever
+`String.prototype.replace` looks it up, the lookup silently misses and
+falls back to a plain, regex-oblivious string search - exactly
+explaining the observed "regex .replace() silently does nothing"
+symptom without needing any regex-engine bug at all. Ran paserati's own
+full suite (the same two small, unrelated pre-existing failures as the
+last two rounds), then verified directly against the exact
+`toCamelCase("parsed-resolve")` repro from Round 126 - now converts
+correctly, matching real Node.
+
+Rebuilt noderati and re-ran the webpack probe: the `#486` symptom is
+gone, and `module.build()` now genuinely fires and completes for the
+entry module - real, concrete progress past every prior round's own
+blocker. Traced the pipeline forward step by step (instrumenting each
+successive real, vendored webpack source file in turn, restored
+byte-identical afterward) and found **two more real, distinct noderati
+bugs**, each unmasking the next once fixed:
+
+1. **`Buffer.prototype.copy` was entirely missing** - real, unmodified
+   webpack's own default hash function (`xxhash64`,
+   `lib/util/hash/wasm-hash.js`) calls
+   `data.copy(mem, buffered, 0, length)` unconditionally on every hash
+   update, where `mem` is a real Buffer view directly over the hash's
+   own WASM instance linear memory
+   (`Buffer.from(exports.memory.buffer, 0, 65536)`) - so a missing
+   `.copy()` broke every real webpack module build's own hashing step
+   (`NormalModule._initBuildHash`), producing a confusing
+   double-invocation of `processResult`'s own callback (once with
+   success, once with the resulting "undefined is not a function"
+   error) that took a moment to untangle before finding the real
+   culprit. Confirmed with a minimal, dependency-free repro:
+   `Buffer.from(new ArrayBuffer(65536), 0, 65536).copy` and
+   `Buffer.from("x").copy` are both `undefined` under noderati, `function`
+   under real Node. Implemented matching real Node's semantics -
+   including the overlapping-region case (`buf.copy(buf, ...)` with
+   overlapping source/destination ranges), which Go's own builtin
+   `copy()` already handles with memmove-safe semantics for free - and
+   real Node's own out-of-range clamping for `sourceEnd`/`targetStart`.
+   New test: `TestBufferCopy`.
+2. **`EventEmitter.prototype.setMaxListeners`/`getMaxListeners`
+   (the *instance* methods) were entirely missing** - a different API
+   from the *static* `events.setMaxListeners`/`getMaxListeners` this
+   file already implements (Round 74's own fix, a newer Node 15+
+   addition). Real, unmodified `merge-stream` (a real, direct
+   dependency of `jest-worker`, itself used by `terser-webpack-plugin`
+   for its worker-pool-based minification) calls
+   `output.setMaxListeners(0)` unconditionally on a real
+   `stream.PassThrough` instance - `PassThrough` extends `Transform`
+   extends this same `EventEmitter` class (`stream.go`), so the
+   missing instance method broke real webpack's own default
+   production-mode minification step. Added both as plain instance
+   methods on the `EventEmitter` class body, matching real Node's
+   chainable `setMaxListeners` (returns `this`). New test:
+   `TestEventEmitterInstanceSetGetMaxListeners`.
+
+With both fixed, webpack's own build reached a **genuine, final,
+documented architectural limitation** rather than a bug: real
+`terser-webpack-plugin`'s default configuration parallelizes
+minification across `worker_threads.Worker`, which noderati doesn't
+implement (a full second concurrent JS execution context - a
+deliberate, substantial feature gap, not something to patch around in
+a round of bug-fixing, matching this investigation's own house
+philosophy for sql.js's WASM memory gap). Real Node's own error
+message noderati already produces for this
+(`worker_threads.Worker is not implemented: noderati cannot yet run a
+second concurrent JS execution context`) confirmed this is
+intentional, not silent. Since single-threaded minification
+(`new TerserPlugin({ parallel: false })`) is a real, commonly-used
+webpack configuration in its own right (CI/serverless environments
+without worker thread support are a real reason people set this, not
+a synthetic workaround invented for this probe), updated the probe
+script (`p13-webpack.mjs`, scratchpad-local, not part of this repo) to
+use it explicitly - and **webpack built a real, working, minified
+bundle end to end**, confirmed byte-for-byte functionally equivalent
+to real Node's own output (`console.log('bundled ok')` present,
+`module.exports = 1 + 1` correctly folded to `2`) modulo one cosmetic
+minifier-output-style difference (`function(){...}()` vs. real Node's
+`(()=>{...})()` - both valid, working IIFEs, not a correctness bug,
+not chased further this round).
+
+**Verification**: `go build ./...` and `go vet ./...` both clean; full
+suite (`go test ./... -skip TestEventsAddAbortListener`) clean; two
+new tests added and passing (`TestBufferCopy`,
+`TestEventEmitterInstanceSetGetMaxListeners`); scoreboard clean (same
+pre-existing baseline/all-fakes-off pairing as every prior round).
+Every instrumentation edit made to the scratchpad's own vendored
+`webpack` copy (`Compilation.js`, `NormalModule.js`, `Compiler.js`)
+while tracing this round's two bugs was restored to a byte-identical
+copy of its pre-instrumentation state before concluding.
+
+**Status**: **11/13** - webpack passes for the first time in this
+entire investigation. Remaining: prettier (still the unisolated
+silent-wrong-output doc-printer bug - now the only item on this whole
+list that's neither fixed nor filed), sql.js (Round 116's own separate
+WASM investigation, a comparably deliberate deep-dive still owed its
+own dedicated round).

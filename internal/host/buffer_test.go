@@ -21,6 +21,50 @@ func TestBufferIsFunction(t *testing.T) {
 	}
 }
 
+// TestBufferCopy guards a real noderati gap found this round
+// (docs/real-node-plan.md): Buffer.prototype.copy was entirely missing.
+// Real, unmodified webpack's own default hash function (xxhash64,
+// terser-webpack-plugin's dependency chain) calls
+// `data.copy(mem, buffered, 0, length)` where mem is a real Buffer view
+// directly over a WASM hash instance's own linear memory - a missing
+// copy() broke every real webpack module build's own hashing step.
+// Exercises the plain case, overlapping-region copy within the same
+// buffer (Go's own copy() already has memmove-safe overlap semantics,
+// but this locks in that the wiring here doesn't break it), and the
+// real Node clamping behavior for an out-of-range sourceEnd/targetStart.
+func TestBufferCopy(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		const plain = Buffer.alloc(5, 0x2e);
+		Buffer.from("hi").copy(plain, 1);
+
+		const overlap = Buffer.from("abcdefghij");
+		overlap.copy(overlap, 2, 0, 5);
+
+		const clampTarget = Buffer.alloc(3);
+		const clampN = Buffer.from("hello").copy(clampTarget, 0, 0, 100);
+
+		const tooFar = Buffer.alloc(2);
+		const tooFarN = Buffer.from("hello").copy(tooFar, 5, 0, 5);
+
+		JSON.stringify({
+			plain: plain.toString(),
+			overlap: overlap.toString(),
+			clampTarget: clampTarget.toString(),
+			clampN,
+			tooFarN,
+		});
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"plain":".hi..","overlap":"ababcdehij","clampTarget":"hel","clampN":3,"tooFarN":0}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
 func TestBufferGlobal(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)

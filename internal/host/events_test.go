@@ -86,6 +86,44 @@ func TestEventsGetSetMaxListeners(t *testing.T) {
 	}
 }
 
+// TestEventEmitterInstanceSetGetMaxListeners guards a real noderati gap
+// found this round (docs/real-node-plan.md): EventEmitter only had the
+// newer, Node 15+ *static* events.setMaxListeners/getMaxListeners
+// (TestEventsGetSetMaxListeners above), not the original, much older and
+// far more commonly used *instance* methods
+// (emitter.setMaxListeners(n)/emitter.getMaxListeners()). Real,
+// unmodified `merge-stream` (a real, direct dependency of `jest-worker`,
+// itself used by `terser-webpack-plugin` for its worker-pool
+// minification) calls `output.setMaxListeners(0)` unconditionally on a
+// real `stream.PassThrough` instance - PassThrough extends Transform
+// extends this same EventEmitter (stream.go) - so the missing instance
+// method broke real webpack's own default production-mode minification
+// step.
+func TestEventEmitterInstanceSetGetMaxListeners(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	val, errs := p.RunCode(`
+		import { EventEmitter } from "node:events";
+		const ee = new EventEmitter();
+		const before = ee.getMaxListeners();
+		const chained = ee.setMaxListeners(0);
+		const after = ee.getMaxListeners();
+
+		JSON.stringify({
+			before,
+			after,
+			returnsThis: chained === ee,
+		})
+	`, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	want := `{"before":10,"after":0,"returnsThis":true}`
+	if val.ToString() != want {
+		t.Errorf("got %s, want %s", val.ToString(), want)
+	}
+}
+
 // TestEventsAddAbortListener drives the exact real call shape found while
 // re-probing real undici's fetch() after paserati#302 was fixed (round
 // 75, docs/real-node-plan.md): undici's own lib/core/util.js destructures

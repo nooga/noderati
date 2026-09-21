@@ -32,6 +32,34 @@ const eventsShim = `class EventEmitter {
     for (const fn of list.slice()) fn.call(this, ...args);
     return true;
   }
+  // setMaxListeners/getMaxListeners INSTANCE methods were missing
+  // entirely - a different API from the *static* events.setMaxListeners/
+  // getMaxListeners this file already implements below (this file's own
+  // pre-existing doc comment on those covers only the newer, Node 15+
+  // static module-level form: 'events.setMaxListeners(n, ...emitters)').
+  // Real Node's EventEmitter has always had these as plain instance
+  // methods too (emitter.setMaxListeners(n)/emitter.getMaxListeners()),
+  // predating the static form by years and far more commonly used in
+  // practice. Found this round (docs/real-node-plan.md): real,
+  // unmodified 'merge-stream' (a real, direct dependency of
+  // 'jest-worker', itself used by 'terser-webpack-plugin' for its
+  // worker-pool minification) does 'output.setMaxListeners(0)'
+  // unconditionally on a real 'stream.PassThrough' instance -
+  // PassThrough extends Transform extends this same EventEmitter
+  // (stream.go), so the missing instance method broke real webpack's
+  // own default production-mode minification step. Mirrors the static
+  // form's own semantics (an explicit, non-negative limit; 0 means
+  // unlimited) but scoped to 'this' alone, and returns 'this' to match
+  // real Node's chainable API ('output.setMaxListeners(0)' is used
+  // standalone here, but real code elsewhere chains off the return
+  // value too).
+  setMaxListeners(n) {
+    this._maxListeners = n;
+    return this;
+  }
+  getMaxListeners() {
+    return typeof this._maxListeners === "number" ? this._maxListeners : defaultMaxListeners;
+  }
 }
 // Real Node's require("node:events")/require("events") returns the
 // EventEmitter class itself, not a namespace object wrapping it (also
