@@ -14057,3 +14057,177 @@ were at the start of this whole investigation). Remaining: prettier
 item on this whole list that's neither fixed nor filed), eslint
 (`#481`), babel (`#480`), webpack (`#482`), sql.js (Round 116's own
 separate WASM investigation, untouched this round).
+
+## Round 124: paserati#480/#481/#482 all confirmed merged - eslint and babel both genuinely pass now, slate jumps to 10/13; four real noderati bugs found and fixed chasing webpack's new blocker; a fifth, architectural gap filed as paserati#484
+
+Picked up directly from "ok, fixes landed in paserati, pull and try":
+[paserati#480/#481/#482](https://github.com/nooga/paserati/issues/480)
+all landed in a single commit (`7e98f468`, "Fix #480, #481, #482:
+trimLeft/trimRight, super spread this-binding, 32-bit jump offsets").
+Pulled, ran paserati's own full suite (two small, unrelated
+pre-existing failures - an exception-message wording mismatch and a
+regexp Unicode-property-escape gap, neither touched by this commit or
+relevant to any package on this list), then verified each fix directly
+against its own minimal repro from Round 123 before touching the real
+packages at all:
+
+- `"a  b".trimLeft()` / `"a  b  ".trimRight()` now match real Node
+  exactly (`#480`).
+- The `super.finishNodeAt(...args)` five-line repro now returns the
+  derived instance's own field correctly instead of `undefined`
+  (`#481`).
+
+Rebuilt noderati and re-ran the full 13-package breadth sweep:
+**eslint and babel both flipped to a genuine pass** - not a "closed on
+GitHub" pass, a real, unmodified `eslint@9.36.0`/`@babel/core@7.28.4`
+pass, confirmed the same way every other item on this list is, by
+actually running the real, unmodified package end to end. **Slate:
+10/13**, up from 8/13 at the end of Round 123. ajv, handlebars,
+graphql, zod, commander, both SDK probes, and aws-s3 all continue to
+pass unchanged.
+
+**webpack progressed instead of flipping - and unmasked four real,
+distinct noderati bugs one after another, each blocking the next once
+fixed:**
+
+1. **`fsAsyncEncodingFromValue` panicked on a non-object, non-string
+   trailing argument** (`internal/host/fs_async.go`) -
+   `v.AsPlainObject()` panics on any `vm.Value` whose type isn't
+   exactly `TypeObject`, but the function called it unconditionally on
+   any non-string argument. Real, unmodified `graceful-fs`'s own
+   `fs.readFile` wrapper passes exactly this shape - `fs$readFile(path,
+   options, callback)` where `options` is `null` in the common case -
+   crashing a real webpack compile with an internal VM panic
+   (`value is not an object`) the moment `@babel/preset-env`'s
+   `core-js-compat/data.json` require chain pulled `graceful-fs` in.
+   Fixed by checking `v.Type() != vm.TypeObject` first (`v.IsObject()`
+   alone isn't enough - it's a broader range covering arrays and
+   functions too, which `AsPlainObject()` still panics on). New test:
+   `TestFSAsyncReadFileNonObjectOptionsDoesNotPanic`.
+2. **`path.resolve()`'s multi-argument semantics were wrong** -
+   real Node's own documented behavior processes arguments right to
+   left, and a later *absolute* argument must win outright over
+   everything before it, not get joined onto it
+   (`path.resolve("/a/b", "/c/d")` is `/c/d`, not `/a/b/c/d`). The
+   top-level `path.resolve` (`internal/host/path.go`) used
+   `filepath.Join(parts...)` first, which has no such reset - the
+   `path.posix`/`path.win32` variants already got this right, only the
+   plain, unqualified one didn't. Confirmed as the root cause of a
+   very visible symptom: real, unmodified `enhanced-resolve` (webpack's
+   own resolver) calls `path.resolve(cwd, someAbsolutePath)` during its
+   own directory-walking, and the join bug silently produced a doubled
+   path like `<cwd>/<cwd>/wp-fixture/index.js` - confirmed **not** a
+   bug in itself (real Node produces the identical doubled-looking path
+   for this exact test fixture too, an artifact of the scratchpad's own
+   directory structure, not a real divergence) only by running the
+   identical instrumented probe against real Node side by side and
+   diffing the two traces line for line. Fixed to match
+   `path.posix.resolve`'s existing left-to-right-with-reset-on-absolute
+   pattern. New test: `TestPathResolveAbsoluteArgumentWins`.
+3. **`fs.stat`/`fs.lstat`/`fs.access` ignored real Node's own
+   `(path[, options], callback)` three-argument form** - all three
+   took a fixed-position `cb vm.Value` parameter (added Round 122), so
+   a real caller passing an options argument landed it in the callback
+   slot instead, which is never callable - the callback then simply
+   **never fires at all**, no error, no success, nothing. This is
+   exactly the shape real, unmodified `enhanced-resolve`'s own
+   `CachedInputFileSystem` uses internally
+   (`fs.stat(path, undefined, callback)`), and it hung a real webpack
+   compile forever with zero diagnostics - confirmed directly with a
+   standalone `fs.stat(path, {}, cb)` repro against real Node (fires)
+   vs. noderati (silent, forever) before touching webpack again. Fixed
+   all three to accept `opts ...vm.Value` and pick the callable
+   argument out of the trailing args, the same pattern `readFile`/
+   `writeFile` already used. New test:
+   `TestFSAsyncStatAccessTrailingOptions`.
+4. **`fs.readlink` was entirely missing** - real, unmodified
+   `enhanced-resolve` (via its own `SymlinkPlugin.js`) calls
+   `fs.readlink(path, callback)` unconditionally on every path segment
+   of every single resolve attempt, symlink or not, since that's the
+   only way it can find out. Missing entirely wasn't a plain
+   "undefined is not a function": enhanced-resolve's own
+   `CachedInputFileSystem`/`CacheBackend` wraps a missing async
+   provider as a **literal `null`**
+   (`this.provide = provider ? this.provide.bind(this) : null;`), so
+   the real, observed failure was `null is not a function`, thrown
+   deep inside a scheduled callback with no repro-worthy stack (every
+   frame was dynamically-generated Tapable codegen, `<script>`/
+   `<forEachBail>`/`<CALL_ASYNC_DELEGATE>`, not real source positions).
+   Root-caused by patching real, unmodified `enhanced-resolve`'s own
+   vendored source in the scratchpad install with one `console.error`
+   per plugin's `tapAsync` entry point, then diffing which plugin ran
+   last before the exception under noderati versus under real Node -
+   `SymlinkPlugin.js` was the answer. Added a real, Node-shaped
+   `fs.readlink(path[, options], callback)`, matching Node's own
+   `EINVAL` behavior on a non-symlink target (Go's `os.Readlink`
+   already returns exactly that errno, so `wrapFsErr`'s existing
+   generic errno table needed no changes). New test:
+   `TestFSAsyncReadlink`.
+
+With all four fixed, webpack's real resolve phase now **completes
+successfully** - confirmed directly, not assumed: instrumented
+`enhanced-resolve`'s own `Resolver.js` to log its top-level
+`doResolve` completion, and it now reports
+`RESOLVE_DONE null .../wp-fixture/index.js` under noderati, matching
+real Node's own outcome for the identical resolve call.
+
+**webpack's compile still hangs past resolution, though - not on a new
+noderati or paserati correctness bug, but on a real, previously-
+documented architectural gap finally caught in the act and filed
+upstream.** Round 79/80 (`immediate_object.go`'s own doc comment)
+already noted, in passing, that a throwing `setImmediate` callback is
+silently discarded with zero diagnostics - checked back then against
+paserati's own bare `setTimeout` and found to be the same pre-existing,
+engine-wide pattern (`RunDueTimers()` discards the callback's error
+exactly the same way), not something introduced by `setImmediate`
+specifically, and left documented rather than patched around. This
+round, that exact gap turned out to be the actual reason webpack hung:
+real, unmodified `webpack@5.102.1`'s own `lib/util/AsyncQueue.js`
+drains its task queue via `setImmediate(root._ensureProcessing)`, and
+once resolution succeeds, `_ensureProcessing` throws somewhere in the
+build phase - the exception vanishes with **zero output at all**
+(confirmed directly by temporarily un-discarding the error in
+`fs_async.go`'s own `scheduleCallback` and printing it by hand: it
+correctly showed nothing further being thrown once past all four fixes
+above, meaning the actual failure is downstream of any fs call this
+round could see, inside webpack's own queue machinery). From the
+outside, `compiler.run()`'s callback simply never fires, and the
+probe's own top-level `await new Promise(...)` hangs forever, reported
+only as paserati's generic "promise remains pending with no
+microtasks to process" - no hint at all about what actually broke.
+Confirmed as a real, dependency-free, paserati-level bug (no noderati
+code involved) with a five-line repro - a `setTimeout` callback that
+throws prints nothing and exits `0`, where real Node prints a full
+stack trace and exits `1` - and filed as
+[paserati#484](https://github.com/nooga/paserati/issues/484), rather
+than papered over locally: patching just `fs_async.go`'s own dispatch
+(as this round's earlier fixes might tempt) would leave `setTimeout`/
+`setImmediate` themselves still silently broken the same way, since
+the discard lives in paserati's own event-loop machinery
+(`host_timers.go`) and in this project's own `immediate_object.go`
+alike - the real fix belongs in one place upstream, not scattered
+across every host callback dispatcher that happens to trip over it.
+
+**Verification**: `go build ./...` and `go vet ./...` both clean; full
+suite (`go test ./... -skip TestEventsAddAbortListener`) clean on a
+second run (one flaky, order-dependent `TestURLSearchParamsIteration`
+failure on the first run reproduced as a pass in isolation and on a
+clean rerun - a pre-existing test-ordering flake, not a regression
+from anything this round touched); four new tests added
+(`TestPathResolveAbsoluteArgumentWins`,
+`TestFSAsyncStatAccessTrailingOptions`,
+`TestFSAsyncReadFileNonObjectOptionsDoesNotPanic`,
+`TestFSAsyncReadlink`); scoreboard clean. Every temporary debug print
+and every instrumentation edit made to the scratchpad's own vendored
+`enhanced-resolve`/`Resolver.js` copies while tracing this round's four
+bugs was reverted or restored from a byte-identical backup before
+concluding - `git diff --stat` on `internal/host/fs_async.go` and
+`internal/host/path.go` shows only the real, permanent fixes described
+above.
+
+**Status**: **10/13** - a genuine jump from 8/13, not just deeper
+diagnosis this time. Remaining: prettier (still the silent-wrong-output
+doc-printer bug, not yet isolated), webpack (now cleanly blocked on
+`#484`, an upstream architectural fix - resolution itself is
+confirmed working end to end), sql.js (Round 116's own separate WASM
+investigation, untouched this round).

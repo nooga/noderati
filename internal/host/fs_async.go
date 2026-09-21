@@ -61,6 +61,21 @@ func fsErrToVM(err error) vm.Value {
 func scheduleCallback(vmInst *vm.VM, cb vm.Value, cbArgs []vm.Value) {
 	rt := vmInst.GetAsyncRuntime()
 	rt.ScheduleNextTick(func() {
+		// The returned error (a throwing callback) is deliberately
+		// discarded here, matching the exact same house pattern
+		// immediate_object.go's setImmediate dispatch already documents:
+		// paserati's own setTimeout/nextTick (host_timers.go) silently
+		// discard a throwing callback's error too, with no
+		// uncaughtException, no nonzero exit, nothing printed at all --
+		// confirmed as a real, dependency-free engine-level gap and filed
+		// upstream as paserati#484 (this round, docs/real-node-plan.md),
+		// after it was the actual reason a real webpack compile hung
+		// forever with zero diagnostics (an exception thrown deep inside
+		// webpack's own `AsyncQueue`'s `setImmediate` callback vanished
+		// the same way). Not papered over here with a one-off fix that
+		// would leave setTimeout/setImmediate still silently broken the
+		// same way -- the real fix belongs in paserati's own event-loop
+		// dispatch, which every one of these call sites shares.
 		_, _ = vmInst.Call(cb, vm.Undefined, cbArgs)
 	})
 }
@@ -76,6 +91,16 @@ func fsAsyncEncodingFromValue(v vm.Value) (string, bool) {
 	if v.IsString() {
 		return v.AsString(), true
 	}
+	// Real callers (graceful-fs's own fs.readFile wrapper included) pass
+	// non-object non-string values here too -- `false`/`null`/`undefined`
+	// placeholders among the trailing args -- so this must reject anything
+	// that isn't a plain object rather than assume the caller already
+	// filtered it out; AsPlainObject() panics on any value whose type isn't
+	// exactly TypeObject (IsObject() is too broad -- it also covers arrays
+	// and functions, which AsPlainObject() would still panic on).
+	if v.Type() != vm.TypeObject {
+		return "", false
+	}
 	obj := v.AsPlainObject()
 	if obj == nil {
 		return "", false
@@ -85,6 +110,22 @@ func fsAsyncEncodingFromValue(v vm.Value) (string, bool) {
 		return "", false
 	}
 	return enc.AsString(), true
+}
+
+// findAsyncCallback picks the callable value out of a classic Node fs
+// function's trailing variadic arguments -- shared by stat/lstat/access,
+// which each accept an optional options-or-mode argument before the
+// callback (mirrors the inline loop readFile/writeFile above already use
+// for the same reason: a fixed-position `cb vm.Value` parameter silently
+// receives the options value instead whenever a real caller passes one,
+// and never gets called).
+func findAsyncCallback(opts []vm.Value) vm.Value {
+	for _, v := range opts {
+		if v.IsCallable() {
+			return v
+		}
+	}
+	return vm.Undefined
 }
 
 // declareFSAsync adds real Node's classic callback-style fs functions --
@@ -206,7 +247,17 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "mkdir", path, err))})
 		return vm.Undefined, nil
 	})
-	m.Function("stat", func(path string, cb vm.Value) (vm.Value, error) {
+	m.Function("stat", func(path string, opts ...vm.Value) (vm.Value, error) {
+		// Real Node's fs.stat(path[, options], callback) -- same trailing-
+		// callback shape as readFile/writeFile above. Fixed-arity `cb
+		// vm.Value` (as this had before) silently never calls back at all
+		// when a real caller passes an options argument too, since the
+		// options value lands in the `cb` parameter instead and is never
+		// callable -- confirmed as a real noderati bug this round: real,
+		// unmodified enhanced-resolve (webpack's own resolver) calls
+		// exactly this 3-argument form, and the missing callback left a
+		// real webpack compile hanging forever with no error at all.
+		cb := findAsyncCallback(opts)
 		info, err := os.Stat(path)
 		if err != nil {
 			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "stat", path, err))})
@@ -224,7 +275,9 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 	// variant was simply never added alongside it. Mirrors os.Stat's own
 	// `stat` above exactly, swapped for os.Lstat (matching lstatSync's
 	// real Go call in fs.go and fs/promises's own lstat).
-	m.Function("lstat", func(path string, cb vm.Value) (vm.Value, error) {
+	m.Function("lstat", func(path string, opts ...vm.Value) (vm.Value, error) {
+		// Same trailing-options-then-callback shape as stat above.
+		cb := findAsyncCallback(opts)
 		info, err := os.Lstat(path)
 		if err != nil {
 			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "lstat", path, err))})
@@ -255,10 +308,41 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 	// fs/promises's own access (fspromises.go) - real Node's fs.access
 	// only ever reports whether the path is reachable/permitted via the
 	// callback's error argument, never a success payload.
-	m.Function("access", func(path string, cb vm.Value) (vm.Value, error) {
+	m.Function("access", func(path string, opts ...vm.Value) (vm.Value, error) {
+		// Real Node's fs.access(path[, mode], callback) -- same trailing-
+		// options-then-callback shape as stat/lstat above (the optional
+		// arg here is a numeric mode instead of an options object, but the
+		// callback-finding problem is identical).
+		cb := findAsyncCallback(opts)
 		fsTouch("stat", path)
 		_, err := os.Stat(path)
 		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "access", path, err))})
+		return vm.Undefined, nil
+	})
+	// readlink added (docs/real-node-plan.md, this round): real, unmodified
+	// enhanced-resolve (webpack's own resolver, via `SymlinkPlugin.js`)
+	// calls `fs.readlink(path, callback)` on every path segment of every
+	// resolve attempt, unconditionally -- not just when a symlink is
+	// suspected, since that's the only way it can find out. Missing
+	// entirely (as `stat`/`lstat`/`access` all were before Round 122)
+	// wasn't a plain "undefined is not a function" here: enhanced-resolve's
+	// own `CachedInputFileSystem` wraps a missing async provider as a
+	// literal `null` (`this.provide = provider ? ... : null` in its
+	// `CacheBackend`), so the real, observed failure was a real webpack
+	// compile hanging forever on a `null is not a function` exception
+	// thrown deep inside a scheduled callback -- silently, since the
+	// scheduler swallowed the error rather than surfacing it (a related,
+	// separate gap; see docs/real-node-plan.md for this round's paserati
+	// issue about that). Same real-Node-signature shape as stat/lstat:
+	// `fs.readlink(path[, options], callback)`.
+	m.Function("readlink", func(path string, opts ...vm.Value) (vm.Value, error) {
+		cb := findAsyncCallback(opts)
+		target, err := os.Readlink(path)
+		if err != nil {
+			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "readlink", path, err))})
+			return vm.Undefined, nil
+		}
+		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, vm.NewString(target)})
 		return vm.Undefined, nil
 	})
 	m.Function("utimes", func(path string, atime, mtime vm.Value, cb vm.Value) (vm.Value, error) {

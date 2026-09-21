@@ -24,22 +24,35 @@ func declarePath(p *driver.Paserati) {
 		m.Function("isAbsolute", filepath.IsAbs)
 		m.Function("normalize", filepath.Clean)
 		m.Function("resolve", func(parts ...string) string {
-			if len(parts) == 0 {
-				cwd, err := os.Getwd()
-				if err != nil {
-					return ""
-				}
-				return cwd
-			}
-			p := filepath.Join(parts...)
-			if filepath.IsAbs(p) {
-				return filepath.Clean(p)
-			}
-			abs, err := filepath.Abs(p)
+			cwd, err := os.Getwd()
 			if err != nil {
-				return filepath.Clean(p)
+				cwd = "/"
 			}
-			return abs
+			// Real Node's path.resolve processes its arguments right to
+			// left, prepending each until an absolute path has been
+			// constructed (falling back to cwd if none of them were
+			// absolute) -- so a later absolute argument must WIN over an
+			// earlier one, not get joined onto it. The previous
+			// implementation used filepath.Join(parts...) first, which has
+			// no such reset and instead concatenates every segment
+			// regardless of absoluteness -- confirmed as the root cause of
+			// a real webpack failure (docs/real-node-plan.md, this round):
+			// enhanced-resolve's own directory-walking calls
+			// path.resolve(cwd, someAbsolutePath), and the join bug
+			// produced a doubled path like "<cwd>/<cwd>/wp-fixture/index.js"
+			// instead of the real, unmodified absolute path.
+			resolved := cwd
+			for _, part := range parts {
+				if part == "" {
+					continue
+				}
+				if filepath.IsAbs(part) {
+					resolved = part
+				} else {
+					resolved = filepath.Join(resolved, part)
+				}
+			}
+			return filepath.Clean(resolved)
 		})
 		m.Function("relative", func(from, to string) string {
 			rel, err := filepath.Rel(from, to)

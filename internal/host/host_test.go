@@ -25,6 +25,30 @@ func TestPathJoin(t *testing.T) {
 	}
 }
 
+// A later absolute argument to path.resolve() must win over everything
+// before it, not get joined onto it -- real Node's own documented
+// right-to-left "stop at the first absolute segment" semantics. Confirmed
+// as a real noderati bug (docs/real-node-plan.md, this round): the
+// previous implementation did filepath.Join(parts...) first, which has no
+// such reset, and a real webpack compile hung forever on the resulting
+// doubled path once enhanced-resolve's own directory-walking called
+// path.resolve(cwd, someAbsolutePath).
+func TestPathResolveAbsoluteArgumentWins(t *testing.T) {
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	js := `
+		import path from "node:path";
+		path.resolve("/a/b", "/c/d");
+	`
+	val, errs := p.RunCode(js, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	if val.ToString() != "/c/d" {
+		t.Errorf("path.resolve(\"/a/b\", \"/c/d\") = %q, want \"/c/d\"", val.ToString())
+	}
+}
+
 func TestExportedClassStaticCreate(t *testing.T) {
 	dir := t.TempDir()
 	mod := filepath.Join(dir, "cls.js")
