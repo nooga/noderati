@@ -14578,3 +14578,101 @@ silent-wrong-output doc-printer bug - now the only item on this whole
 list that's neither fixed nor filed), sql.js (Round 116's own separate
 WASM investigation, a comparably deliberate deep-dive still owed its
 own dedicated round).
+
+## Round 128: prettier's silent-wrong-output bug fully root-caused to a single, minimal, dependency-free engine bug - `Object.fromEntries()` creates non-enumerable properties - filed as paserati#488
+
+Picked up directly from "keep going on prettier" - the one item on
+this whole list that had never been isolated to a minimal repro,
+across every prior round that touched it. No noderati source changes
+this round; the root cause turned out to live entirely in paserati's
+own `Object.fromEntries()`.
+
+Started from `prettier.__debug.printToDoc()` (a real, public prettier
+debug API) to see the intermediate "Doc" IR *before* the print-to-
+string/layout algorithm runs, to separate "the AST-to-doc conversion
+produced something wrong" from "the doc got converted to a string
+wrong." Diffing real Node's and noderati's Doc IR for
+`const x={a:1,b:2}` side by side found real, concrete differences: a
+missing trailing `;`, an empty `if-break` (should carry the trailing
+comma), and `{"type":"line","soft":true}` where real Node has a plain
+`{"type":"line"}`. Multiple different prettier *options*
+(`semi`/`trailingComma`) diverging simultaneously, in a way that
+looked like their *declared defaults* specifically weren't taking
+effect, was the first real clue.
+
+Bisected with a battery of trivially small, unrelated inputs (`{}`,
+`[1,2]`, `f(1,2)`, `const {a,b}=y`) and found **every single one**
+broke into multi-line under noderati, including a bare empty object
+literal (`const x={}` -> `const x =\n{}\n`) - far too small to
+genuinely not fit an 80-column line under any real measurement bug.
+Passing `printWidth: 80` explicitly immediately fixed it, confirming
+the real, specific defect: prettier's own declared default
+(`printWidth: 80`) wasn't reaching the doc-printer's own
+`fits()`/layout code at all - it was silently resolving to
+`undefined`, making virtually everything "not fit."
+
+Traced *why* through prettier's own bundled source (real,
+unmodified `index.mjs`, instrumented in place and restored
+byte-identical afterward) to the exact line building the options
+defaults object:
+
+```js
+const defaults = {
+  ...formatOptionsHiddenDefaults,
+  ...Object.fromEntries(
+    supportOptions.filter((optionInfo) => optionInfo.default !== void 0).map((option) => [option.name, option.default])
+  )
+};
+```
+
+Reduced this to a minimal, dependency-free, five-line repro:
+
+```js
+const obj = Object.fromEntries([["a", 1], ["b", 2]]);
+console.log(obj.a);              // 1 - direct property access works
+console.log(JSON.stringify(obj)); // {} under noderati/paserati, {"a":1,"b":2} in real Node
+console.log(Object.keys(obj));    // [] under noderati/paserati, ["a","b"] in real Node
+```
+
+`Object.getOwnPropertyDescriptor(obj, "a")` pinpoints the exact
+defect: `{value: 1, writable: true, enumerable: false, configurable:
+true}` - `writable`/`configurable` are both spec-correct, only
+`enumerable` is wrong (should be `true`, exactly like a normal object
+literal or a correctly-configured `Object.defineProperty` call).
+Since `Object.keys`/`Object.values`/`Object.entries`/`for...in`/
+`JSON.stringify`/object spread (`{...obj}`) all only see *enumerable*
+own properties, every one of them silently sees an empty object even
+though direct property access (`obj.a`) works completely normally -
+explaining why this slipped past casual testing for so long. Filed as
+[paserati#488](https://github.com/nooga/paserati/issues/488), a
+clean, minimal engine bug, not touched here per this investigation's
+own standing instruction.
+
+**Confirmed this is genuinely the entire bug, not just a contributing
+factor**: passing every relevant default explicitly
+(`printWidth: 80, semi: true, trailingComma: "all", objectWrap:
+"preserve", bracketSpacing: true`) makes real, unmodified prettier
+produce output that matches real Node **byte-for-byte**
+(`"const x = { a: 1, b: 2 };\n"` on both sides) - including the
+`{"type":"line","soft":true}` vs. plain `{"type":"line"}` Doc IR
+difference noted at the very start of this round's investigation,
+which turned out to be `objectWrap`'s own lost default, the same root
+cause wearing a different hat. Not a coincidence or a second bug
+papered over by coincidence - the full options object genuinely
+resolves correctly once every default is supplied by hand, confirming
+`Object.fromEntries()` is the one and only root cause behind every
+symptom this round found.
+
+**Verification**: no noderati source changes this round (purely
+diagnostic, entirely inside paserati's own `Object.fromEntries`
+builtin and real, unmodified, vendored `prettier` source). Every
+instrumentation edit made to the scratchpad's own vendored `prettier`
+copy (`doc.mjs`, `index.mjs`) was restored to a byte-identical copy of
+its pre-instrumentation state before concluding - `diff` against both
+backups is empty.
+
+**Status**: still **11/13** in raw count (prettier isn't fixed yet -
+that's paserati's own call to make), but the investigation itself is
+complete: every remaining failure on this whole list now has a
+precise, filed, upstream diagnosis. Remaining: prettier (blocked on
+`#488`), sql.js (Round 116's own separate WASM investigation).
