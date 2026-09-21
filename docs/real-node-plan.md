@@ -14359,3 +14359,116 @@ precise, reproducible, catchable exception instead of an opaque
 Remaining unchanged in count: prettier (still unisolated), webpack
 (new `createModuleAssets`/`buildInfo` blocker, not yet root-caused),
 sql.js (Round 116's own separate WASM investigation).
+
+## Round 126: webpack's `buildInfo` blocker root-caused to `Resolver.js`'s own `toCamelCase()` silently no-op'ing in a specific deep-call-stack context; extensive minimal-repro attempts all failed, filed as paserati#486 without one, per the `#482` precedent
+
+Picked up directly from "keep going on webpack's buildInfo bug." No
+noderati-side changes this round - purely a diagnostic investigation,
+entirely inside real, unmodified `webpack`/`enhanced-resolve` source
+(temporarily instrumented in place in the scratchpad's own vendored
+copy, restored byte-identical before concluding) and paserati itself.
+
+Since real `NormalModule.prototype.build()` sets
+`this.buildInfo = {...}` **synchronously**, as the very first thing it
+does, `module.buildInfo` being `undefined` later means `build()` was
+never actually called on that module instance - not a subtler
+mid-build failure. Confirmed by instrumenting `NormalModule`'s
+constructor and `build()` entry point with an object-identity counter:
+exactly one `NormalModule` instance is ever created for the entry file
+(no identity-mismatch caching bug), and `build()` genuinely never
+fires on it.
+
+Traced the real call chain step by step by instrumenting each layer in
+turn (`_buildModule` -> `needBuild` -> the `needBuild` callback ->
+`module.build(...)`'s own three computed arguments) until finding the
+exact statement that silently swallows everything past it:
+`this.resolverFactory.get("normal", module.resolveOptions)` -
+webpack's own `ResolverFactory.get()`/`_create()` - which calls down
+into `Factory.createResolver(...)` (real, unmodified `enhanced-resolve`)
+and throws `Error: Hook internal-resolve doesn't exist`. Real webpack's
+own `AsyncQueue._startProcessing` (`lib/util/AsyncQueue.js`) wraps its
+processor call in a `try`/`catch` specifically so a module's build
+failure doesn't crash the whole compiler - by design, not a bug - which
+is why this exception doesn't surface as an immediate crash: it's
+caught, the module is marked failed internally, but (a real,
+independent issue for a later round) still reaches code generation
+with no real content, producing the originally-reported
+`createModuleAssets`/`Cannot read property 'assets' of undefined`
+crash as a confusing secondary symptom of this same root cause.
+
+**Root-caused the actual throw** to `enhanced-resolve`'s own
+`Resolver.js`: `getHook`/`ensureHook` both camelCase their argument via
+a small local `toCamelCase(str) { return str.replace(/-([a-z])/g, (str)
+=> str.slice(1).toUpperCase()); }` before doing a plain property lookup
+on `this.hooks`. Instrumenting every `ensureHook`/`getHook` call for
+the specific failing resolver instance showed `toCamelCase("parsed-resolve")`
+returning `"parsed-resolve"` **completely unconverted** (no hyphen
+replaced at all) - while dozens of other hook names in the exact same
+run (`"internal-resolve"` -> `"internalResolve"`, etc.) converted
+correctly. This silently creates a hook under the wrong, still-hyphenated
+key; a later `getHook("internal-resolve")` call (correctly camelCased)
+can't find it, and throws.
+
+**Extensive attempts to build a minimal, dependency-free repro all
+failed** - each specific, plausible hypothesis was tested directly and
+disproven:
+- **Non-object `WeakMap` key** (`ResolverFactory.get`'s cache is keyed
+  by `module.resolveOptions`, an object that could plausibly be
+  `undefined`): tested `new WeakMap().get(undefined)`/`.set(undefined, x)`
+  directly - matches real Node exactly (`get` returns `undefined`,
+  `set` throws the real `TypeError`). Not it.
+- **Stale `lastIndex` on a shared global-flag regex literal leaking
+  across calls** (the classic "regex literal accidentally reused as a
+  singleton" bug class): built a direct repro advancing a shared
+  `/g`-flag regex's `lastIndex` via `.exec()` on a long string, then
+  `.replace()`-ing a short string with the same regex object -
+  `lastIndex` was correctly reset to 0 before matching in both engines.
+  Not it.
+- **Faithfully replaying the real call sequence** (create a "loader"
+  resolver, create an "import"-conditionNames "normal" resolver,
+  actually resolve a real file with it asynchronously, then create a
+  "require"-conditionNames "normal" resolver - the exact order/shape
+  webpack itself uses) via both `enhanced-resolve`'s own public
+  `ResolverFactory.createResolver` API directly and a faithful
+  from-scratch reimplementation of `Resolver`'s own `ensureHook`/
+  `getHook`/`toCamelCase` structure driven through the real ~28 hook
+  names in the real order - succeeded every single time, including
+  across **200 repeated iterations** of the full sequence in one
+  process (0 failures / 200 - ruling out a rare/flaky race that just
+  needs enough iterations to trigger).
+- Confirmed the exact resolve-options object actually passed to
+  `Factory.createResolver(...)` (after webpack's own internal
+  `hooks.resolveOptions.for(type).call(...)` normalization step) is
+  **byte-for-byte identical** between real Node and noderati for all
+  three resolver-creation calls in the real run (diffed the full
+  `JSON.stringify`'d options for each, excluding only the
+  non-serializable `fileSystem` field) - ruling out any upstream
+  divergence in *what* gets computed; the failure is specifically in
+  this one `.replace()` call's own matching behavior.
+
+Given the failure reproduces **100% consistently** (3/3 runs) against
+the real, unmodified npm packages, but not in any isolated context
+tried - including a 200-iteration stress replay of the closest faithful
+approximation - this has the exact shape of this investigation's own
+recurring "real, complex, deep-call-stack code triggers a subtle VM
+bug invisible to shallow synthetic tests" pattern (the same family as
+the register-spill fixes chased across several earlier rounds). Filed
+as [paserati#486](https://github.com/nooga/paserati/issues/486)
+without a minimized repro - the same allowance this investigation used
+for `#482` ("the bug is inherently X, not Y") - but with the full,
+precise diagnostic trail above (including everything ruled out) so the
+next person doesn't retread the same dead ends.
+
+**Verification**: no noderati source changes this round (purely
+diagnostic). Every instrumentation edit made to the scratchpad's own
+vendored `webpack`/`enhanced-resolve` copies (`Compilation.js`,
+`NormalModule.js`, `Resolver.js`, `ResolverFactory.js`) was reverted or
+restored from a byte-identical backup before concluding - `diff`
+against pre-instrumentation copies of all four files is empty. `git
+status` on noderati's own repo shows no new changes from this round.
+
+**Status**: slate holds at **10/13**. webpack's blocker is now
+root-caused as precisely as extensive investigation could manage
+without engine-level introspection tools, and filed upstream as
+`#486`. Remaining: prettier (still unisolated), webpack (blocked on
+`#486`), sql.js (Round 116's own separate WASM investigation).
