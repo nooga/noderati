@@ -138,7 +138,18 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		fn := args[0]
 		fnArgs := args[1:]
 		rt.ScheduleNextTick(func() {
-			_, _ = vmInstance.Call(fn, vm.Undefined, fnArgs)
+			// Mirrors #484's own fix (docs/real-node-plan.md, this
+			// round): this is noderati's own separate process.nextTick
+			// implementation (real Node's process object, not paserati's
+			// bare global nextTick that #484 patched in
+			// process_init.go), so that upstream fix doesn't reach this
+			// call site on its own. Confirmed as a real, current gap:
+			// real webpack's own AsyncQueue calls
+			// `process.nextTick(() => callback(entry.error,
+			// entry.result))` directly.
+			if _, err := vmInstance.Call(fn, vm.Undefined, fnArgs); err != nil {
+				reportUncaughtCallbackException(vmInstance, err)
+			}
 		})
 		return vm.Undefined, nil
 	}))

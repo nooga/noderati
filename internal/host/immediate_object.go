@@ -86,22 +86,30 @@ func installSetImmediate(p *driver.Paserati) {
 		// vmInst.Call directly here, with no ScheduleNextTick hop, is
 		// safe (unlike callbacks invoked from a background goroutine,
 		// which must defer any VM-value construction/call to a tick).
-		// The returned error (a throwing callback) is deliberately
-		// discarded, not silently dropped by oversight: confirmed
-		// directly that paserati's own RunDueTimers() does the exact
-		// same thing for a throwing setTimeout(fn, 0) callback (no
-		// uncaughtException, no nonzero exit, no trace at all) - this
-		// matches that existing engine-level house pattern for
-		// DrainUntilIdle-driven callbacks rather than inventing a new,
-		// inconsistent one for setImmediate alone. A real gap from
-		// Node (which does report it), but a pre-existing, paserati-wide
-		// one, not something introduced here - flagged, not fixed, per
-		// this round's own actual scope.
+		//
+		// A throwing callback's error used to be silently discarded here,
+		// deliberately matching the exact same house pattern paserati's
+		// own setTimeout/nextTick had at the time (confirmed directly:
+		// a throwing setTimeout(fn, 0) callback showed the identical "no
+		// uncaughtException, no nonzero exit, no trace at all" behavior).
+		// That upstream gap is now fixed (paserati#484,
+		// docs/real-node-plan.md) via vm.FormatUncaughtCallError, but
+		// setImmediate doesn't exist in paserati at all - it's a
+		// noderati-only global - so #484's fix never reaches this call
+		// site on its own. Confirmed as a real, current gap: a real
+		// webpack compile's own AsyncQueue schedules its queue-draining
+		// function via `setImmediate(root._ensureProcessing)`, and once
+		// `_ensureProcessing` throws, the exception vanished with zero
+		// diagnostics even after pulling #484. Mirrors #484's own fix
+		// exactly via the shared reportUncaughtCallbackException helper
+		// (uncaught.go).
 		rt.ScheduleMacrotask(func() {
 			if cancelled {
 				return
 			}
-			_, _ = vmInst.Call(callback, vm.Undefined, extraArgs)
+			if _, err := vmInst.Call(callback, vm.Undefined, extraArgs); err != nil {
+				reportUncaughtCallbackException(vmInst, err)
+			}
 		})
 
 		return self, nil

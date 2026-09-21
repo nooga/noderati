@@ -14231,3 +14231,131 @@ doc-printer bug, not yet isolated), webpack (now cleanly blocked on
 `#484`, an upstream architectural fix - resolution itself is
 confirmed working end to end), sql.js (Round 116's own separate WASM
 investigation, untouched this round).
+
+## Round 125: paserati#484 confirmed merged - but three of noderati's own call sites reimplement the exact same discard bug it fixed, so the upstream fix never reached webpack on its own; fixed all three, unmasking webpack's real (and different) next blocker
+
+Picked up directly from "fix merged, pull latest main":
+[paserati#484](https://github.com/nooga/paserati/issues/484) landed
+(`dba3b07c`, "Fix #484: report and exit on an exception thrown inside
+setTimeout/nextTick"). Pulled, ran paserati's own full suite (the
+same two small, unrelated pre-existing failures as Round 124 - an
+exception-message wording mismatch and a regexp Unicode-property-escape
+gap), then verified the fix directly against its own repro before
+touching anything else:
+
+```js
+console.log("before");
+setTimeout(() => { throw new Error("boom from timeout"); }, 0);
+console.log("after");
+```
+
+Real Node prints a full stack trace and exits `1`. Rebuilt noderati and
+ran the identical repro - and it **still printed nothing and exited
+`0`**, exactly the pre-fix behavior, as if `#484` hadn't landed at all.
+
+**Root cause: noderati has three of its own call sites that
+reimplement (rather than delegate to) paserati's own timer/nextTick
+dispatch, and each one silently reintroduced the exact bug `#484` just
+fixed, entirely within noderati's own code - paserati's fix never had
+a chance to reach any of them:**
+
+1. `timeout_object.go` wraps paserati's real `setTimeout` to return a
+   Node-shaped `Timeout` object (round 75's own fix, for
+   `.unref()`/`.ref()` support). For the real, ref-counted path, it
+   reschedules the user's callback *directly* through the
+   `AsyncRuntime` (`rt.ScheduleTimer`/`rt.ScheduleUnrefTimer`) rather
+   than going back through paserati's own (now-fixed) `setTimeoutFn` -
+   this is why the exact repro above, which goes through a bare
+   `setTimeout(...)` call, never saw `#484`'s fix: noderati always
+   wraps the global `setTimeout`, so no script-visible call actually
+   reaches paserati's own fixed dispatcher.
+2. `immediate_object.go`'s `setImmediate` doesn't exist in paserati at
+   all - it's a noderati-only global, added in Round 79 specifically
+   because paserati has no such builtin - so `#484`'s fix, scoped to
+   paserati's own `setTimeout`/`nextTick`, never touched it. (Round
+   79/80's own doc comment on this exact call site had already noted
+   the discard as "a real gap from Node... but a pre-existing,
+   paserati-wide one... flagged, not fixed" - accurate at the time, but
+   now that the paserati-wide half is actually fixed, the comment's own
+   reasoning for leaving this one alone no longer holds.)
+3. `process.go`'s `process.nextTick` is noderati's own separate
+   implementation of real Node's `process` object, entirely distinct
+   from paserati's own bare global `nextTick` that `#484` did patch
+   (`process_init.go`) - same shape as `timeout_object.go`'s gap,
+   different call site.
+
+Fixed all three the same way `#484` fixed paserati's own dispatch -
+report the exception the way a genuinely uncaught top-level exception
+is displayed, then exit `1` - via a new shared helper,
+`reportUncaughtCallbackException` (`internal/host/uncaught.go`), built
+on paserati's own newly-exported `vm.FormatUncaughtCallError` (part of
+`#484`'s own fix, designed for exactly this: "host callback dispatch
+sites... that receive the thrown exception as a Go error rather than
+having the VM's own unwind loop print it automatically"). Mirrors
+paserati's own `osExit` test-override pattern
+(`pkg/driver/host_timers.go`) so the three new tests
+(`TestSetTimeoutUncaughtExceptionReportsAndExits`,
+`TestSetImmediateUncaughtExceptionReportsAndExits`,
+`TestProcessNextTickUncaughtExceptionReportsAndExits`) can observe the
+exit request without killing the test binary.
+
+Re-ran the bare `setTimeout`/`setImmediate`/`process.nextTick` repros
+directly against real Node side by side - all three now match: a
+stack trace on stderr, exit code `1`.
+
+**With all three fixed, re-running the webpack probe replaced the
+silent, undiagnosable hang with a real, actionable crash - a
+genuinely different, new blocker, not `#484` again:**
+
+```
+Uncaught exception: TypeError: Cannot read property 'assets' of undefined
+    at createModuleAssets (<createModuleAssets>:4955:1)
+    ...
+```
+
+Real, unmodified `webpack@5.102.1`'s own `Compilation.prototype.
+createModuleAssets` (`lib/Compilation.js`) does
+`const buildInfo = module.buildInfo; if (buildInfo.assets) {...}`
+unconditionally for every module in `this.modules` - `buildInfo` is
+`undefined` for the (only) entry module by the time this runs, even
+though real `NormalModule.prototype.build()` always sets
+`module.buildInfo = {}` unconditionally near the very start of a real
+build. Confirmed directly (not assumed) by temporarily patching the
+scratchpad's own vendored `Compilation.js` to log which module and
+module type lacks `buildInfo` before skipping it: the culprit is the
+one and only entry module itself
+(`javascript/dynamic|.../wp-fixture/index.js`) - `javascript/dynamic`
+is a real, legitimate webpack module type (confirmed in
+`ModuleTypeConstants.js`, not a misdetection artifact), so the type
+itself isn't the problem. Skipping the missing-`buildInfo` guard
+(rather than crashing) doesn't fix anything either - the compile just
+goes back to hanging silently afterward, meaning the module's own
+`build()` never genuinely completed, not just that one property got
+lost along the way. Not yet root-caused further - a real, different,
+newly-visible bug for whichever round picks webpack back up next,
+distinct from (and only reachable after fixing) this round's own
+`#484`-adjacent gaps.
+
+**Verification**: `go build ./...` and `go vet ./...` both clean; full
+suite (`go test ./... -skip TestEventsAddAbortListener`) clean; three
+new tests added and passing
+(`TestSetTimeoutUncaughtExceptionReportsAndExits`,
+`TestSetImmediateUncaughtExceptionReportsAndExits`,
+`TestProcessNextTickUncaughtExceptionReportsAndExits`); scoreboard
+clean (same pre-existing baseline/all-fakes-off pairing as every prior
+round, unrelated to this round's own changes). The scratchpad's own
+vendored `webpack/lib/Compilation.js`, temporarily patched with a
+diagnostic `console.error` while isolating the `buildInfo` crash, was
+restored to a byte-identical copy of its pre-instrumentation state
+before concluding.
+
+**Status**: slate holds at **10/13** in raw numbers (webpack's own
+count doesn't change - still a failure either way), but the
+*character* of the remaining failures shifted: `#484`-class silent,
+zero-diagnostic hangs are now fixed everywhere in this codebase's own
+timer/nextTick dispatch, and webpack's real next blocker is now a
+precise, reproducible, catchable exception instead of an opaque
+"promise remains pending" message with no further information.
+Remaining unchanged in count: prettier (still unisolated), webpack
+(new `createModuleAssets`/`buildInfo` blocker, not yet root-caused),
+sql.js (Round 116's own separate WASM investigation).

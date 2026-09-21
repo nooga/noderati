@@ -182,7 +182,9 @@ func installTimeoutObjects(p *driver.Paserati) {
 		}
 		fnArgs := append([]vm.Value(nil), args[2:]...)
 		callback := func() {
-			_, _ = vmInst.Call(fn, vm.Undefined, fnArgs)
+			if _, err := vmInst.Call(fn, vm.Undefined, fnArgs); err != nil {
+				reportUncaughtCallbackException(vmInst, err)
+			}
 		}
 
 		scheduledAt := time.Now()
