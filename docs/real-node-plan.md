@@ -14676,3 +14676,52 @@ that's paserati's own call to make), but the investigation itself is
 complete: every remaining failure on this whole list now has a
 precise, filed, upstream diagnosis. Remaining: prettier (blocked on
 `#488`), sql.js (Round 116's own separate WASM investigation).
+
+## Round 129: paserati#488 confirmed merged - prettier passes for the first time ever, 12/13
+
+Picked up directly from "paserati fixes landed, pull latest and
+retry." [paserati#488](https://github.com/nooga/paserati/issues/488)
+landed (`8395899c`, "Fix #488: Object.fromEntries must create
+enumerable properties"), alongside one unrelated follow-on commit
+(`bf3be21e`, "Box strings in Object() through vm.NewStringObject") -
+pulled both. Ran paserati's own full suite (the same two small,
+unrelated pre-existing failures as every recent round - an
+exception-message wording mismatch and a regexp Unicode-property-
+escape gap, neither touched by either commit), then verified the fix
+directly against Round 128's own exact minimal repro before touching
+prettier again:
+
+```js
+const obj = Object.fromEntries([["a", 1], ["b", 2]]);
+Object.keys(obj);   // ["a","b"] now, matching real Node exactly
+JSON.stringify(obj); // {"a":1,"b":2} now, matching real Node exactly
+```
+
+`Object.getOwnPropertyDescriptor(obj, "a")` now reports
+`enumerable: true`, matching real Node bit for bit.
+
+Rebuilt noderati and re-ran the real prettier probe directly: real,
+unmodified `prettier@3.6.2`'s own `format("const x={a:1,b:2}\n",
+{parser: "babel"})` now produces `const x = { a: 1, b: 2 };` -
+matching real Node exactly, with zero explicit options needed (every
+declared default - `printWidth`, `semi`, `trailingComma`,
+`objectWrap`, `bracketSpacing` - now resolves correctly through
+prettier's own `{...Object.fromEntries(...)}` defaults-merging code,
+confirming Round 128's own diagnosis was the complete, sole root
+cause, not merely a contributing factor).
+
+**Verification**: `go vet ./...` clean; full suite
+(`go test ./... -skip TestEventsAddAbortListener`) clean; scoreboard
+clean (same pre-existing baseline/all-fakes-off pairing as every prior
+round). No noderati source changes this round - purely a
+pull-and-verify round, consistent with #488 being entirely a paserati-
+side fix.
+
+**Status**: **12/13**. Remaining: sql.js alone - `new SQL.Database()`
+throwing "out of memory" from the real WASM binary's own allocator,
+Round 116's own separate, still-unresolved WASM/Emscripten
+investigation, deliberately not revisited in any of the rounds since
+(prettier, eslint, babel, webpack, and every paserati-side blocker in
+between all took priority as they were each closer to a real,
+reachable fix) - the last, and now only, item on the entire 13-package
+slate.
