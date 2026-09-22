@@ -16638,3 +16638,74 @@ divergence hiding behind a broken test, just an equally-broken probe.
 needed - a genuine "already works" result, confirmed by direct
 byte-for-byte comparison rather than merely "didn't crash."
 
+## Round 144: real `chokidar` blocked by a sixth, real, minimal paserati parser bug; real `bcryptjs` passes completely once given enough time (no bug at all - just an interpreter with no JIT)
+
+**`chokidar`** (real file-watching, `fs.watch`-based) picked as
+genuinely untested territory - grepped `internal/host/fs*.go` first
+and confirmed `fs.watch`/`fs.watchFile` don't exist at all yet (a real,
+sizeable gap, consistent with round 136's own unexplained
+`vite_server_probe.mjs` close() bug, "likely `fs.watch()`'s returned
+watcher missing `.close()`"). Never got far enough to find out: loading
+`chokidar` itself failed at parse time -
+
+```
+Module '.../chokidar/handler.js' failed to load: parsing failed:
+'}' expected.
+  import { type as osType } from 'node:os';
+```
+
+Reduced to a clean, chokidar-free repro
+(`import { type as osType } from "node:os";`) and confirmed against
+the standalone `paserati` CLI directly. This is ordinary, unambiguous
+JS/TS - importing the real, ordinary named export `os.type` and
+aliasing it locally to `osType` - not a type-only import (TypeScript's
+own grammar only treats a leading `type` as the type-only-import
+modifier when followed by another identifier or by `,`/`}`; followed
+immediately by `as`, `type` is unambiguously the *imported binding's
+own name*). `chokidar`'s own `handler.js` does exactly this, presumably
+because `os.type()` is a real Node function whose name happens to
+collide with the modifier keyword - not a hypothetical case. Filed as
+[paserati#505](https://github.com/nooga/paserati/issues/505).
+`fs.watch`/`fs.watchFile` remain a real, unexplored gap for a future
+round - blocked from even starting this time.
+
+**`bcryptjs`** picked as a lower-risk, plain-JS (no exotic import
+syntax) follow-up. First attempt looked like a genuine hang -
+`hashSync` calling `Date.now()`-based time-sliced key-schedule chunks
+(`for (; i < rounds; ) { ...; if (Date.now() - start > MAX_EXECUTION_TIME) break; }`,
+real bcryptjs's own cooperative-yielding design) never returned within
+a 10s timeout, and the process sat at ~98% CPU the whole time -
+indistinguishable at a glance from an infinite loop, and this
+project's own history has real precedent for that exact failure shape
+(paserati#503's own reentrant-drain deadlock two rounds ago hit the
+same symptom). Traced it properly before concluding anything: added
+direct `process.stderr.write` probes into the real, installed
+`bcryptjs/index.js` (gitignored, reverted after) logging `i`/`rounds`
+on every chunk - and watched `i` climb steadily, chunk after chunk,
+exactly as designed, for both the first *and* second `hashSync` call
+in the same process (ruling out the "only breaks on a second call"
+shape that would have suggested actual state corruption). Given a
+generous 60s budget instead of 10s, it completed both hashes
+successfully in ~12.6 seconds total. **Not a bug at all** - a real
+cost-10 bcrypt computation (2^10 = 1024 Blowfish key-schedule rounds)
+is simply slow under an interpreted, non-JIT bytecode VM the way it
+isn't under V8's JIT, and the probe's own 10-second timeout was just
+too tight for that, not evidence of anything actually wrong.
+
+Re-ran the full probe at bcrypt's real, valid minimum cost factor (4
+instead of 10) purely to keep total runtime reasonable for a
+correctness check (not a performance one) - completed in well under a
+second, and diffed byte-for-byte identical against real Node,
+including a hash computed from a *fixed* salt (not a freshly random
+one), which pins down that the actual Blowfish/bcrypt bit-level
+algorithm matches real Node exactly, not merely "produces a
+plausible-looking hash." Sync `hashSync`/`compareSync` and async
+`hash`/`compare` (both correct-password-accepted and
+wrong-password-rejected cases) all verified.
+
+**Status**: `chokidar` blocked at parse time (paserati#505);
+`fs.watch`/`fs.watchFile` remain unexplored. `bcryptjs` fully verified
+working, no changes needed - genuinely just slow, not broken, and
+worth writing down precisely *because* the initial symptom looked so
+much like a real bug this project has hit before.
+
