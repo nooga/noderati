@@ -17074,3 +17074,105 @@ and filed:**
 - New regression tests are in `node_parity_test.go`. Every expected value
   there was captured from real Node running the identical script.
 - `go vet` and the full suite are clean.
+
+## Round 149: `chokidar` passes completely - real `fs.watch`/`fs.watchFile`, and a faithful pull-driven `Readable` (the real blocker); one more paserati bug (#522)
+
+**fs.watch / fs.watchFile / fs.unwatchFile (new `fs_watch.go`).** None
+of these existed.
+- **`fs.watch`** uses `fsnotify` (inotify on Linux, kqueue on macOS; its
+  only dependency is `golang.org/x/sys`, which noderati already pulled in
+  indirectly). This is the one new dependency this round. Hand-rolling
+  kqueue/inotify backends would have meant reimplementing it.
+- It returns a Go-native EventEmitter `FSWatcher` with `close()` (emits
+  `'close'`), chainable `ref()`/`unref()` backed by a real event-loop
+  hold, and `'change'`/`'error'` events. It throws `ENOENT ... watch
+  '<path>'` for a missing path, exactly as Node does.
+- Events map `create`/`remove`/`rename` → `'rename'` and
+  `write`/`chmod` → `'change'`. Filenames are relative to the watched
+  directory. `recursive: true` walks the tree and adds new directories as
+  they appear. No events are delivered after `close()`.
+- **`fs.watchFile`** follows libuv's `uv_fs_poll` rules exactly: the first
+  good sample is only a baseline; each distinct errno is reported once,
+  with zeroed current stats; after that, any change to size/mtime/ctime/
+  birthtime/mode/uid/gid/ino/dev is reported. Watchers are shared per
+  resolved path, with `unwatchFile(path, [listener])` and
+  `persistent`/`interval`.
+- A reference trace captured from real Node on this machine (missing →
+  create → append → delete) is identical: `0:0 / 3:0 / 5:3 / 0:5`.
+- `fs.watch` on macOS goes through FSEvents in real Node, whose history
+  replay and coalescing produce events you can't match exactly (e.g.
+  `rename` for files created *before* the watch started). noderati's
+  events are the clean semantic set, which is what Node emits on Linux
+  via inotify.
+
+**The real blocker was one layer down: `Readable` (`stream.go`).** With
+`fs.watch` in place, chokidar still never emitted `ready` and the process
+silently drained its event loop, exiting 0. chokidar's initial scan runs
+through `readdirp`, a genuine *pull* stream (`class ReaddirpStream extends
+Readable` with an async `_read()`). noderati's `Readable` was push-only
+and, by its own doc comment, deliberately never called `_read()`. So
+readdirp never produced a single entry. That comment had flagged exactly
+this ("a future ... pull-driven ... would stall"), and it now hit.
+
+Rewrote `Readable` to follow real Node's own state machine
+(`lib/internal/streams/readable.js`):
+- paused/flowing modes, with `_read()` pulled against `highWaterMark`
+  (Node 22+ defaults: 65536 bytes, 16 objects, both measured);
+- `objectMode`, `read(n)` (including partial reads across buffered
+  chunks), `unshift`, `pause`/`resume`/`isPaused`, and the `'readable'`
+  event with its `readableListening` bookkeeping;
+- `setEncoding` (holding back incomplete UTF-8 sequences);
+- `pipe()` with real backpressure (pause on `write() === false`, resume
+  on `'drain'`), `unpipe()`, and never ending `process.stdout`/`stderr`;
+- `destroy()`/`_destroy()` with *next-tick* `'error'`/`'close'`
+  (re-entrancy safe, which undici's `onError` needs), `autoDestroy` after
+  `'end'`, and `signal`;
+- an async iterator built on `read()` (with `return()` destroying),
+  `Readable.from()`, and all the `readable*` state getters.
+
+`isDisturbed()`/`isErrored()` keep working through compatibility getters.
+Also fixed `EventEmitter.once()`/`prependOnceListener()` to route through
+`this.on()`/`this.prependListener()` as real Node does, so
+`readable.once('data', ...)` switches a stream to flowing.
+
+A reference script covering the exact `read:`/`data:` interleaving,
+next-tick destroy ordering, the async iterator, `Readable.from`,
+`setEncoding`, and paused `read(n)` is byte-identical to real Node.
+
+**Three existing tests encoded non-Node behavior, and were corrected
+against real Node:**
+- `TestReadlineCreateInterface` passed a bare `new Readable()` to
+  readline. Real Node crashes on that exact script with
+  `ERR_METHOD_NOT_IMPLEMENTED` (verified), so it now uses
+  `new Readable({ read() {} })`.
+- `TestReadableDestroyIsReentrancySafe` asserted `'error'`/`'close'`
+  fire synchronously inside `destroy()`. Real Node fires them on the next
+  tick (verified: `0/0` sync, `1/1` after a tick).
+- `TestStreamEmitBindsThisToEmitter` and the Duplex pipe test read results
+  synchronously right after `push()`. Real Node delivers on a later tick.
+
+**Regression sweep:**
+- `fetch()` against a local `http` server works end to end: JSON, a POST
+  body, a 300 KB body past the new 64 KB `highWaterMark` (the
+  backpressure path), and `for await` over `res.body`.
+- express: all four routes still pass.
+- `marked`/`esbuild`: byte-identical to Node.
+- vite's dev server starts and closes (and now runs its chokidar watcher
+  on the real `fs.watch`).
+- `jsonwebtoken`: only the already-documented RS256 gap.
+
+**Result: real, unmodified `chokidar` v5 passes completely.**
+`examples/chokidar_probe.mjs` output is identical to real Node: `add`,
+`change`, `addDir`, nested `add`, `unlink`, then a clean close.
+
+**Engine bug found during the sweep:**
+[paserati#522](https://github.com/nooga/paserati/issues/522).
+`Response.json()` doesn't use `JSON.parse`. It goes through
+`Value.UnmarshalJSON` → Go `json.Unmarshal` into `map[string]any`, so key
+order is *randomized* run to run, and the objects have no
+`Object.prototype`. This is pre-existing, not a regression; `.text()` plus
+`JSON.parse` is correct.
+
+**Status**: `chokidar` done. New tests are `TestReadablePullModeMatchesNode`,
+`TestFsWatchReportsRenameAndChange` and `TestFsWatchFileMatchesNodeSequence`
+(stable across 10 repeated runs). `go vet` and the full suite are clean.

@@ -202,3 +202,81 @@ func TestProcessIdsAndUmask(t *testing.T) {
 		t.Errorf("got %s, want %s", got, want)
 	}
 }
+
+// The exact read()/data interleaving and next-tick end/close ordering
+// real Node produces for a pull-driven Readable (what readdirp is).
+func TestReadablePullModeMatchesNode(t *testing.T) {
+	got := runScriptString(t, `
+		import { Readable } from "node:stream";
+		const order = [];
+		let i = 0;
+		const s = new Readable({ read(n) { order.push("read:" + n); if (i < 3) this.push("c" + i++); else this.push(null); } });
+		s.on("data", (d) => order.push("data:" + d));
+		s.on("end", () => order.push("end"));
+		order.push("sync-after-on");
+		await new Promise((res) => s.on("close", res));
+		const o = [];
+		const s2 = new Readable({ objectMode: true, read() {} });
+		s2.push({ a: 1 }); s2.push("x"); s2.push(null);
+		for await (const c of s2) o.push(JSON.stringify(c));
+		const got = [];
+		for await (const c of Readable.from(["p", "q"])) got.push(c);
+		const s5 = new Readable({ read() {} });
+		s5.push("ab"); s5.push("cd");
+		[order.join(" "), o.join(" "), s2.destroyed, got.join(","), s5.read(3).toString(), s5.readableLength, new Readable().readableHighWaterMark].join(" | ")
+	`)
+	want := `sync-after-on read:65536 read:65536 data:c0 read:65536 data:c1 read:65536 data:c2 end | {"a":1} "x" | true | p,q | abc | 1 | 65536`
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestFsWatchReportsRenameAndChange(t *testing.T) {
+	dir := t.TempDir()
+	got := runScriptString(t, fmt.Sprintf(`
+		import fs from "node:fs";
+		const root = %q;
+		const seen = new Set();
+		const w = fs.watch(root, (type, name) => seen.add(type + ":" + name));
+		const until = async (pred) => { for (let i = 0; i < 200 && !pred(); i++) await new Promise((r) => setTimeout(r, 10)); };
+		fs.writeFileSync(root + "/a.txt", "x");
+		await until(() => seen.has("rename:a.txt"));
+		fs.appendFileSync(root + "/a.txt", "y");
+		await until(() => seen.has("change:a.txt"));
+		let closed = false;
+		w.on("close", () => { closed = true; });
+		w.close();
+		await until(() => closed);
+		let missing = "";
+		try { fs.watch(root + "/nope"); } catch (e) { missing = e.code + ":" + e.syscall; }
+		[seen.has("rename:a.txt"), seen.has("change:a.txt"), closed, missing].join(",")
+	`, dir))
+	if got != "true,true,true,ENOENT:watch" {
+		t.Errorf("got %s", got)
+	}
+}
+
+// watchFile follows uv_fs_poll: one zeroed report for a missing file,
+// then one report per observed change, with (curr, prev) stats.
+func TestFsWatchFileMatchesNodeSequence(t *testing.T) {
+	dir := t.TempDir()
+	got := runScriptString(t, fmt.Sprintf(`
+		import fs from "node:fs";
+		const f = %q + "/later.txt";
+		const wf = [];
+		const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+		const until = async (n) => { for (let i = 0; i < 300 && wf.length < n; i++) await sleep(10); };
+		const sw = fs.watchFile(f, { interval: 20 }, (c, p) => wf.push(c.size + ":" + p.size + ":" + (c.mtimeMs > p.mtimeMs) + ":" + c.isFile()));
+		const same = fs.watchFile(f, { interval: 20 }, () => {}) === sw;
+		await until(1);
+		fs.writeFileSync(f, "abc"); await until(2);
+		fs.appendFileSync(f, "de"); await until(3);
+		fs.rmSync(f); await until(4);
+		fs.unwatchFile(f);
+		[same, wf.join(" ")].join(" | ")
+	`, dir))
+	want := "true | 0:0:false:false 3:0:true:true 5:3:true:true 0:5:false:false"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}

@@ -51,11 +51,14 @@ class EventEmitter {
     wrapper.listener = listener;
     return wrapper;
   }
+  // Routed through this.on/this.prependListener (not _addListener) as in
+  // real Node, so subclass overrides such as Readable's 'data' handling
+  // see once-listeners too.
   once(event, listener) {
-    return this._addListener(event, this._onceWrap(event, listener), false);
+    return this.on(event, this._onceWrap(event, listener));
   }
   prependOnceListener(event, listener) {
-    return this._addListener(event, this._onceWrap(event, listener), true);
+    return this.prependListener(event, this._onceWrap(event, listener));
   }
   off(event, listener) {
     return this.removeListener(event, listener);

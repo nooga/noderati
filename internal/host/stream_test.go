@@ -22,7 +22,7 @@ func TestStreamPipelinePromises(t *testing.T) {
 		import { Readable, Writable } from "node:stream";
 		import { pipeline } from "node:stream/promises";
 
-		class Src extends Readable {}
+		class Src extends Readable { _read() {} }
 		class Dst extends Writable {
 			collected = "";
 			_write(chunk, _encoding, callback) { this.collected += chunk; callback(); }
@@ -50,7 +50,7 @@ func TestStreamPipelineCallback(t *testing.T) {
 	val, errs := p.RunCode(`
 		import { Readable, Writable, pipeline } from "node:stream";
 
-		class Src extends Readable {}
+		class Src extends Readable { _read() {} }
 		class Dst extends Writable {
 			collected = "";
 			_write(chunk, _encoding, callback) { this.collected += chunk; callback(); }
@@ -79,7 +79,7 @@ func TestStreamPipelineRejectsOnError(t *testing.T) {
 		import { Readable, Writable } from "node:stream";
 		import { pipeline } from "node:stream/promises";
 
-		const src = new Readable();
+		const src = new Readable({ read() {} });
 		const dst = new Writable();
 		const done = pipeline(src, dst);
 		src.emit("error", new Error("boom"));
@@ -128,12 +128,15 @@ func TestReadableDestroyIsReentrancySafe(t *testing.T) {
 		});
 		r.on("close", () => { closeCount++; });
 		r.destroy(new Error("boom"));
-		JSON.stringify({ errorCount, closeCount, destroyed: r.destroyed })
+		// Real Node emits 'error'/'close' on the next tick, not synchronously.
+		const sync = JSON.stringify({ errorCount, closeCount, destroyed: r.destroyed });
+		await new Promise((res) => setImmediate(res));
+		sync + " " + JSON.stringify({ errorCount, closeCount, destroyed: r.destroyed })
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	want := `{"errorCount":1,"closeCount":1,"destroyed":true}`
+	want := `{"errorCount":0,"closeCount":0,"destroyed":true} {"errorCount":1,"closeCount":1,"destroyed":true}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
@@ -188,12 +191,14 @@ func TestStreamEmitBindsThisToEmitter(t *testing.T) {
 	val, errs := p.RunCode(`
 		import { Readable } from "node:stream";
 
-		const r = new Readable();
+		const r = new Readable({ read() {} });
 		let sawSelf = false;
 		r.on("data", function (chunk) {
 			sawSelf = this === r;
 		});
 		r.push("x");
+		// Delivered on a later tick in real Node, not inside push().
+		await new Promise((res) => setImmediate(res));
 		sawSelf
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
@@ -367,16 +372,17 @@ func TestStreamDuplexSubclassable(t *testing.T) {
 			}
 		}
 
-		const source = new Readable();
+		const source = new Readable({ read() {} });
 		const t = new Upper();
 		let result = "";
 		let ended = false;
 		t.on("data", (chunk) => { result += chunk; });
-		t.on("end", () => { ended = true; });
+		const done = new Promise((res) => t.on("end", () => { ended = true; res(); }));
 		source.pipe(t);
 		source.push("hello ");
 		source.push("world");
 		source.push(null);
+		await done;
 		JSON.stringify({ result, ended })
 	`, driver.RunOptions{})
 	if len(errs) > 0 {

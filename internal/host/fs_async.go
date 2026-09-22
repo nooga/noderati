@@ -142,6 +142,7 @@ func findAsyncCallback(opts []vm.Value) vm.Value {
 // more of the callback surface -- don't build ahead of evidence.
 func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 	declareFSFd(m, vmInst)
+	declareFSWatch(m, vmInst)
 	m.Function("readFile", func(path string, opts ...vm.Value) (vm.Value, error) {
 		// Real Node's fs.readFile(path, [options], callback) - the
 		// callback is always the *last* argument, whether or not an

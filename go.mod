@@ -1,6 +1,6 @@
 module github.com/nooga/noderati
 
-go 1.26.0
+go 1.27.1
 
 require (
 	github.com/nooga/paserati v0.0.0
@@ -11,6 +11,7 @@ require (
 
 require (
 	github.com/dlclark/regexp2 v1.11.5 // indirect
+	github.com/fsnotify/fsnotify v1.10.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
@@ -18,4 +19,4 @@ require (
 
 replace github.com/nooga/paserati => ../paserati
 
-replace github.com/tetratelabs/wazero => github.com/nooga/wazero 0ec6142ae8c7edabab701c8d0d8b53a3f4732979
+replace github.com/tetratelabs/wazero => github.com/nooga/wazero v1.12.1-0.20260911172836-0ec6142ae8c7

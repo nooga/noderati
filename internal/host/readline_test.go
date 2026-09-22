@@ -12,7 +12,9 @@ func TestReadlineCreateInterface(t *testing.T) {
 	val, errs := p.RunCode(`
 		import { createInterface, emitKeypressEvents } from "node:readline";
 		import { Readable, Writable } from "node:stream";
-		const input = new Readable();
+		// A Readable with no read() errors as soon as readline resumes it
+		// (ERR_METHOD_NOT_IMPLEMENTED), in real Node as well.
+		const input = new Readable({ read() {} });
 		const output = new Writable();
 		let wrote = "";
 		output.on("data", (c) => { wrote += c; });
