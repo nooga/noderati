@@ -6,9 +6,23 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"unsafe"
 
 	"github.com/nooga/paserati/pkg/driver"
 )
+
+// hostEndianness reports the running process's native byte order as
+// real Node's os.endianness() does ("BE" or "LE") - checked directly
+// via a multi-byte write rather than assumed from GOARCH, so it stays
+// correct if noderati is ever built for a big-endian target.
+func hostEndianness() string {
+	var i uint16 = 1
+	b := (*[2]byte)(unsafe.Pointer(&i))
+	if b[0] == 1 {
+		return "LE"
+	}
+	return "BE"
+}
 
 func declareOS(p *driver.Paserati) {
 	eol := "\n"
@@ -38,6 +52,7 @@ func declareOS(p *driver.Paserati) {
 			return h
 		})
 		m.Function("cpus", cpuInfos)
+		m.Function("endianness", hostEndianness)
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:os", "os")

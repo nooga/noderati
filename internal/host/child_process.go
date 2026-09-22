@@ -13,6 +13,24 @@ import (
 
 type spawnHandle struct {
 	cmd *exec.Cmd
+	mu  sync.Mutex
+	// refed tracks real Node's per-child ref count (collapsed to a bool,
+	// since child.ref()/.unref() are idempotent - a second call in the
+	// same direction is a no-op, matching real Node): true from spawn
+	// (a real Node child_process keeps the event loop alive by default)
+	// until unref() flips it, ref() flips it back. Guarded by mu since
+	// ref()/unref() run on the VM's own thread while waitSpawnProcess's
+	// own exit-triggered EndExternalOp() (child_process.go) runs on a
+	// background goroutine.
+	refed bool
+	// exited is set once waitSpawnProcess has already resolved this
+	// child's own BeginExternalOp/EndExternalOp balance - a ref()/unref()
+	// call that loses the race and arrives after that point would
+	// otherwise create or cancel an external op nothing will ever
+	// balance again (a real, lasting leak or double-decrement), so both
+	// become no-ops once this is true, matching real Node's own harmless
+	// no-op semantics for ref()/unref() on an already-exited child.
+	exited bool
 }
 
 var (
@@ -141,6 +159,7 @@ func parseSpawnOptions(v vm.Value) spawnOptions {
 }
 
 func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value) vm.Value {
+	rt := vmInst.GetAsyncRuntime()
 	opts := parseSpawnOptions(optsVal)
 	cmd := exec.Command(command, args...)
 	if opts.cwd != "" {
@@ -161,15 +180,24 @@ func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value
 	stderrStream := newReadableStream(vmInst)
 	var stdinStream *vm.PlainObject
 	stdinStream = newWritableStream(vmInst,
+		// Found via real esbuild's own service protocol (a binary,
+		// length-prefixed message format) under noderati: writing a
+		// Buffer here used to go through .ToString(), which - like
+		// Object.prototype.toString on a typed array - doesn't decode
+		// bytes at all, so any byte outside plain ASCII silently
+		// corrupted the write instead of being sent as-is (confirmed
+		// directly: a 7-byte binary Buffer arrived on the other end as
+		// 19 bytes). valueToBytes (net.go) already does this correctly
+		// for a string, Buffer, or TypedArray alike.
 		func(writeArgs []vm.Value) (vm.Value, error) {
 			if len(writeArgs) > 0 && stdinPipe != nil {
-				_, _ = stdinPipe.Write([]byte(writeArgs[0].ToString()))
+				_, _ = stdinPipe.Write(valueToBytes(vmInst, writeArgs[0]))
 			}
 			return vm.True, nil
 		},
 		func(endArgs []vm.Value) (vm.Value, error) {
 			if len(endArgs) > 0 && stdinPipe != nil {
-				_, _ = stdinPipe.Write([]byte(endArgs[0].ToString()))
+				_, _ = stdinPipe.Write(valueToBytes(vmInst, endArgs[0]))
 			}
 			if stdinPipe != nil {
 				_ = stdinPipe.Close()
@@ -180,7 +208,9 @@ func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value
 	)
 
 	handleID := spawnHandleSeq.Add(1)
-	spawnHandles.Store(handleID, &spawnHandle{cmd: cmd})
+	// refed: true - real Node's own default: a freshly spawned child
+	// keeps the event loop alive until something calls .unref() on it.
+	spawnHandles.Store(handleID, &spawnHandle{cmd: cmd, refed: true})
 	child.SetOwn("__noderatiSpawnHandle", vm.NumberValue(float64(handleID)))
 
 	child.SetOwn("stdout", vm.NewValueFromPlainObject(stdoutStream))
@@ -194,8 +224,50 @@ func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value
 		}
 		return vm.Undefined, nil
 	}))
+	// unref/ref were missing entirely - found via real esbuild's own
+	// ensureServiceIsRunning (lib/main.js), which calls child.unref()
+	// unconditionally right after spawn so a long-running build service
+	// doesn't itself keep the host process alive. A first pass shipped
+	// these as permanent no-ops, reasoning that noderati's async runtime
+	// keeps running as long as any pump/wait goroutine has an
+	// outstanding BeginExternalOp regardless of this call - true, but
+	// beside the point: that's exactly the counter real ref()/unref()
+	// are supposed to opt this child in and out of, so a no-op silently
+	// keeps a "backgrounded" build service alive forever instead of
+	// letting the process exit once nothing else is left running, the
+	// one thing esbuild's own unref() call exists to request. Real
+	// semantics instead: unref() ends this child's own BeginExternalOp
+	// (so it stops counting toward "keep the process alive") exactly
+	// once, ref() begins a fresh one to undo that - both idempotent
+	// (spawnHandle.refed collapses repeated calls in the same direction
+	// to a no-op) and both no-ops once the child has already exited
+	// (spawnHandle.exited - see waitSpawnProcess, which needs the same
+	// mutex-guarded state to know whether it still owes an
+	// EndExternalOp() call of its own or unref() already made one).
+	childVal := vm.NewValueFromPlainObject(child)
+	child.SetOwn("unref", vm.NewNativeFunction(0, false, "unref", func(_ []vm.Value) (vm.Value, error) {
+		if h := loadSpawnHandle(child); h != nil {
+			h.mu.Lock()
+			if h.refed && !h.exited {
+				h.refed = false
+				rt.EndExternalOp()
+			}
+			h.mu.Unlock()
+		}
+		return childVal, nil
+	}))
+	child.SetOwn("ref", vm.NewNativeFunction(0, false, "ref", func(_ []vm.Value) (vm.Value, error) {
+		if h := loadSpawnHandle(child); h != nil {
+			h.mu.Lock()
+			if !h.refed && !h.exited {
+				h.refed = true
+				rt.BeginExternalOp()
+			}
+			h.mu.Unlock()
+		}
+		return childVal, nil
+	}))
 
-	rt := vmInst.GetAsyncRuntime()
 	rt.BeginExternalOp()
 
 	if err := cmd.Start(); err != nil {
@@ -251,8 +323,19 @@ func pumpSpawnStream(vmInst *vm.VM, r io.ReadCloser, stream *vm.PlainObject, wg 
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
-			chunk := vm.NewString(string(buf[:n]))
-			scheduleEmit(vmInst, stream, "data", chunk)
+			// Real Node's child.stdout/stderr emit real Buffers by
+			// default (only a string once setEncoding() has been
+			// called) - this used to always emit a plain JS string,
+			// the exact same bug pumpHTTPResponseBody (http.go) was
+			// fixed for in round 101 (found there via a real AWS SDK
+			// stream collector's Buffer.concat silently producing zero
+			// bytes on string input). Found here independently, chasing
+			// real esbuild's own service protocol (a binary,
+			// length-prefixed stdout stream) under noderati - the exact
+			// same silent-empty-output shape, not a thrown error.
+			// wrapBuffer copies buf[:n] into a fresh ArrayBuffer, so
+			// reusing buf across loop iterations is safe.
+			scheduleEmit(vmInst, stream, "data", wrapBuffer(vmInst, buf[:n]))
 		}
 		if err != nil {
 			if err != io.EOF {
@@ -284,7 +367,26 @@ func waitSpawnProcess(vmInst *vm.VM, child *vm.PlainObject, cmd *exec.Cmd, rt in
 	}
 	scheduleEmit(vmInst, child, "exit", vm.NumberValue(float64(code)))
 	scheduleEmit(vmInst, child, "close", vm.NumberValue(float64(code)))
-	rt.EndExternalOp()
+	// Only balance the original spawn-time BeginExternalOp() if this
+	// child is still ref'd - an unref() that already ran (see
+	// spawnProcess's own unref/ref natives) already called EndExternalOp()
+	// itself, and doing it again here would double-decrement the async
+	// runtime's own external-op counter. Marking exited (under the same
+	// mutex) before releasing it closes the other side of that race: a
+	// ref()/unref() arriving after this point sees exited and does
+	// nothing, rather than beginning or ending an op this function has
+	// already accounted for one way or the other.
+	if h := loadSpawnHandle(child); h != nil {
+		h.mu.Lock()
+		wasRefed := h.refed
+		h.exited = true
+		h.mu.Unlock()
+		if wasRefed {
+			rt.EndExternalOp()
+		}
+	} else {
+		rt.EndExternalOp()
+	}
 	if idVal, ok := child.GetOwn("__noderatiSpawnHandle"); ok && idVal.IsNumber() {
 		spawnHandles.Delete(uint64(idVal.ToFloat()))
 	}

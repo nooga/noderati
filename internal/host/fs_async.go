@@ -61,22 +61,18 @@ func fsErrToVM(err error) vm.Value {
 func scheduleCallback(vmInst *vm.VM, cb vm.Value, cbArgs []vm.Value) {
 	rt := vmInst.GetAsyncRuntime()
 	rt.ScheduleNextTick(func() {
-		// The returned error (a throwing callback) is deliberately
-		// discarded here, matching the exact same house pattern
-		// immediate_object.go's setImmediate dispatch already documents:
-		// paserati's own setTimeout/nextTick (host_timers.go) silently
-		// discard a throwing callback's error too, with no
-		// uncaughtException, no nonzero exit, nothing printed at all --
-		// confirmed as a real, dependency-free engine-level gap and filed
-		// upstream as paserati#484 (this round, docs/real-node-plan.md),
-		// after it was the actual reason a real webpack compile hung
-		// forever with zero diagnostics (an exception thrown deep inside
-		// webpack's own `AsyncQueue`'s `setImmediate` callback vanished
-		// the same way). Not papered over here with a one-off fix that
-		// would leave setTimeout/setImmediate still silently broken the
-		// same way -- the real fix belongs in paserati's own event-loop
-		// dispatch, which every one of these call sites shares.
-		_, _ = vmInst.Call(cb, vm.Undefined, cbArgs)
+		// The returned error (a throwing callback) used to be silently
+		// discarded here - the same house pattern immediate_object.go's
+		// setImmediate dispatch and emitter.go's emitOnObject (every
+		// EventEmitter-based construct: process, streams, sockets, HTTP)
+		// both had, and both are now fixed the identical way via the
+		// shared reportUncaughtCallbackException helper (uncaught.go) -
+		// this was the one remaining unfixed call site of that same
+		// pattern, found sweeping for it while chasing real esbuild's own
+		// service protocol under noderati.
+		if _, err := vmInst.Call(cb, vm.Undefined, cbArgs); err != nil {
+			reportUncaughtCallbackException(vmInst, err)
+		}
 	})
 }
 

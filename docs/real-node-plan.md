@@ -15250,3 +15250,175 @@ repro before being fixed or filed.
 target from the post-13/13 candidate slate (after the sql.js close-out
 that finished the original 13) to reach a genuine, byte-for-byte-
 matching-real-Node pass.
+
+## Round 135: esbuild probe - five real noderati bugs found and fixed (one of them systemic, covering every EventEmitter in the codebase), one real paserati bug found and filed - blocked on the paserati fix, but a hang turned into a precise, one-line crash
+
+Next candidate off the post-13/13 slate: real, unmodified
+`esbuild@0.28.2`'s JS API (`build()`/`transform()`), chosen specifically
+because it spawns esbuild's own native binary via `child_process` and
+talks to it over a length-prefixed binary protocol - a genuinely
+different code path than every pure-JS bundler this investigation has
+tested so far (webpack included).
+
+**Bug 1 - `os.endianness` entirely missing (noderati-side, fixed
+directly).** First crash: `TypeError: undefined is not a function` at
+esbuild's own `pkgAndSubpathForCurrentPlatform` (picks the right
+`@esbuild/<platform>` package), which reads
+`` `${process.platform} ${os.arch()} ${os.endianness()}` ``.
+`os.endianness` didn't exist in `internal/host/os.go` at all. Added,
+checked at runtime via a `uint16`/byte-order probe rather than assumed
+from `GOARCH`, so it stays correct on a big-endian build. Verified:
+returns `"LE"` on this (arm64) host, matching real Node.
+
+**Bug 2 - `child_process.spawn`'s stdout/stderr always emitted a JS
+string, never a real Buffer (noderati-side, fixed directly).** Once
+esbuild actually spawned its real binary, the build hung indefinitely.
+Isolated with a minimal repro (`spawn("cat", []).stdout.on("data", ...)`)
+that `chunk` was a plain string, not a Buffer - `pumpSpawnStream`
+(`child_process.go`) always did `vm.NewString(string(buf[:n]))`. This is
+the *exact* bug `pumpHTTPResponseBody` (http.go) was already fixed for in
+round 101 (`Buffer.concat` on a string silently produces zero bytes, not
+an error) - just never ported to this sibling call site. Fixed the same
+way (`wrapBuffer`), and made `setEncoding()` (previously a documented,
+deliberate permanent no-op, justified at the time by every "data" chunk
+already being a string) into a real switch: extended `pendingStreamData`
+(emitter.go) with a `*stringDecoder` field, set by `setEncoding`, and
+consulted by `flushPendingStreamData` before each delivery - a real
+per-stream `string_decoder.go` instance, so a multi-byte character split
+across two underlying reads still decodes correctly. Verified both
+paths: default (`Buffer.isBuffer(chunk) === true`) and
+`setEncoding("utf8")` (`typeof chunk === "string"`, correct text).
+
+**Bug 3 - `child.stdin.write()`/`.end()` corrupted any binary `Buffer`
+argument (noderati-side, fixed directly).** Past the hang, into `Error:
+The service was stopped`. Isolated by piping a 7-byte binary `Buffer`
+through `spawn("wc", ["-c"])`: `wc` counted 19 bytes, not 7. Root cause:
+the stdin writable stream's `write`/`end` did `stdinPipe.Write([]byte(v.ToString()))`
+- `.ToString()` doesn't decode raw bytes at all, so anything outside
+plain ASCII silently corrupted the write instead of being sent as-is.
+Switched to `valueToBytes` (net.go), already used correctly elsewhere
+for exactly this Buffer/TypedArray/string trichotomy. Verified: the same
+`wc -c` repro now reports 7.
+
+**Bug 4 - `child.unref()`/`.ref()` entirely missing (noderati-side,
+fixed directly, upgraded to real semantics same-round).** Real esbuild's
+own `ensureServiceIsRunning()` calls `child.unref()` unconditionally
+right after spawn. First shipped as no-ops (fluent `return this`),
+reasoned at the time as harmless since noderati's async runtime keeps
+running independent of this call regardless - true, but beside the
+point real `unref()` exists for: a no-op silently keeps a backgrounded
+build service alive forever instead of letting the process exit once
+nothing else is running, exactly what esbuild's own call is asking for.
+Given real semantics instead, same round: `spawnHandle` (child_process.go)
+gained a mutex-guarded `refed`/`exited` pair; `unref()` calls the async
+runtime's `EndExternalOp()` exactly once (undoing the spawn-time
+`BeginExternalOp()`), `ref()` calls `BeginExternalOp()` again to
+reinstate it - both idempotent, and both no-ops once the child has
+already exited (`waitSpawnProcess`'s own exit-triggered
+`EndExternalOp()` and a racing `ref()`/`unref()` share the same mutex so
+neither double-counts). Verified directly against real Node's own
+observable behavior, not just inspected: `spawn("sleep",["2"])` without
+`unref()` keeps the process alive the full ~2s; the identical spawn
+with `.unref()` right after lets the process exit in ~20ms; `.ref()`
+called after `.unref()` correctly restores the full wait; a repeated
+`.unref()`/`.unref()` is idempotent (still exits fast, not double
+side-effected). `go vet ./...` clean; full suite clean.
+
+**Bug 5 (the big one) - any exception thrown inside *any* EventEmitter
+listener anywhere in the codebase vanished silently: no crash, no
+trace, exit code 0 (noderati-side, fixed directly, systemic).** With
+bugs 1-4 fixed, the build still failed - not a hang anymore, but a
+confusing `Error: The service was stopped` with no other diagnostic,
+even though byte-for-byte-identical bytes were being exchanged with
+real Node (confirmed by temporarily instrumenting the vendored
+`esbuild/lib/main.js` with debug logging, reverted before this commit -
+same technique rounds 87/128/130 each used on vendored packages).
+Traced to `emitOnObject` (emitter.go), the single function every
+EventEmitter-based construct in this codebase (process, streams,
+sockets, HTTP) shares for actually calling listeners:
+`_, _ = vmInst.Call(fn, self, args)` - the returned error was
+unconditionally discarded. This is the exact same bug shape as
+paserati#484 (a throwing `setTimeout`/`nextTick` callback vanishing the
+same way, fixed upstream that round) and its noderati-side follow-ups
+in `timeout_object.go`/`immediate_object.go` (documented in
+`uncaught.go`, which exists specifically to give call sites paserati's
+own fix can't reach a shared `reportUncaughtCallbackException` helper)
+- `emitOnObject` was simply never updated to use it. Fixed the same
+way; swept for other still-open instances of the identical pattern
+(`grep -n "_, _ = vmInst\.Call("`) and found one more,
+`fs_async.go`'s `scheduleCallback` (backs every `fs.*` async callback),
+fixed identically. (A handful of narrower call sites - `http.go`,
+`net.go`, `dns.go`, `util.go`'s promisify, `zlib.go` - share the same
+shape but dispatch a single Node-style `(err, result)` callback
+directly rather than through `emitOnObject`; left for a dedicated future
+sweep rather than folded into this round, since none of them were the
+actual blocker here.) Verified directly: a `data` listener that throws
+now crashes with `Uncaught exception: Error: ...` and exit code 1,
+matching real Node, instead of silently continuing with exit code 0.
+
+**Bug 6 - real, upstream paserati bug: spreading a TypedArray always
+throws "is not iterable" (filed, not noderati's to fix).** With bug 5's
+loud-crash reporting in place, the real root cause finally surfaced
+directly, in one line: `TypeError: object is not iterable` at real
+esbuild's own `String.fromCharCode(...bytes)` (its handshake-version
+check, `bytes` being a `Uint8Array` subarray read off the service's real
+stdout). Minimal, dependency-free repro: `[...new Uint8Array([1,2,3])]`
+and `fn(...new Uint8Array(...))` both throw the identical error, for
+*every* typed array kind (confirmed `Int32Array` too) and *every* spread
+position (array literal, call arguments) - while `for...of`,
+destructuring, and `Array.from` on the exact same value all already
+work correctly. Root-caused directly: `pkg/vm/vm.go`'s
+`extractSpreadArguments` has explicit fast-path cases for
+`TypeArray`/`TypeArguments`/`TypeString`/`TypeGenerator`/`TypeSet`/`TypeMap`,
+and a generic-iterator-protocol `default` branch for everything else -
+but that `default` branch's own prototype-chain walk only advances
+`current` for `TypeObject`/`TypeGenerator`/`TypeAsyncGenerator`/`TypeDictObject`,
+falling to `else { break }` (leaving `found = false`) for anything else,
+`TypeTypedArray` included - so it throws before ever reaching the typed
+array's own working `Symbol.iterator` (proven to exist and work by the
+`for...of` case, presumably reached through a separate,
+`OpIterFastCheck`-shaped opcode path that never goes through this
+function at all). Filed as
+[paserati#498](https://github.com/nooga/paserati/issues/498), with the
+one-line likely fix (an explicit `TypeTypedArray` case, or teaching the
+`default` walk to delegate to a typed array's own prototype the same
+way it already does for `TypeGenerator`/`TypeAsyncGenerator`/`TypeDictObject`).
+
+Worth noting explicitly: bug 5's fix is what made bug 6 *findable* at
+all in a reasonable amount of time - before it, the exact same root
+cause manifested only as a stuck length-prefix bookkeeping variable a
+completely different function never got to reset, surfacing as a
+generic "service was stopped" with zero indication anything had even
+thrown. Real, loud crash reporting for every EventEmitter listener
+in the codebase (not just this specific stream) is worth having for
+its own sake, independent of esbuild.
+
+**Status**: esbuild probe blocked on paserati#498 - five real,
+independent noderati bugs found and fixed along the way (one of them,
+bug 5, a systemic, codebase-wide fix rather than a narrow patch, and
+bug 4 upgraded from a no-op to real ref-counted semantics), one real
+paserati bug found, precisely isolated, and filed. `go vet ./...`
+clean; full suite (`go test ./... -skip TestEventsAddAbortListener
+-count=1`) clean throughout.
+
+**Addendum, same session**: rebuilding against the local `../paserati`
+checkout (which `go.work` points at directly, not a pinned commit)
+picked up an *uncommitted, unpushed* local fix for #498 already sitting
+in that working tree (`pkg/vm/vm.go`, an explicit `case TypeTypedArray:`
+mirroring the `TypeArray` fast path) - at the time, not yet reflected on
+`nooga/paserati`'s `main` or in the (then still-open) GitHub issue.
+
+**paserati#498 since confirmed merged** (`76904893`, same fix). Pulled,
+rebuilt, reran the minimal repro directly
+(`[...new Uint8Array([1,2,3])]`, `String.fromCharCode(...)`) against
+the real merged commit - both correct. Reran the full esbuild probe -
+diffed byte-for-byte identical against real Node's own
+`build()`/`transform()` output
+(`diff <(node esbuild_probe.mjs) <(./noderati esbuild_probe.mjs)`,
+zero diff). `go vet ./...` clean; full suite clean.
+
+**Status**: esbuild probe **closed** - the third target from the
+post-13/13 candidate slate (after sql.js and eslint/typescript-eslint)
+to reach a genuine, byte-for-byte-matching-real-Node pass, and the
+first to also require multiple real, systemic noderati-side fixes
+(bugs 1-5 above) rather than only chasing upstream paserati issues.

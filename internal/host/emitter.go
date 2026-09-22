@@ -71,21 +71,34 @@ func newReadableStream(vmInst *vm.VM) *vm.PlainObject {
 	obj.SetOwn("readable", vm.True)
 	obj.SetInternalSlots(&pendingStreamData{})
 	self := vm.NewValueFromPlainObject(obj)
-	// setEncoding was missing entirely - real Node's Readable always has it,
-	// and pi-agent-core's own real tool-call harness (nodejs.js's
+	// setEncoding was missing entirely - real Node's Readable always has
+	// it, and pi-agent-core's own real tool-call harness (nodejs.js's
 	// AgentEnvironment.exec(), the code path behind every bash-tool
 	// invocation) calls child.stdout.setEncoding("utf8")/
 	// child.stderr?.setEncoding("utf8") unconditionally, immediately after
-	// spawn, with no guarding `?.` before the call itself - so this being
-	// undefined threw a synchronous TypeError inside every single real tool
-	// call's Promise executor, rejecting exec()'s whole promise before a
-	// single byte of output was ever read. There's no actual encoding
-	// switch to perform: this stream's own "data" events already always
-	// carry JS strings (pumpSpawnStream in child_process.go decodes with
-	// vm.NewString, never emits a Buffer), so this is a real no-op that
-	// exists to not be missing, not a stub standing in for unbuilt
-	// behavior - matches Node's own fluent `return this`.
-	obj.SetOwn("setEncoding", vm.NewNativeFunction(1, false, "setEncoding", func(_ []vm.Value) (vm.Value, error) {
+	// spawn, with no guarding `?.` before the call itself. This used to be
+	// a permanent no-op, justified at the time by every "data" emitter
+	// (pumpSpawnStream in particular) always producing a JS string chunk
+	// already, never a real Buffer - but that premise stopped being true
+	// once pumpSpawnStream was fixed to emit real Buffers by default
+	// (matching pumpHTTPResponseBody's own real-Buffer-by-default fix,
+	// docs/real-node-plan.md round 101), found chasing real esbuild's own
+	// service protocol under noderati: its stdout is a binary,
+	// length-prefixed protocol, and a permanently-string "data" stream
+	// broke it silently rather than throwing (Buffer.concat on a string
+	// argument produces zero bytes, not an error - the same failure shape
+	// round 101 already documented for HTTP). Now a real switch: sets a
+	// per-stream StringDecoder (string_decoder.go's real incremental
+	// decoder, so a multi-byte character split across two chunks decodes
+	// correctly) that flushPendingStreamData consults before each delivery.
+	obj.SetOwn("setEncoding", vm.NewNativeFunction(1, false, "setEncoding", func(args []vm.Value) (vm.Value, error) {
+		if pending, ok := obj.InternalSlots().(*pendingStreamData); ok {
+			if len(args) > 0 && !args[0].IsUndefined() && !args[0].IsNull() {
+				pending.decoder = newStringDecoder(vmInst)(args[0])
+			} else {
+				pending.decoder = nil
+			}
+		}
 		return self, nil
 	}))
 	// destroy was also missing - called on child.stdout/stderr elsewhere in
@@ -351,7 +364,24 @@ func emitOnObject(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.V
 	self := vm.NewValueFromPlainObject(obj)
 	for _, fn := range listeners {
 		if fn.IsCallable() {
-			_, _ = vmInst.Call(fn, self, args)
+			// An exception thrown here used to vanish silently - this is a
+			// host callback dispatch site with no catching JS context above
+			// it (same shape as timeout_object.go/immediate_object.go's own
+			// setTimeout/setImmediate call sites, see uncaught.go), but
+			// nothing here ever reported the error Call() returns. Found the
+			// hard way chasing real esbuild's own service protocol under
+			// noderati: a real exception thrown inside a stream "data"
+			// listener (itself caused by a real, separate engine bug,
+			// paserati#498) silently corrupted downstream state instead of
+			// crashing loudly the way real Node's own EventEmitter does for
+			// an uncaught exception escaping a listener - turning an
+			// otherwise easy, minutes-long repro into a much longer
+			// investigation. Every EventEmitter-based construct in this
+			// codebase (process, streams, sockets, HTTP, ...) shares this
+			// one function, so this one fix covers all of them at once.
+			if _, err := vmInst.Call(fn, self, args); err != nil {
+				reportUncaughtCallbackException(vmInst, err)
+			}
 		}
 	}
 	return true
@@ -379,6 +409,11 @@ func emitOnObject(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.V
 type pendingStreamData struct {
 	chunks []vm.Value
 	ended  bool
+	// decoder is nil in the real-Node default (raw Buffer chunks); once
+	// setEncoding() sets it, flushPendingStreamData routes every buffered
+	// chunk through it before delivery, so a multi-byte character split
+	// across two underlying reads still decodes correctly.
+	decoder *stringDecoder
 }
 
 func scheduleEmit(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.Value) {
@@ -426,10 +461,21 @@ func flushPendingStreamData(vmInst *vm.VM, obj *vm.PlainObject, pending *pending
 	for len(pending.chunks) > 0 {
 		chunk := pending.chunks[0]
 		pending.chunks = pending.chunks[1:]
+		if pending.decoder != nil {
+			if text := pending.decoder.Write(chunk); text != "" {
+				emitOnObject(vmInst, obj, "data", vm.NewString(text))
+			}
+			continue
+		}
 		emitOnObject(vmInst, obj, "data", chunk)
 	}
 	if pending.ended {
 		pending.ended = false
+		if pending.decoder != nil {
+			if tail := pending.decoder.End(vm.Undefined); tail != "" {
+				emitOnObject(vmInst, obj, "data", vm.NewString(tail))
+			}
+		}
 		emitOnObject(vmInst, obj, "end")
 	}
 }
