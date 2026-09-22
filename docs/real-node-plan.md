@@ -16559,3 +16559,82 @@ real, documented gap for a future, dedicated round. Four real,
 independent noderati bugs found and fixed this round, all in
 `crypto.go` - none of them depended on any of the four currently-open
 paserati issues (#500-#503).
+
+## Round 143: real `tar` - blocked immediately by a fifth, real, minimal paserati compiler bug (a minifier-produced `super()` shape, not hand-written code)
+
+Next non-server candidate: real, unmodified `tar`, chosen specifically
+because `zlib.go` only ever implements the *decompression* direction
+(`createGunzip`/`createInflate`/`createInflateRaw` - the doc comment at
+the top of that file explains why: grepped for every real zlib call
+site across undici and found none needing compression) - `tar`'s own
+`gzip: true` option would need `createGzip`, a clean, well-scoped,
+additive gap to fill following the exact same pattern already
+established for the decompression side, if this round got that far.
+
+It didn't - `tar`'s own bundled/minified build crashed immediately,
+before a single byte of anything was read or written:
+
+```
+ReferenceError: Must call super constructor in derived class before
+accessing 'this' or returning from derived constructor
+```
+
+Root-caused to a real, minimal paserati compiler bug, not anything
+`tar` itself does unusually. `tar` ships (both its ESM and CommonJS
+builds - confirmed both hit it identically) real minifier output for
+one of its internal classes, and the minifier had folded a `super()`
+call together with several field assignments into one `if` statement's
+*test* expression via the comma operator:
+
+```js
+if (super(), this.opt = t, this.file = t.file || "", /* ...more... */) { ... }
+```
+
+Reduced to a clean, tar-free, paserati-only repro: a derived class with
+**any** instance field declaration (`x;`), whose constructor calls
+`super()` as part of a comma expression that is itself an `if`'s test,
+throws that exact error - even though `super()` genuinely does run,
+and runs first. Narrowed further with two more isolated tests: the
+same field + a *top-level* comma-expression `super()` call (`super(),
+this.x = t;`, no `if` at all) works correctly; the same `if`-embedded
+comma-expression `super()` call with *no* instance field declared at
+all also works correctly. So the bug is specifically the combination
+of "derived class has an instance field" and "its constructor's
+`super()` call is nested inside an `if` condition" - the field
+initializer's own injected `this` access runs (or is checked)
+apparently without properly recognizing that this particular `super()`
+call already happened. Filed as
+[paserati#504](https://github.com/nooga/paserati/issues/504).
+
+**Status**: `tar` is fully blocked - hits the exact same crash via both
+its ESM and CommonJS entry points, with no way to route around it from
+noderati's own side (this is real, unmodified, minified npm package
+output, not something to patch around). Moving to a fresh target this
+same round rather than waiting on #504.
+
+## Round 143 (continued): real, unmodified `marked` - passes completely, byte-for-byte identical to real Node, zero bugs found
+
+Picked `marked` (Markdown → HTML) off the same non-server slate:
+plain, unminified JS source (lower risk of landing on another
+minifier-shaped engine bug the way `tar` just did), never attempted
+under this doc's methodology.
+
+Probed with a representative real Markdown document exercising
+headings, paragraphs, bold/italic/inline-code, fenced code blocks with
+a language tag, ordered/unordered/nested lists, blockquotes, GFM
+tables, links/images, and a horizontal rule - `marked.parse()` end to
+end, plus the lower-level `marked.lexer()` token stream.
+
+Ran the identical probe script against real Node (v26.3.0) and
+noderati and diffed the two outputs directly, byte for byte:
+**identical**, including a stray, cosmetically-broken custom-renderer
+line in the probe itself (the script used `Renderer`'s old, pre-v9
+method signature by mistake) - which is exactly the useful part of
+this result: real Node and noderati produce the *same* wrong output
+for the *same* API-misuse mistake, confirming this isn't a noderati
+divergence hiding behind a broken test, just an equally-broken probe.
+
+**Status**: `marked` fully verified working, first try, no fixes
+needed - a genuine "already works" result, confirmed by direct
+byte-for-byte comparison rather than merely "didn't crash."
+
