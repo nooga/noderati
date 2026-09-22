@@ -16,6 +16,7 @@ func New(argv []string) *driver.Paserati {
 	)
 	p := driver.NewPaseratiWithInitializers(inits)
 	installModules(p)
+	registerIPCDriver(p)
 	if err := p.PreloadAllNativeModules(); err != nil {
 		fmt.Fprintf(os.Stderr, "noderati: preload native modules: %v\n", err)
 	}

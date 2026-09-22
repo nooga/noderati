@@ -311,7 +311,8 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 	// fromInput implements the shared decode logic behind both `new
 	// Buffer(...)` (legacy, still real code's own call shape in places)
 	// and `Buffer.from(...)`.
-	fromInput := func(args []vm.Value) (vm.Value, error) {
+	var fromInput func(args []vm.Value) (vm.Value, error)
+	fromInput = func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
 			return wrapBytes(nil), nil
 		}
@@ -348,6 +349,27 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 			}
 			return wrapBytes(data), nil
 		default:
+			if arg.IsObject() {
+				// Node's lib/buffer.js order: a valueOf() that yields a
+				// different string/object is converted instead.
+				if valueOf, err := vmInst.GetProperty(arg, "valueOf"); err == nil && valueOf.IsCallable() {
+					if prim, err := vmInst.Call(valueOf, arg, nil); err == nil && prim != arg &&
+						(prim.Type() == vm.TypeString || (prim.IsObject() && !prim.IsCallable())) {
+						return fromInput(append([]vm.Value{prim}, args[1:]...))
+					}
+				}
+				if lengthVal, err := vmInst.GetProperty(arg, "length"); err == nil && !lengthVal.IsUndefined() && !lengthVal.IsNumber() {
+					return wrapBytes(nil), nil
+				}
+				// Buffer.prototype.toJSON's {type: 'Buffer', data: [...]}.
+				if typ, err := vmInst.GetProperty(arg, "type"); err == nil && typ.Type() == vm.TypeString && typ.ToString() == "Buffer" {
+					if data, err := vmInst.GetProperty(arg, "data"); err == nil && data.Type() == vm.TypeArray {
+						if b, ok := bytesFromArrayLike(vmInst, data); ok {
+							return wrapBytes(b), nil
+						}
+					}
+				}
+			}
 			if data, ok := bytesFromArrayLike(vmInst, arg); ok {
 				return wrapBytes(data), nil
 			}

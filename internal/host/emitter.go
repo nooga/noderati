@@ -56,6 +56,38 @@ func newEventEmitterObject(vmInst *vm.VM) *vm.PlainObject {
 		}
 		return listenersOf(obj, args[0].ToString()), nil
 	}))
+	self := vm.NewValueFromPlainObject(obj)
+	obj.SetOwn("setMaxListeners", vm.NewNativeFunction(1, false, "setMaxListeners", func(args []vm.Value) (vm.Value, error) {
+		if len(args) > 0 {
+			obj.SetOwn("_maxListeners", args[0])
+		}
+		return self, nil
+	}))
+	obj.SetOwn("getMaxListeners", vm.NewNativeFunction(0, false, "getMaxListeners", func(_ []vm.Value) (vm.Value, error) {
+		if v, ok := obj.GetOwn("_maxListeners"); ok && v.IsNumber() {
+			return v, nil
+		}
+		return vm.NumberValue(10), nil
+	}))
+	obj.SetOwn("rawListeners", vm.NewNativeFunction(1, false, "rawListeners", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 {
+			return vm.NewArray(), nil
+		}
+		return listenersOf(obj, args[0].ToString()), nil
+	}))
+	obj.SetOwn("eventNames", vm.NewNativeFunction(0, false, "eventNames", func(_ []vm.Value) (vm.Value, error) {
+		out := vm.NewArray()
+		if tableVal, ok := obj.GetOwn("_events"); ok {
+			if table := tableVal.AsPlainObject(); table != nil {
+				for _, k := range table.OwnKeys() {
+					if listenerCount(obj, k) > 0 {
+						out.AsArray().Append(vm.NewString(k))
+					}
+				}
+			}
+		}
+		return out, nil
+	}))
 	obj.SetOwn("emit", vm.NewNativeFunction(1, true, "emit", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 {
 			return vm.False, nil

@@ -3,9 +3,11 @@ package host
 import (
 	"bytes"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/vm"
@@ -58,6 +60,13 @@ func installChildProcessNatives(p *driver.Paserati) {
 		}
 		command, cmdArgs := parseSpawnCommandArgs(args[0], args[1])
 		return runSpawnSync(command, cmdArgs), nil
+	}))
+
+	obj.SetOwn("__noderatiFork", vm.NewNativeFunction(3, false, "__noderatiFork", func(args []vm.Value) (vm.Value, error) {
+		if len(args) < 2 {
+			return vm.Undefined, nil
+		}
+		return forkChild(vmInst, args[0].ToString(), stringArrayFromValue(args[1]), argAt(args, 2))
 	}))
 
 	obj.SetOwn("__noderatiSpawn", vm.NewNativeFunction(3, false, "__noderatiSpawn", func(args []vm.Value) (vm.Value, error) {
@@ -129,6 +138,59 @@ type spawnOptions struct {
 	cwd      string
 	env      []string // nil means "inherit noderati's own environment" (Go's default); non-nil replaces it entirely, matching Node's own spawn(): passing an env object replaces, never merges.
 	detached bool
+	stdio    [3]stdioSpec
+}
+
+// stdioSpec is one of options.stdio's first three slots: a pipe (the
+// default), the parent's own fd (inherit, a number, or a stream with an
+// fd), or /dev/null (ignore).
+type stdioSpec struct {
+	mode string // "pipe", "inherit", "ignore"
+	file *os.File
+}
+
+func stdioFileForFd(fd int) *os.File {
+	switch fd {
+	case 0:
+		return os.Stdin
+	case 1:
+		return os.Stdout
+	case 2:
+		return os.Stderr
+	}
+	if f, ok := fsFile(int64(fd)); ok {
+		return f
+	}
+	return nil
+}
+
+func parseStdioEntry(v vm.Value, index int) stdioSpec {
+	switch {
+	case isNullish(v):
+		return stdioSpec{mode: "pipe"}
+	case v.IsString():
+		switch v.ToString() {
+		case "inherit":
+			return stdioSpec{mode: "inherit", file: stdioFileForFd(index)}
+		case "ignore":
+			return stdioSpec{mode: "ignore"}
+		default: // "pipe", "overlapped"
+			return stdioSpec{mode: "pipe"}
+		}
+	case v.IsNumber():
+		if f := stdioFileForFd(int(v.ToFloat())); f != nil {
+			return stdioSpec{mode: "inherit", file: f}
+		}
+	case v.Type() == vm.TypeObject:
+		// A stream: process.stdout & co. carry an fd.
+		if fdVal, ok := objOption(v, "fd"); ok && fdVal.IsNumber() {
+			if f := stdioFileForFd(int(fdVal.ToFloat())); f != nil {
+				return stdioSpec{mode: "inherit", file: f}
+			}
+		}
+		return stdioSpec{mode: "inherit", file: stdioFileForFd(index)}
+	}
+	return stdioSpec{mode: "pipe"}
 }
 
 func parseSpawnOptions(v vm.Value) spawnOptions {
@@ -155,10 +217,42 @@ func parseSpawnOptions(v vm.Value) spawnOptions {
 	if detachedVal, ok := obj.GetOwn("detached"); ok {
 		opts.detached = detachedVal.IsTruthy()
 	}
+	if stdioVal, ok := obj.GetOwn("stdio"); ok {
+		if stdioVal.Type() == vm.TypeArray {
+			arr := stdioVal.AsArray()
+			for i := 0; i < 3; i++ {
+				opts.stdio[i] = parseStdioEntry(argAt(arrayValues(arr), i), i)
+			}
+		} else if !isNullish(stdioVal) {
+			for i := 0; i < 3; i++ {
+				opts.stdio[i] = parseStdioEntry(stdioVal, i)
+			}
+		}
+	}
 	return opts
 }
 
+func arrayValues(arr *vm.ArrayObject) []vm.Value {
+	out := make([]vm.Value, arr.Length())
+	for i := range out {
+		out[i] = arr.Get(i)
+	}
+	return out
+}
+
+// spawnExtras carries what fork() adds on top of a plain spawn: the IPC
+// socket handed to the child as fd 3, and the env vars announcing it.
+type spawnExtras struct {
+	extraFiles []*os.File
+	extraEnv   []string
+}
+
 func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value) vm.Value {
+	child, _ := spawnProcessWith(vmInst, command, args, optsVal, spawnExtras{})
+	return vm.NewValueFromPlainObject(child)
+}
+
+func spawnProcessWith(vmInst *vm.VM, command string, args []string, optsVal vm.Value, extras spawnExtras) (*vm.PlainObject, bool) {
 	rt := vmInst.GetAsyncRuntime()
 	opts := parseSpawnOptions(optsVal)
 	cmd := exec.Command(command, args...)
@@ -168,44 +262,87 @@ func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value
 	if opts.env != nil {
 		cmd.Env = opts.env
 	}
+	if len(extras.extraEnv) > 0 {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = append(cmd.Env, extras.extraEnv...)
+	}
+	cmd.ExtraFiles = extras.extraFiles
 	if opts.detached {
 		setDetached(cmd)
 	}
-	stdinPipe, _ := cmd.StdinPipe()
-	stdoutPipe, _ := cmd.StdoutPipe()
-	stderrPipe, _ := cmd.StderrPipe()
 
 	child := newEventEmitterObject(vmInst)
-	stdoutStream := newReadableStream(vmInst)
-	stderrStream := newReadableStream(vmInst)
-	var stdinStream *vm.PlainObject
-	stdinStream = newWritableStream(vmInst,
-		// Found via real esbuild's own service protocol (a binary,
-		// length-prefixed message format) under noderati: writing a
-		// Buffer here used to go through .ToString(), which - like
-		// Object.prototype.toString on a typed array - doesn't decode
-		// bytes at all, so any byte outside plain ASCII silently
-		// corrupted the write instead of being sent as-is (confirmed
-		// directly: a 7-byte binary Buffer arrived on the other end as
-		// 19 bytes). valueToBytes (net.go) already does this correctly
-		// for a string, Buffer, or TypedArray alike.
-		func(writeArgs []vm.Value) (vm.Value, error) {
-			if len(writeArgs) > 0 && stdinPipe != nil {
-				_, _ = stdinPipe.Write(valueToBytes(vmInst, writeArgs[0]))
+	var stdinPipe io.WriteCloser
+	var pumps []struct {
+		r      io.ReadCloser
+		stream *vm.PlainObject
+	}
+	streamFor := func(i int) vm.Value {
+		spec := opts.stdio[i]
+		switch spec.mode {
+		case "inherit":
+			switch i {
+			case 0:
+				cmd.Stdin = spec.file
+			case 1:
+				cmd.Stdout = spec.file
+			case 2:
+				cmd.Stderr = spec.file
 			}
-			return vm.True, nil
-		},
-		func(endArgs []vm.Value) (vm.Value, error) {
-			if len(endArgs) > 0 && stdinPipe != nil {
-				_, _ = stdinPipe.Write(valueToBytes(vmInst, endArgs[0]))
-			}
-			if stdinPipe != nil {
-				_ = stdinPipe.Close()
-			}
-			emitOnObject(vmInst, stdinStream, "finish")
-			return vm.Undefined, nil
-		},
-	)
+			return vm.Null
+		case "ignore":
+			return vm.Null
+		}
+		if i == 0 {
+			stdinPipe, _ = cmd.StdinPipe()
+			var stdinStream *vm.PlainObject
+			stdinStream = newWritableStream(vmInst,
+				// Found via real esbuild's own service protocol (a binary,
+				// length-prefixed message format) under noderati: writing a
+				// Buffer here used to go through .ToString(), which - like
+				// Object.prototype.toString on a typed array - doesn't decode
+				// bytes at all, so any byte outside plain ASCII silently
+				// corrupted the write instead of being sent as-is (confirmed
+				// directly: a 7-byte binary Buffer arrived on the other end as
+				// 19 bytes). valueToBytes (net.go) already does this correctly
+				// for a string, Buffer, or TypedArray alike.
+				func(writeArgs []vm.Value) (vm.Value, error) {
+					if len(writeArgs) > 0 && stdinPipe != nil {
+						_, _ = stdinPipe.Write(valueToBytes(vmInst, writeArgs[0]))
+					}
+					return vm.True, nil
+				},
+				func(endArgs []vm.Value) (vm.Value, error) {
+					if len(endArgs) > 0 && stdinPipe != nil {
+						_, _ = stdinPipe.Write(valueToBytes(vmInst, endArgs[0]))
+					}
+					if stdinPipe != nil {
+						_ = stdinPipe.Close()
+					}
+					emitOnObject(vmInst, stdinStream, "finish")
+					return vm.Undefined, nil
+				},
+			)
+			return vm.NewValueFromPlainObject(stdinStream)
+		}
+		var r io.ReadCloser
+		if i == 1 {
+			r, _ = cmd.StdoutPipe()
+		} else {
+			r, _ = cmd.StderrPipe()
+		}
+		stream := newReadableStream(vmInst)
+		pumps = append(pumps, struct {
+			r      io.ReadCloser
+			stream *vm.PlainObject
+		}{r, stream})
+		return vm.NewValueFromPlainObject(stream)
+	}
+	stdinVal := streamFor(0)
+	stdoutVal := streamFor(1)
+	stderrVal := streamFor(2)
 
 	handleID := spawnHandleSeq.Add(1)
 	// refed: true - real Node's own default: a freshly spawned child
@@ -213,16 +350,42 @@ func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value
 	spawnHandles.Store(handleID, &spawnHandle{cmd: cmd, refed: true})
 	child.SetOwn("__noderatiSpawnHandle", vm.NumberValue(float64(handleID)))
 
-	child.SetOwn("stdout", vm.NewValueFromPlainObject(stdoutStream))
-	child.SetOwn("stderr", vm.NewValueFromPlainObject(stderrStream))
-	child.SetOwn("stdin", vm.NewValueFromPlainObject(stdinStream))
-	child.SetOwn("pid", vm.NumberValue(0))
+	child.SetOwn("stdin", stdinVal)
+	child.SetOwn("stdout", stdoutVal)
+	child.SetOwn("stderr", stderrVal)
+	stdioArr := vm.NewArray()
+	for _, v := range []vm.Value{stdinVal, stdoutVal, stderrVal} {
+		stdioArr.AsArray().Append(v)
+	}
+	child.SetOwn("stdio", stdioArr)
+	child.SetOwn("pid", vm.Undefined)
+	child.SetOwn("killed", vm.False)
+	child.SetOwn("exitCode", vm.Null)
+	child.SetOwn("signalCode", vm.Null)
+	child.SetOwn("spawnfile", vm.NewString(command))
 
-	child.SetOwn("kill", vm.NewNativeFunction(0, true, "kill", func(_ []vm.Value) (vm.Value, error) {
-		if h := loadSpawnHandle(child); h != nil && h.cmd.Process != nil {
-			_ = h.cmd.Process.Kill()
+	// kill([signal]) sends a real signal (SIGTERM by default, like Node)
+	// rather than always SIGKILL, and reports whether it was delivered.
+	child.SetOwn("kill", vm.NewNativeFunction(1, false, "kill", func(killArgs []vm.Value) (vm.Value, error) {
+		sig := syscall.SIGTERM
+		if len(killArgs) > 0 && !isNullish(killArgs[0]) {
+			if killArgs[0].IsNumber() {
+				sig = syscall.Signal(int(killArgs[0].ToFloat()))
+			} else if s, ok := nodeSignals[killArgs[0].ToString()]; ok {
+				sig = s
+			} else {
+				return vm.Undefined, newNodeTypeError(vmInst, "ERR_UNKNOWN_SIGNAL", "Unknown signal: "+killArgs[0].ToString())
+			}
 		}
-		return vm.Undefined, nil
+		h := loadSpawnHandle(child)
+		if h == nil || h.cmd.Process == nil {
+			return vm.False, nil
+		}
+		if err := h.cmd.Process.Signal(sig); err != nil {
+			return vm.False, nil
+		}
+		child.SetOwn("killed", vm.True)
+		return vm.True, nil
 	}))
 	// unref/ref were missing entirely - found via real esbuild's own
 	// ensureServiceIsRunning (lib/main.js), which calls child.unref()
@@ -272,9 +435,14 @@ func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value
 
 	if err := cmd.Start(); err != nil {
 		rt.EndExternalOp()
-		scheduleEmit(vmInst, child, "error", vm.NewString(err.Error()))
-		scheduleEmit(vmInst, child, "close", vm.NumberValue(1))
-		return vm.NewValueFromPlainObject(child)
+		spawnErr := wrapFsErr(vmInst, "spawn "+command, command, err)
+		errVal := fsErrToVM(spawnErr)
+		if errVal.IsUndefined() {
+			errVal = newJSError(vmInst, err.Error())
+		}
+		scheduleEmit(vmInst, child, "error", errVal)
+		scheduleEmit(vmInst, child, "close", vm.NumberValue(-2), vm.Null)
+		return child, false
 	}
 	child.SetOwn("pid", vm.IntegerValue(int32(cmd.Process.Pid)))
 
@@ -296,12 +464,13 @@ func spawnProcess(vmInst *vm.VM, command string, args []string, optsVal vm.Value
 	// on the VM's single-threaded event-loop queue after the output events
 	// they logically follow, not just usually after.
 	var pumpDone sync.WaitGroup
-	pumpDone.Add(2)
-	go pumpSpawnStream(vmInst, stdoutPipe, stdoutStream, &pumpDone)
-	go pumpSpawnStream(vmInst, stderrPipe, stderrStream, &pumpDone)
+	pumpDone.Add(len(pumps))
+	for _, pmp := range pumps {
+		go pumpSpawnStream(vmInst, pmp.r, pmp.stream, &pumpDone)
+	}
 	go waitSpawnProcess(vmInst, child, cmd, rt, &pumpDone)
 
-	return vm.NewValueFromPlainObject(child)
+	return child, true
 }
 
 func loadSpawnHandle(child *vm.PlainObject) *spawnHandle {
@@ -356,17 +525,25 @@ func waitSpawnProcess(vmInst *vm.VM, child *vm.PlainObject, cmd *exec.Cmd, rt in
 	// real, encountered bug and not just theoretical.
 	pumpDone.Wait()
 	err := cmd.Wait()
-	code := 0
+	codeVal, sigVal := vm.NumberValue(0), vm.Null
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
+			if name := exitSignalName(ee); name != "" {
+				codeVal, sigVal = vm.Null, vm.NewString(name)
+			} else {
+				codeVal = vm.NumberValue(float64(ee.ExitCode()))
+			}
 		} else {
-			code = 1
+			codeVal = vm.NumberValue(1)
 			scheduleEmit(vmInst, child, "error", vm.NewString(err.Error()))
 		}
 	}
-	scheduleEmit(vmInst, child, "exit", vm.NumberValue(float64(code)))
-	scheduleEmit(vmInst, child, "close", vm.NumberValue(float64(code)))
+	vmInst.GetAsyncRuntime().ScheduleNextTick(func() {
+		child.SetOwn("exitCode", codeVal)
+		child.SetOwn("signalCode", sigVal)
+		emitOnObject(vmInst, child, "exit", codeVal, sigVal)
+		emitOnObject(vmInst, child, "close", codeVal, sigVal)
+	})
 	// Only balance the original spawn-time BeginExternalOp() if this
 	// child is still ref'd - an unref() that already ran (see
 	// spawnProcess's own unref/ref natives) already called EndExternalOp()

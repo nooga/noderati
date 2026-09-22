@@ -319,16 +319,10 @@ class Readable extends EventEmitter {
     }
     return res;
   }
-  addListener(ev, fn) {
-    return this.on(ev, fn);
-  }
   removeListener(ev, fn) {
     const res = super.removeListener(ev, fn);
     if (ev === "readable") process.nextTick(() => updateReadableListening(this));
     return res;
-  }
-  off(ev, fn) {
-    return this.removeListener(ev, fn);
   }
   removeAllListeners(ev) {
     const res = super.removeAllListeners(ev);
@@ -477,6 +471,9 @@ class Readable extends EventEmitter {
     return readableFrom(iterable, opts);
   }
 }
+
+Readable.prototype.addListener = Readable.prototype.on;
+Readable.prototype.off = Readable.prototype.removeListener;
 
 function readableAddChunk(stream, chunk, encoding, addToFront) {
   const state = stream._readableState;

@@ -30,6 +30,13 @@ func installWorkerThreadsExports(p *driver.Paserati) {
 	exports := rec.GetExportValues()
 	workerCtor := buildWorkerConstructor(vmInst)
 	exports["Worker"] = workerCtor
+	api := messageChannelFor(vmInst)
+	exports["MessageChannel"] = api.channel
+	exports["MessagePort"] = api.port
+	exports["receiveMessageOnPort"] = api.receive
+	exports["threadId"] = vm.NumberValue(0)
+	exports["workerData"] = vm.Null
+	exports["resourceLimits"] = vm.NewValueFromPlainObject(vm.NewObject(vmInst.ObjectPrototype).AsPlainObject())
 	// markAsUncloneable(obj): real Node marks obj so a later
 	// structuredClone()/postMessage attempt on it throws DataCloneError.
 	// Found missing while probing real undici (round 74,

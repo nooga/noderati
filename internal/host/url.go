@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"strings"
 
 	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/vm"
@@ -65,13 +66,53 @@ func (u *jsURL) ToJSON() string   { return u.Href }
 // step is built on, close enough for every real base+relative-path
 // combination found so far (no dot-segment/scheme-relative edge case
 // yet needed a WHATWG-exact implementation).
+// removeDotSegments applies the WHATWG URL path parser's dot-segment
+// rules to an already-escaped absolute path: "." and ".." (in any
+// %2e-encoded spelling) are dropped/pop a segment, a trailing one leaves a
+// trailing slash, and a file: URL's Windows drive letter is never popped.
+func removeDotSegments(p string, isFile bool) string {
+	segs := strings.Split(p[1:], "/")
+	out := make([]string, 0, len(segs))
+	for i, s := range segs {
+		last := i == len(segs)-1
+		switch strings.ToLower(s) {
+		case ".", "%2e":
+			if last {
+				out = append(out, "")
+			}
+		case "..", ".%2e", "%2e.", "%2e%2e":
+			if len(out) > 0 && !(isFile && len(out) == 1 && isWindowsDriveLetter(out[0])) {
+				out = out[:len(out)-1]
+			}
+			if last {
+				out = append(out, "")
+			}
+		default:
+			out = append(out, s)
+		}
+	}
+	return "/" + strings.Join(out, "/")
+}
+
+func isWindowsDriveLetter(s string) bool {
+	return len(s) == 2 && (s[1] == ':' || s[1] == '|') &&
+		((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z'))
+}
+
 func newJSURL(href string, base vm.Value) (*jsURL, error) {
 	var parsed *url.URL
 	var err error
-	if base.IsString() && base.AsString() != "" {
-		baseURL, berr := url.Parse(base.AsString())
+	// Any base is stringified, as in Node: a URL object's href, or ToString.
+	baseStr := ""
+	if href, ok := hrefFromURLLike(base); ok {
+		baseStr = href
+	} else if !base.IsUndefined() {
+		baseStr = base.ToString()
+	}
+	if baseStr != "" {
+		baseURL, berr := url.Parse(baseStr)
 		if berr != nil || baseURL.Scheme == "" {
-			return nil, fmt.Errorf("Invalid base URL: %s", base.AsString())
+			return nil, fmt.Errorf("Invalid base URL: %s", baseStr)
 		}
 		ref, rerr := url.Parse(href)
 		if rerr != nil {
@@ -109,6 +150,17 @@ func newJSURL(href string, base vm.Value) (*jsURL, error) {
 	// "http://x/", not "http://x") for the same reason.
 	if specialSchemes[parsed.Scheme] && parsed.Path == "" {
 		parsed.Path = "/"
+	}
+	// WHATWG path parsing resolves "." and ".." segments; Go's url.Parse
+	// keeps them verbatim (new URL("file:///a/b/../c").pathname must be
+	// "/a/c").
+	if escaped := parsed.EscapedPath(); strings.HasPrefix(escaped, "/") {
+		if cleaned := removeDotSegments(escaped, parsed.Scheme == "file"); cleaned != escaped {
+			if unescaped, uerr := url.PathUnescape(cleaned); uerr == nil {
+				parsed.Path = unescaped
+				parsed.RawPath = cleaned
+			}
+		}
 	}
 	search := ""
 	if parsed.RawQuery != "" {
@@ -183,7 +235,13 @@ func fileURLStringToPath(fileURL string) (string, error) {
 	if u.Scheme != "file" {
 		return "", fmt.Errorf("fileURLToPath: must be a file URL")
 	}
-	return filepath.FromSlash(u.Path), nil
+	p := u.Path
+	if escaped := u.EscapedPath(); strings.HasPrefix(escaped, "/") {
+		if unescaped, uerr := url.PathUnescape(removeDotSegments(escaped, true)); uerr == nil {
+			p = unescaped
+		}
+	}
+	return filepath.FromSlash(p), nil
 }
 
 func declareURL(p *driver.Paserati) {

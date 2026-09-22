@@ -1,7 +1,6 @@
 package host
 
 import (
-	"fmt"
 	"io"
 	"math/big"
 	"os"
@@ -22,6 +21,10 @@ import (
 // deltas are meaningful. time.Since uses Go's monotonic clock reading, so
 // this stays correct across NTP/wall-clock adjustments during the run.
 var processStartTime = time.Now()
+
+// ExecArgv holds the Node-style options that preceded the script on the
+// command line, exposed as process.execArgv.
+var ExecArgv []string
 
 // ProcessInitializer is noderati’s process global. Do not grow Paserati’s stub.
 type ProcessInitializer struct {
@@ -107,7 +110,11 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 
 	processObj := newEventEmitterObject(vmInstance)
 	processObj.SetOwn("argv", argvArray)
-	processObj.SetOwn("execArgv", vm.NewArray())
+	execArgvArr := vm.NewArray()
+	for _, a := range ExecArgv {
+		execArgvArr.AsArray().Append(vm.NewString(a))
+	}
+	processObj.SetOwn("execArgv", execArgvArr)
 	processObj.SetOwn("execPath", vm.NewString(execPath))
 	processObj.SetOwn("platform", vm.NewString(runtime.GOOS))
 	processObj.SetOwn("arch", vm.NewString(runtime.GOARCH))
@@ -203,8 +210,49 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		}))
 	}
 	processObj.SetOwn("hrtime", hrtimeFn)
+	// memoryUsage()/memoryUsage.rss()/cpuUsage([previous]) report the Go
+	// runtime's real numbers: rss from getrusage's max RSS, the heap from
+	// runtime.MemStats, CPU time in microseconds like Node.
+	memFn := vm.NewNativeFunctionWithProps(0, false, "memoryUsage", func(_ []vm.Value) (vm.Value, error) {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		out := vm.NewObject(vmInstance.ObjectPrototype).AsPlainObject()
+		out.SetOwn("rss", vm.NumberValue(float64(processRSS())))
+		out.SetOwn("heapTotal", vm.NumberValue(float64(ms.HeapSys)))
+		out.SetOwn("heapUsed", vm.NumberValue(float64(ms.HeapAlloc)))
+		out.SetOwn("external", vm.NumberValue(0))
+		out.SetOwn("arrayBuffers", vm.NumberValue(0))
+		return vm.NewValueFromPlainObject(out), nil
+	})
+	if props := memFn.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+		props.Properties.SetOwn("rss", vm.NewNativeFunction(0, false, "rss", func(_ []vm.Value) (vm.Value, error) {
+			return vm.NumberValue(float64(processRSS())), nil
+		}))
+	}
+	processObj.SetOwn("memoryUsage", memFn)
+	processObj.SetOwn("cpuUsage", vm.NewNativeFunction(1, false, "cpuUsage", func(args []vm.Value) (vm.Value, error) {
+		var ru syscall.Rusage
+		_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+		user := float64(ru.Utime.Sec)*1e6 + float64(ru.Utime.Usec)
+		system := float64(ru.Stime.Sec)*1e6 + float64(ru.Stime.Usec)
+		if prev := argAt(args, 0); prev.Type() == vm.TypeObject {
+			if u, ok := objOption(prev, "user"); ok {
+				user -= u.ToFloat()
+			}
+			if s, ok := objOption(prev, "system"); ok {
+				system -= s.ToFloat()
+			}
+		}
+		out := vm.NewObject(vmInstance.ObjectPrototype).AsPlainObject()
+		out.SetOwn("user", vm.NumberValue(user))
+		out.SetOwn("system", vm.NumberValue(system))
+		return vm.NewValueFromPlainObject(out), nil
+	}))
 	installProcessKill(vmInstance, processObj)
 	startSignalBridge(vmInstance, processObj)
+	// After startSignalBridge: the IPC channel wraps the listener methods
+	// it installs.
+	setupChildIPCFromEnv(vmInstance, processObj, envObj)
 
 	if err := ctx.DefineGlobal("process", vm.NewValueFromPlainObject(processObj)); err != nil {
 		return err
@@ -283,13 +331,19 @@ func newStdioWritable(vmInstance *vm.VM, out *os.File) *vm.PlainObject {
 	obj.SetOwn("fd", vm.IntegerValue(int32(out.Fd())))
 	rt := vmInstance.GetAsyncRuntime()
 	obj.SetOwn("write", vm.NewNativeFunction(1, true, "write", func(args []vm.Value) (vm.Value, error) {
-		chunk := ""
+		// Buffers/TypedArrays are written as their raw bytes (a string
+		// with an encoding is decoded first), not stringified.
+		var chunk []byte
 		if len(args) > 0 && !args[0].IsUndefined() && args[0].Type() != vm.TypeNull {
-			chunk = args[0].ToString()
+			encoding := "utf8"
+			if len(args) > 1 && args[1].IsString() {
+				encoding = args[1].ToString()
+			}
+			chunk = valueToBytesWithEncoding(vmInstance, args[0], encoding)
 		}
 		cb := writeCallback(args)
-		if chunk != "" {
-			_, _ = fmt.Fprint(out, chunk)
+		if len(chunk) > 0 {
+			_, _ = out.Write(chunk)
 		}
 		if cb.IsCallable() {
 			fn := cb

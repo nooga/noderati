@@ -37,10 +37,9 @@ import (
 // running the real probe, not assumed from the issue's own summary)
 // with plain-number (i32/i64/f32/f64) function imports, and
 // `instance.exports.memory.buffer` reflecting current wasm memory
-// (including after growth). No Global, no streaming instantiate - not
-// needed by any real call site this bridge targets, and this project's
-// own discipline is to build the real thing a real call site needs, not
-// speculative surface.
+// (including after growth). Exported globals were added later for real
+// es-module-lexer (see webassembly_globals.go); still no streaming
+// instantiate - not needed by any real call site this bridge targets.
 //
 // WebAssembly.Table and multi-value exported-function results were
 // added later, once a second real call site needed them (see
@@ -159,6 +158,7 @@ func installWebAssemblyGlobal(p *driver.Paserati) {
 	ns.SetOwn("Instance", instanceCtor)
 	ns.SetOwn("Memory", memoryCtor)
 	ns.SetOwn("Table", tableCtor)
+	ns.SetOwn("Global", buildWasmGlobalConstructor(vmInst))
 	ns.SetOwn("CompileError", errs.compileError)
 	ns.SetOwn("LinkError", errs.linkError)
 	ns.SetOwn("RuntimeError", errs.runtimeError)
@@ -1331,6 +1331,12 @@ func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal, tabl
 		}
 		bridge := newWasmTableBridge(wazeroTableBackend{t: tbl}, def.Type())
 		exportsObj.SetOwn(name, buildWasmTableValue(vmInst, tableProtoVal, bridge))
+	}
+
+	for _, name := range wasmExportedGlobalNames(wasmBytes) {
+		if g := mod.ExportedGlobal(name); g != nil {
+			exportsObj.SetOwn(name, buildWasmGlobalValue(vmInst, g))
+		}
 	}
 
 	instObj := vm.NewObject(instanceProtoVal).AsPlainObject()

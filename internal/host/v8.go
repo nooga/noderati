@@ -22,7 +22,11 @@ import (
 // whole module missing, `require("node:v8")` itself throws before that
 // call's own try/catch ever gets a chance to run.
 func declareV8(p *driver.Paserati) {
-	p.DeclareModule("v8", func(m *driver.ModuleBuilder) {
+	registerJSShim("v8", v8Shim)
+	// The Go half is an internal module the "v8" JS shim (v8_serdes.go)
+	// re-exports from, alongside the serializer it builds in JS.
+	p.DeclareModule("noderati-internal-v8", func(m *driver.ModuleBuilder) {
+		m.Function("classify", v8Classify)
 		// getHeapStatistics(): real numbers, sourced from Go's own runtime
 		// memory stats rather than invented zeros — not V8's actual heap
 		// layout (there isn't one), but genuinely reflects live process
@@ -83,5 +87,4 @@ func declareV8(p *driver.Paserati) {
 
 		m.Default(nil)
 	})
-	_ = p.DeclareModuleAlias("node:v8", "v8")
 }

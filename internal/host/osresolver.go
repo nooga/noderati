@@ -29,10 +29,20 @@ func (r *OSPathResolver) CanResolve(specifier string) bool {
 	return strings.HasPrefix(specifier, "./") ||
 		strings.HasPrefix(specifier, "../") ||
 		strings.HasPrefix(specifier, "/") ||
+		strings.HasPrefix(specifier, "file://") ||
 		filepath.IsAbs(specifier)
 }
 
 func (r *OSPathResolver) Resolve(specifier string, fromPath string) (*modules.ResolvedModule, error) {
+	// A file: URL names the same module as its path (and shares its cache
+	// entry, as in Node, since ResolvedPath below is the file path).
+	if strings.HasPrefix(specifier, "file://") {
+		p, err := fileURLStringToPath(specifier)
+		if err != nil {
+			return nil, err
+		}
+		specifier = p
+	}
 	target, err := osResolveTarget(specifier, fromPath)
 	if err != nil {
 		return nil, err

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,9 +23,9 @@ func main() {
 		}()
 	}
 
-	eval := flag.String("e", "", "evaluate script")
-	printEval := flag.String("p", "", "evaluate script and print the result")
-	flag.Parse()
+	cli := parseNodeArgs(os.Args[1:])
+	host.ExecArgv = cli.execArgv
+	host.UserConditions = cli.conditions
 
 	execPath, err := os.Executable()
 	if err != nil {
@@ -34,15 +33,79 @@ func main() {
 	}
 
 	switch {
-	case *printEval != "":
-		os.Exit(runEval(execPath, *printEval, true, flag.Args()))
-	case *eval != "":
-		os.Exit(runEval(execPath, *eval, false, flag.Args()))
-	case flag.NArg() >= 1:
-		os.Exit(runFile(execPath, flag.Arg(0), flag.Args()[1:]))
+	case cli.hasEval && cli.print:
+		os.Exit(runEval(execPath, cli.eval, true, cli.rest))
+	case cli.hasEval:
+		os.Exit(runEval(execPath, cli.eval, false, cli.rest))
+	case cli.script != "":
+		os.Exit(runFile(execPath, cli.script, cli.rest))
 	default:
 		os.Exit(runREPL(execPath))
 	}
+}
+
+type nodeArgs struct {
+	execArgv   []string
+	conditions []string
+	eval       string
+	hasEval    bool
+	print      bool
+	script     string
+	rest       []string
+}
+
+// nodeValueOptions are Node CLI options whose value may come as the next
+// argument ("--conditions dev") rather than after "=".
+var nodeValueOptions = map[string]bool{
+	"-C": true, "--conditions": true, "-r": true, "--require": true, "--import": true,
+	"--loader": true, "--experimental-loader": true, "--input-type": true, "--title": true,
+	"--env-file": true, "--inspect-port": true, "--redirect-warnings": true,
+	"--unhandled-rejections": true, "--diagnostic-dir": true, "--watch-path": true,
+	"--stack-trace-limit": true, "--max-http-header-size": true, "--dns-result-order": true,
+}
+
+// parseNodeArgs follows Node's own command line shape: options first
+// (collected as process.execArgv), then the script, then the script's
+// own arguments, which are never interpreted.
+func parseNodeArgs(args []string) nodeArgs {
+	var out nodeArgs
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			if i+1 < len(args) {
+				out.script = args[i+1]
+				out.rest = args[i+2:]
+			}
+			return out
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			out.script = a
+			out.rest = args[i+1:]
+			return out
+		}
+		name, value, hasValue := strings.Cut(a, "=")
+		switch name {
+		case "-e", "--eval", "-p", "--print":
+			out.print = out.print || name == "-p" || name == "--print"
+			if !hasValue && i+1 < len(args) {
+				i++
+				value = args[i]
+			}
+			out.eval, out.hasEval = value, true
+			out.rest = args[i+1:]
+			return out
+		}
+		out.execArgv = append(out.execArgv, a)
+		if !hasValue && nodeValueOptions[name] && i+1 < len(args) {
+			i++
+			value = args[i]
+			out.execArgv = append(out.execArgv, value)
+		}
+		if name == "-C" || name == "--conditions" {
+			out.conditions = append(out.conditions, value)
+		}
+	}
+	return out
 }
 
 func newHost(argv []string) *driver.Paserati {
@@ -50,10 +113,9 @@ func newHost(argv []string) *driver.Paserati {
 }
 
 func runEval(execPath, source string, print bool, rest []string) int {
-	argv := append([]string{execPath, "-e"}, rest...)
-	if print {
-		argv[1] = "-p"
-	}
+	// Node's process.argv for -e/-p is [execPath, ...args]: the flag and
+	// the source aren't part of it.
+	argv := append([]string{execPath}, rest...)
 	p := newHost(argv)
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(source, driver.RunOptions{Filename: "[eval]", Script: false, ModuleName: "[eval]"})

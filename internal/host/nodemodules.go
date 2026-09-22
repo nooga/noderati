@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -235,11 +236,54 @@ const (
 	exportsConditionImport
 )
 
-func (c exportsCondition) candidates() []string {
-	if c == exportsConditionRequire {
-		return []string{"node", "require", "default"}
+// UserConditions are extra export conditions from --conditions/-C on the
+// command line (real Node adds them to every resolution).
+var UserConditions []string
+
+// active reports whether a conditions-object key applies: Node's set is
+// "node", "import" or "require", "default", plus any user conditions.
+func (c exportsCondition) active(key string) bool {
+	switch key {
+	case "node", "default":
+		return true
+	case "require":
+		return c == exportsConditionRequire
+	case "import":
+		return c == exportsConditionImport
 	}
-	return []string{"node", "import", "default"}
+	for _, u := range UserConditions {
+		if u == key {
+			return true
+		}
+	}
+	return false
+}
+
+// orderedJSONObject decodes a JSON object keeping its keys in source
+// order, which is what export condition matching is defined over.
+func orderedJSONObject(raw json.RawMessage) ([]string, map[string]json.RawMessage, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, nil, false
+	}
+	var keys []string
+	m := map[string]json.RawMessage{}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return nil, nil, false
+		}
+		k, _ := kt.(string)
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return nil, nil, false
+		}
+		if _, dup := m[k]; !dup {
+			keys = append(keys, k)
+		}
+		m[k] = v
+	}
+	return keys, m, true
 }
 
 func resolvePackageEntry(pkgDir, subpath string, cond exportsCondition) (string, error) {
@@ -424,17 +468,18 @@ func resolveExportTarget(raw json.RawMessage, cond exportsCondition) (string, bo
 		return "", false, nil
 	}
 
-	var asMap map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &asMap); err != nil {
+	keys, asMap, ok := orderedJSONObject(raw)
+	if !ok {
 		return "", false, fmt.Errorf("unsupported export target format")
 	}
 
-	for _, candidate := range cond.candidates() {
-		entry, ok := asMap[candidate]
-		if !ok {
+	// Real Node walks the conditions object in its own key order and takes
+	// the first key that is active - not a fixed priority list.
+	for _, key := range keys {
+		if !cond.active(key) {
 			continue
 		}
-		resolved, found, err := resolveExportTarget(entry, cond)
+		resolved, found, err := resolveExportTarget(asMap[key], cond)
 		if err != nil {
 			return "", false, err
 		}

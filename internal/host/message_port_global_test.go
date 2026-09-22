@@ -17,7 +17,7 @@ func TestMessagePortGlobalIsConstructibleEmitter(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
-		const port = new MessagePort();
+		const { port1: port } = new MessageChannel();
 		let closed = false;
 		await new Promise((resolve) => {
 			port.on("close", () => { closed = true; resolve(); });

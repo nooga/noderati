@@ -10,3 +10,5 @@ import "os/exec"
 // Ctrl+Break rather than SIGTERM-style signals) - out of scope for the
 // gap this file's unix counterpart closes.
 func setDetached(cmd *exec.Cmd) {}
+
+func exitSignalName(_ *exec.ExitError) string { return "" }

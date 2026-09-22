@@ -22,9 +22,6 @@ class EventEmitter {
     // undefined.
     return this._addListener(event, listener, false);
   }
-  addListener(event, listener) {
-    return this._addListener(event, listener, false);
-  }
   prependListener(event, listener) {
     return this._addListener(event, listener, true);
   }
@@ -59,9 +56,6 @@ class EventEmitter {
   }
   prependOnceListener(event, listener) {
     return this.prependListener(event, this._onceWrap(event, listener));
-  }
-  off(event, listener) {
-    return this.removeListener(event, listener);
   }
   removeListener(event, listener) {
     if (!this._events) return this;
@@ -191,6 +185,12 @@ class EventEmitter {
 // 'extends' a non-constructor object throws "Class extends value object
 // is not a constructor or null" - a real, encountered failure, not a
 // hypothetical one.
+// Aliases are the same function objects, as in Node: a subclass that
+// overrides off() and calls super.off() must reach removeListener's body
+// directly, not re-dispatch through this.removeListener (minipass does
+// exactly that, and a forwarding off() recursed forever).
+EventEmitter.prototype.addListener = EventEmitter.prototype.on;
+EventEmitter.prototype.off = EventEmitter.prototype.removeListener;
 EventEmitter.EventEmitter = EventEmitter;
 
 // getMaxListeners/setMaxListeners/defaultMaxListeners were missing

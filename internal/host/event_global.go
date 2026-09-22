@@ -53,6 +53,43 @@ func installEventGlobals(p *driver.Paserati) {
 	gobj.SetOwn("Event", eventCtor)
 	gobj.SetOwn("CustomEvent", buildEventConstructor(vmInst, "CustomEvent", true))
 	gobj.SetOwn("EventTarget", buildEventTargetConstructor(vmInst))
+	gobj.SetOwn("MessageEvent", buildMessageEventConstructor(vmInst, eventCtor))
+}
+
+// buildMessageEventConstructor: an Event whose init dict also carries
+// data/origin/lastEventId/source/ports - what MessagePort delivers to
+// addEventListener('message') listeners.
+func buildMessageEventConstructor(vmInst *vm.VM, eventCtor vm.Value) vm.Value {
+	eventProto := vm.Undefined
+	if props := eventCtor.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+		eventProto, _ = props.Properties.GetOwn("prototype")
+	}
+	proto := vm.NewObject(eventProto).AsPlainObject()
+	ctor := vm.NewConstructorWithProps(2, false, "MessageEvent", func(args []vm.Value) (vm.Value, error) {
+		ev, err := vmInst.Construct(eventCtor, args)
+		if err != nil {
+			return vm.Undefined, err
+		}
+		obj := ev.AsPlainObject()
+		obj.SetPrototype(vm.NewValueFromPlainObject(proto))
+		fields := map[string]vm.Value{"data": vm.Null, "origin": vm.NewString(""), "lastEventId": vm.NewString(""), "source": vm.Null, "ports": vm.NewArray()}
+		if init := argAt(args, 1); init.Type() == vm.TypeObject {
+			for name := range fields {
+				if v, ok := objOption(init, name); ok && !v.IsUndefined() {
+					fields[name] = v
+				}
+			}
+		}
+		for _, name := range []string{"data", "origin", "lastEventId", "source", "ports"} {
+			obj.SetOwn(name, fields[name])
+		}
+		return ev, nil
+	})
+	if props := ctor.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+		props.Properties.DefineFixedProperty("prototype", vm.NewValueFromPlainObject(proto))
+	}
+	proto.SetOwnNonEnumerable("constructor", ctor)
+	return ctor
 }
 
 // buildEventConstructor builds Event (withDetail=false) or CustomEvent

@@ -17176,3 +17176,163 @@ order is *randomized* run to run, and the objects have no
 **Status**: `chokidar` done. New tests are `TestReadablePullModeMatchesNode`,
 `TestFsWatchReportsRenameAndChange` and `TestFsWatchFileMatchesNodeSequence`
 (stable across 10 repeated runs). `go vet` and the full suite are clean.
+
+## Round 150: `vitest` runs end to end through real forked workers - `child_process.fork()` + IPC, `v8.serialize`, `MessageChannel`, WebAssembly globals and a dozen more noderati gaps; blocked on one engine bug (#531) before the first test executes
+
+`vitest`'s default pool is `forks`: tinypool `fork()`s workers and every
+RPC between them is a `v8.serialize` payload sent over the IPC channel.
+Getting there took a long chain. Each link below was found by running
+the real probe, fixed, and checked against real Node.
+
+**`child_process.fork()` + IPC (new `child_process_ipc.go`,
+`child_process.go`, `child_process_shim.go`).**
+- A Unix socketpair whose child end becomes fd 3, announced through
+  `NODE_CHANNEL_FD`/`NODE_CHANNEL_SERIALIZATION_MODE`, exactly as Node
+  does. Node's own wire formats: JSON lines by default, and 4-byte BE
+  length + `v8.serialize` for `serialization: 'advanced'`.
+- Both ends are the same code, the `ChildProcess` in the parent and
+  `process` in the child: `send(msg, cb)`, `'message'`, `connected`,
+  `disconnect()`/`'disconnect'`, `channel.ref()`/`unref()`.
+- The child's channel is listener-refcounted as in Node's `_forkChild`: it
+  only keeps the child alive while `'message'`/`'disconnect'` listeners
+  exist. `NODE_CHANNEL_*` are removed from the child's `process.env`.
+- In-flight writes hold the loop, like libuv write requests, so
+  send-then-exit doesn't lose the message.
+- A 22-line reference script covering messages both ways, Buffer-in-JSON,
+  send callbacks, disconnect ordering, `exit(code, signal)`, send after
+  exit (returns `false`, then `ERR_IPC_CHANNEL_CLOSED` via callback or an
+  async `'error'`), `kill()`/`killed`/`signalCode`, and inherited stdio is
+  identical to Node. So is advanced mode with Map/Set/Date/BigInt/Buffer.
+- Two real bugs found writing the regression test:
+  - The IPC fds were blocking, so Go's `Close()` couldn't take effect
+    while this side's `Read` was pending, and `disconnect()` on a live
+    process never reached the peer. They're non-blocking now, so the
+    poller owns them.
+  - A message and EOF arriving back to back raced (message dropped).
+- `spawn` gained what `fork` needs and had been silently ignoring:
+  per-slot `stdio` (`pipe`/`inherit`/`ignore`/fd numbers/streams, with
+  `child.stdout === null` when not piped), `exit`/`close` as `(code,
+  signal)`, `kill(signal)` defaulting to SIGTERM (it always sent
+  SIGKILL), `killed`/`exitCode`/`signalCode`/`stdio`/`spawnfile`, and a
+  proper error on spawn failure.
+
+**`v8.serialize`/`deserialize` + `Serializer`/`Deserializer`/
+`DefaultSerializer`/`DefaultDeserializer` (new `v8_serdes.go`; `v8.go`
+now a JS shim over the renamed Go module).** This is a real V8
+ValueSerializer, wire version 15, in JS. It covers:
+- zigzag int32 versus double, and BigInt digits;
+- one-byte versus two-byte strings, with V8's alignment padding;
+- dense versus sparse arrays, with extra properties;
+- index keys written as numbers;
+- back-references;
+- Date, RegExp flags, Map, Set, ArrayBuffer, boxed primitives, Error
+  (prototype tag/message/stack/cause);
+- Node's host-object encoding for ArrayBufferViews (Buffer = index 10);
+- the plain-Serializer `B`+`V` view encoding;
+- the primitives API (`writeUint32`/`Uint64`/`Double`/`RawBytes`);
+- Node's exact error messages.
+
+A native classifier reads paserati's internal type tags, so a subclass or
+`Symbol.toStringTag` can't disguise a Date/Error/boxed value. 52 of 53
+reference values are byte-identical to real Node, and real Node
+deserializes noderati's IPC payloads correctly. The one difference is a
+function's DataCloneError text, which needs #524.
+
+**MessageChannel/MessagePort/receiveMessageOnPort, globals and
+`worker_threads` (`message_port_global.go`).** The previous `MessagePort`
+was a placeholder whose `postMessage` dropped everything, and
+`MessageChannel` didn't exist. tinypool routes every task through one.
+Now it's two entangled ports with incoming queues and structured-clone
+delivery (transferred ports pass by identity). A port auto-starts on
+`on('message')`, keeps the loop alive while started, and has
+`ref`/`unref`/`close` (closes both ends). `addEventListener` delivers a
+real `MessageEvent`, which is now a global too. `new MessagePort()` throws
+`ERR_CONSTRUCT_CALL_INVALID`. The reference script is identical to Node.
+
+**The rest of the chain, in the order vitest hit them:**
+- `process.stdout.setMaxListeners`/`getMaxListeners`/`eventNames`/
+  `rawListeners` on Go-native emitters.
+- **`process.stdout.write(buffer)` printed `[object Uint8Array]`.** It
+  stringified instead of writing the bytes. This had been hiding every
+  worker's stderr.
+- **CLI:** Go's `flag` rejected Node flags (`--conditions` from vitest's
+  `execArgv`). `main.go` now parses Node-style: options before the script
+  become `process.execArgv`, and value-taking options take the next
+  argument. With `-e`/`-p`, `process.argv` no longer contains the flag.
+- **Export conditions:** `--conditions`/`-C` now join the active set, and
+  a real pre-existing bug is fixed. Conditions were matched in a fixed
+  priority order (`node`, `import`, `default`) instead of **the exports
+  object's own key order** as Node does. `{"import": …, "node": …}` picked
+  the wrong file.
+- **`new URL()` kept `.`/`..` segments** (Go's parser doesn't do WHATWG
+  dot-segment removal), and so did `fileURLToPath`. tinypool resolves its
+  worker entry as `import.meta.url + "/../entry/process.js"`.
+  `new URL(rel, urlObject)` also rejected a URL object as the base. Nine
+  edge cases (`%2e` spellings, trailing slashes, drive letters, empty
+  segments) are identical to Node.
+- `process.memoryUsage()` (plus `.rss()`) and `process.cpuUsage()`.
+- **`import("file:///…")` couldn't resolve at all.** It now maps to the
+  same cache entry as the path.
+- **`Buffer.from({type:'Buffer', data})`** (the `toJSON` shape vitest's
+  IPC relies on), `valueOf()` unwrapping, and non-numeric `length`.
+- **`WebAssembly.Global`:** exported globals, via a small export-section
+  parser (wazero can't enumerate them), with live `value` get/set and
+  Node's exact immutable-set error. es-module-lexer (vite's import
+  analysis) reads `exports.__heap_base.value` on every parse, and failed
+  on *every input* without it.
+- **A bug I introduced in Round 148, fixed:** `EventEmitter.off` forwarded
+  to `this.removeListener`. In Node they are *the same function object*,
+  so minipass's `off()` → `super.off()` recursed forever. `off`/
+  `addListener` are now true aliases, as are Readable's.
+
+**Engine bugs found and filed this round, each reduced first:**
+- [#522](https://github.com/nooga/paserati/issues/522) `Response.json()`
+  had random key order and no prototype. Already fixed on the maintainer's
+  branch; fetch parity is now identical.
+- [#523](https://github.com/nooga/paserati/issues/523) `@@toStringTag`
+  was ignored for WeakMap/WeakSet/WeakRef/FinalizationRegistry/DataView.
+  Fixed on that branch too.
+- [#524](https://github.com/nooga/paserati/issues/524)
+  `Function.prototype.toString` returns `[native code]` for user code.
+- [#525](https://github.com/nooga/paserati/issues/525) internal slots
+  (`[[ErrorData]]`, `[[PrimitiveValue]]`, `__timestamp__`) are visible as
+  real properties.
+- [#527](https://github.com/nooga/paserati/issues/527) module namespaces
+  aren't live, aren't cached (`import(x) !== import(x)`), and have no
+  `@@toStringTag`.
+- [#528](https://github.com/nooga/paserati/issues/528) `Object.assign`
+  silently drops everything onto TypedArray/Buffer/ArrayBuffer/Map/Set/
+  RegExp/DataView/Promise/arguments targets. rollup's `parseAst` does
+  `Object.assign(new Uint32Array(…), {convertString})`, and minizlib ends
+  a gzip stream with `Object.assign(Buffer.alloc(0), {[flushFlag]: …})`.
+- [#529](https://github.com/nooga/paserati/issues/529) expando properties
+  on DataView/WeakMap/WeakSet are discarded.
+- [#531](https://github.com/nooga/paserati/issues/531) **upvalues for
+  block-scoped `let`/`const` aren't closed when the block exits.** A later
+  statement reuses the register, and the escaped closure then sees
+  garbage (`{ let e = "x"; o.r = () => e; } o.k = 1; o.r()` returns `o`).
+  Found through `@vitest/expect` and then through tar's `Pack`, where the
+  captured `e` came back as the constructor's own argument. I narrowed it
+  with an automated delta-minimization of tar's real class.
+- #516–#519 and #521 from Round 148 were all fixed upstream during this
+  round.
+
+The paserati checkout is currently on the maintainer's in-progress
+`fix-522-523` branch. It was left untouched; noderati builds against it
+via `go.work`.
+
+**Status:**
+- `vitest` goes all the way through `startVitest` → tinypool forking real
+  workers → the IPC handshake → RPC → vite-node module fetch. The worker
+  then fails importing vitest's own runner on
+  [#531](https://github.com/nooga/paserati/issues/531). Before that, it
+  failed on #528 at vite's `ssrTransform`, confirmed past with a
+  temporary, reverted `node_modules` patch.
+- `tar`: uncompressed archives are now **byte-identical** to real Node
+  (#521 fixed the directory typeflag). gzip is blocked on #528 and #531,
+  and extraction on #520.
+- `chokidar`: still passes.
+- New tests are in `node_parity_vitest_test.go` and
+  `cmd/noderati/main_test.go`, with every expectation checked against real
+  Node. Checking them caught two wrong expectations of my own. `go vet`
+  and the full suite are clean.
