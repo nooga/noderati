@@ -2,6 +2,78 @@ package host
 
 const streamShim = `import EventEmitter from "events";
 
+// The legacy base class real Node's own 'stream' module actually
+// exports as its default/module value (require('stream') === Stream,
+// with Readable/Writable/etc attached to it as static properties - see
+// this file's own exports at the bottom) - missing entirely until now,
+// since Readable/Writable/Duplex/Transform below were flattened
+// straight onto EventEmitter directly (round 90) rather than each
+// extending this shared base, which is fine for those classes' own
+// behavior but left real code that extends the base *itself* with
+// nothing to inherit from. Found via real, unmodified 'send' (a real,
+// direct dependency of express's own static-file/sendFile support):
+// send/index.js does 'util.inherits(SendStream, Stream)' where
+// 'Stream' is the whole 'require(\"stream\")' module value - with that
+// value previously a plain \"{ Readable, Writable, ... }\" namespace
+// object (no '.prototype' at all), util.inherits' own
+// 'Object.setPrototypeOf(SendStream.prototype, Stream.prototype)' call
+// threw \"Object prototype may only be an Object or null\" immediately
+// at require-time, before a single route could even be registered.
+// pipe() is real Node's actual legacy implementation (lib/internal/
+// streams/legacy.js), not a stub - SendStream (and any other class
+// that extends this base directly rather than Readable) relies on
+// inheriting a real .pipe() rather than defining its own, exactly the
+// way real Node's own docs describe the classic \"custom Stream\"
+// pattern (emit 'data'/'end' manually, get .pipe() for free).
+class Stream extends EventEmitter {
+  pipe(dest, options) {
+    const source = this;
+    function ondata(chunk) {
+      if (dest.writable && dest.write(chunk) === false && source.pause) {
+        source.pause();
+      }
+    }
+    source.on("data", ondata);
+    function ondrain() {
+      if (source.readable && source.resume) source.resume();
+    }
+    dest.on("drain", ondrain);
+    let didOnEnd = false;
+    function onend() {
+      if (didOnEnd) return;
+      didOnEnd = true;
+      if (dest.end) dest.end();
+    }
+    function onclose() {
+      if (didOnEnd) return;
+      didOnEnd = true;
+      if (typeof dest.destroy === "function") dest.destroy();
+    }
+    if (!(options && options.end === false)) {
+      source.on("end", onend);
+      source.on("close", onclose);
+    }
+    function onerror(er) {
+      cleanup();
+      if (source.listenerCount("error") === 0) throw er;
+    }
+    source.on("error", onerror);
+    function cleanup() {
+      source.removeListener("data", ondata);
+      dest.removeListener("drain", ondrain);
+      source.removeListener("end", onend);
+      source.removeListener("close", onclose);
+      source.removeListener("error", onerror);
+      source.removeListener("end", cleanup);
+      source.removeListener("close", cleanup);
+    }
+    source.on("end", cleanup);
+    source.on("close", cleanup);
+    dest.emit("pipe", source);
+    return dest;
+  }
+}
+
 // This used to hand-roll its own, separate class EventEmitter { ... }
 // here - a verbatim copy-paste of events.go's real one (down to the
 // same method set), which is exactly the "same thing implemented
@@ -628,8 +700,24 @@ function isErrored(stream) {
   return !!(stream && stream._error);
 }
 
-export { Readable, Writable, Duplex, Transform, PassThrough, pipeline, isDisturbed, isErrored, pipelineStreams as _pipelineStreams };
-export default { Readable, Writable, Duplex, Transform, PassThrough, pipeline, isDisturbed, isErrored };
+// Real Node's require('stream') is the Stream constructor itself, not a
+// plain namespace object - every other export hangs off it as a static
+// property (require('stream').Readable, .Writable, etc). Matters for any
+// real code that does 'var Stream = require(\"stream\")' and then uses
+// Stream directly (as util.inherits' own base, or 'new Stream()') rather
+// than destructuring a named export - see this file's own Stream class
+// doc comment above for the real package (send) that hit this.
+Stream.Readable = Readable;
+Stream.Writable = Writable;
+Stream.Duplex = Duplex;
+Stream.Transform = Transform;
+Stream.PassThrough = PassThrough;
+Stream.pipeline = pipeline;
+Stream.isDisturbed = isDisturbed;
+Stream.isErrored = isErrored;
+
+export { Stream, Readable, Writable, Duplex, Transform, PassThrough, pipeline, isDisturbed, isErrored, pipelineStreams as _pipelineStreams };
+export default Stream;
 `
 
 const streamPromisesShim = `import { _pipelineStreams } from "stream";

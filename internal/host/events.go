@@ -7,6 +7,20 @@ class EventEmitter {
     this._events = Object.create(null);
   }
   on(event, listener) {
+    // Every method below re-checks 'this._events' itself rather than
+    // trusting the constructor already ran - found via real, unmodified
+    // express: createApplication() builds 'app' as a plain function and
+    // does 'mixin(app, EventEmitter.prototype, false)' (merge-descriptors,
+    // copying just the *methods* onto it) instead of ever constructing a
+    // real EventEmitter instance, a real and common pattern for "give this
+    // arbitrary object emitter behavior" that real Node's own EventEmitter
+    // methods are themselves written to tolerate (each one lazily
+    // initializes '_events' internally rather than assuming a constructor
+    // already ran) - this shim's own methods didn't, so 'app.on(\"mount\",
+    // ...)' inside express's defaultConfiguration() threw immediately
+    // trying to read a property off 'this._events' while it was still
+    // undefined.
+    if (!this._events) this._events = Object.create(null);
     if (!this._events[event]) this._events[event] = [];
     this._events[event].push(listener);
     return this;
@@ -22,11 +36,21 @@ class EventEmitter {
     return this.removeListener(event, listener);
   }
   removeListener(event, listener) {
+    if (!this._events) return this;
     const list = this._events[event];
     if (!list) return this;
     const i = list.indexOf(listener);
     if (i >= 0) list.splice(i, 1);
     return this;
+  }
+  // Missing entirely - found adding stream.go's own legacy Stream.pipe()
+  // (needed to check for an attached 'error' listener before deciding
+  // whether an unhandled pipe error should throw, exactly like real
+  // Node's own lib/internal/streams/legacy.js does).
+  listenerCount(event) {
+    if (!this._events) return 0;
+    const list = this._events[event];
+    return list ? list.length : 0;
   }
   // "error" is special-cased per real Node's own EventEmitter contract:
   // emitting it with no listener registered throws (the error itself,
@@ -45,7 +69,7 @@ class EventEmitter {
   // http, not this JS-shim one instantiated by real user code that
   // extends EventEmitter directly) - worth having in both.
   emit(event, ...args) {
-    const list = this._events[event];
+    const list = this._events && this._events[event];
     if (!list || list.length === 0) {
       if (event === "error") {
         const er = args[0];

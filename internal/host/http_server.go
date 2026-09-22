@@ -587,14 +587,34 @@ func buildServerResponse(vmInst *vm.VM, socketSelf vm.Value, writeCh chan<- srvW
 		if isEnded() {
 			return self, nil
 		}
+		// Real Node's end() signature is end([chunk[, encoding]][, callback])
+		// - up to three positional args, with an optional chunk followed by
+		// an optional encoding *string* (not more data), then an optional
+		// callback. The previous version scanned every argument and took
+		// whichever non-callable one came *last* as the body - which is
+		// exactly wrong the moment a caller passes an encoding, since that
+		// encoding string (almost always "utf8", the very default Express's
+		// own res.send() passes explicitly) would then silently overwrite
+		// the real chunk as "the data to send". Found via real, unmodified
+		// express: every res.send()/res.json() response body came back as
+		// the literal four bytes "utf8" (Content-Length still correctly
+		// reflected the real body's length, computed by Express itself
+		// before ever calling end() - only the bytes actually written were
+		// wrong) - a silent data-corruption bug, not a crash, so it would
+		// have gone unnoticed without diffing the actual response body
+		// against what was sent. A non-UTF-8 encoding argument is still an
+		// honest, undocumented gap (valueToBytes always assumes UTF-8 for a
+		// string chunk) - real Node's own default is "utf8" too, so every
+		// real call site seen so far already matches this.
 		var data []byte
 		var cb vm.Value = vm.Undefined
-		for _, a := range args {
-			if a.IsCallable() {
-				cb = a
-			} else if !a.IsUndefined() && a.Type() != vm.TypeNull {
-				data = valueToBytes(vmInst, a)
-			}
+		rest := args
+		if len(rest) > 0 && rest[len(rest)-1].IsCallable() {
+			cb = rest[len(rest)-1]
+			rest = rest[:len(rest)-1]
+		}
+		if len(rest) > 0 && !rest[0].IsUndefined() && rest[0].Type() != vm.TypeNull {
+			data = valueToBytes(vmInst, rest[0])
 		}
 		setEnded()
 		obj.SetOwn("writableEnded", vm.True)

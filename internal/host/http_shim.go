@@ -90,7 +90,26 @@ const httpMaxHeaderSizeDecl = "const maxHeaderSize = 16384;"
 // object), so a class that exists without appearing in createServer()'s
 // own prototype chain is enough to stop that throw without needing full
 // prototype wiring between the two.
+// IncomingMessage/ServerResponse are the same kind of nominal marker as
+// Server above, for the same reason: real code builds its own extended
+// prototype on top of these via Object.create(...)'s own .prototype
+// rather than ever instantiating them directly, so a class existing at
+// all - with no wiring back into what createServer's real req/res
+// objects (buildServerIncomingMessage/buildServerResponse, http_server.go)
+// actually are - is enough. Found via real, unmodified express (a real,
+// direct dependency of neither Connect nor Koa, both already probed):
+// its own lib/request.js/response.js do
+// "Object.create(http.IncomingMessage.prototype)"/
+// "Object.create(http.ServerResponse.prototype)" at module load, before a
+// single request is ever handled, then later re-parent each real req/res
+// onto that extended prototype via a plain setPrototypeOf(req, ...) call
+// - which only swaps the [[Prototype]] link, leaving every own property
+// Go already set on the real object (headers, method, url, ...) exactly
+// where it was. Nothing about *building* the real req/res objects needs
+// to change for this to work.
 const createServerDecl = `class Server {}
+class IncomingMessage {}
+class ServerResponse {}
 function createServer(optionsOrRequestListener, maybeRequestListener) {
   const requestListener = typeof optionsOrRequestListener === "function" ? optionsOrRequestListener : maybeRequestListener;
   return globalThis.__noderatiHTTPCreateServer(requestListener);
@@ -109,8 +128,8 @@ func renderHTTPShim(scheme string, withMaxHeaderSize bool, withCreateServer bool
 	createServer := ""
 	if withCreateServer {
 		createServer = createServerDecl
-		exportsList += ", createServer, Server"
-		defaultExports = strings.Replace(defaultExports, "}", ", createServer, Server }", 1)
+		exportsList += ", createServer, Server, IncomingMessage, ServerResponse"
+		defaultExports = strings.Replace(defaultExports, "}", ", createServer, Server, IncomingMessage, ServerResponse }", 1)
 	}
 	s = strings.ReplaceAll(s, "__NODERATI_MAX_HEADER_SIZE__", maxHeaderSizeDecl)
 	s = strings.ReplaceAll(s, "__NODERATI_CREATE_SERVER__", createServer)

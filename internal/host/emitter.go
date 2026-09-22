@@ -103,6 +103,27 @@ func newReadableStream(vmInst *vm.VM) *vm.PlainObject {
 		}
 		return self, nil
 	}))
+	// resume/pause were missing entirely - found via real, unmodified
+	// express (finalhandler's own real error/404 path: "unpipe(req);
+	// onFinished(req, write); req.resume()" for any request whose body
+	// nothing else ever reads), a call finalhandler makes unconditionally
+	// on every response, not just the routes that happen to need it. See
+	// pendingStreamData's own "resumed" field/doc comment for why
+	// resume() needs to be more than a no-op: it's what lets a
+	// no-"data"-listener stream's buffered "end" actually fire.
+	obj.SetOwn("resume", vm.NewNativeFunction(0, false, "resume", func(_ []vm.Value) (vm.Value, error) {
+		if pending, ok := obj.InternalSlots().(*pendingStreamData); ok {
+			pending.resumed = true
+			flushPendingStreamData(vmInst, obj, pending)
+		}
+		return self, nil
+	}))
+	obj.SetOwn("pause", vm.NewNativeFunction(0, false, "pause", func(_ []vm.Value) (vm.Value, error) {
+		if pending, ok := obj.InternalSlots().(*pendingStreamData); ok {
+			pending.resumed = false
+		}
+		return self, nil
+	}))
 	// destroy was also missing - called on child.stdout/stderr elsewhere in
 	// this same real install (cleanup paths, not the crash above) whenever
 	// a tool call is aborted or its output stream needs to be torn down
@@ -456,6 +477,19 @@ type pendingStreamData struct {
 	// chunk through it before delivery, so a multi-byte character split
 	// across two underlying reads still decodes correctly.
 	decoder *stringDecoder
+	// resumed tracks an explicit .resume() call with no "data" listener
+	// attached (real Node's own "discard the body but still let it
+	// finish" idiom - e.g. finalhandler's own real
+	// "unpipe(req); onFinished(req, write); req.resume()" whenever a
+	// request handler never reads its body at all). Without this,
+	// flushPendingStreamData's own listener-count gate (needed so a real
+	// consumer that attaches "data" *after* chunks already arrived still
+	// sees them - round 101's own fix) also silently withheld "end"
+	// forever when nothing was ever going to attach one, since "end" is
+	// gated by the exact same check as "data" below - so a plain
+	// GET/POST route under express, whose body finalhandler intends to
+	// just discard, never actually finished, hanging the request.
+	resumed bool
 }
 
 func scheduleEmit(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.Value) {
@@ -497,7 +531,7 @@ func scheduleEmit(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.V
 // every buffered chunk has actually been delivered, if the source has
 // already finished.
 func flushPendingStreamData(vmInst *vm.VM, obj *vm.PlainObject, pending *pendingStreamData) {
-	if listenerCount(obj, "data") == 0 {
+	if listenerCount(obj, "data") == 0 && !pending.resumed {
 		return
 	}
 	for len(pending.chunks) > 0 {

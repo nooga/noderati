@@ -130,13 +130,10 @@ func TestEventEmitterInstanceSetGetMaxListeners(t *testing.T) {
 // `addAbortListener` off `require("node:events")` at module load time and
 // calls it unconditionally on every request that carries a signal.
 //
-// fired1 asserts *false*, not the spec-correct *true* - a known, already
-// filed upstream gap (paserati#372: AbortController.abort() never
-// dispatches 'abort' to addEventListener listeners at all, a real
-// AbortSignal/EventTarget bug, not anything addAbortListener's own JS
-// here gets wrong). This locks in current, honest behavior rather than
-// asserting something that can't pass until #372 is fixed - flip this
-// expectation the moment that issue closes.
+// fired1 now asserts the spec-correct *true* - paserati#372
+// (AbortController.abort() never dispatched 'abort' to addEventListener
+// listeners at all) is confirmed closed/merged upstream, flipped per this
+// test's own original instruction to do so the moment that issue closed.
 func TestEventsAddAbortListener(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
@@ -159,7 +156,7 @@ func TestEventsAddAbortListener(t *testing.T) {
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	want := `{"fired1":false,"fired2":false,"hasDispose":true}`
+	want := `{"fired1":true,"fired2":false,"hasDispose":true}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}

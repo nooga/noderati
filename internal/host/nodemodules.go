@@ -100,10 +100,32 @@ func (r *NodeModulesResolver) Resolve(specifier string, fromPath string) (*modul
 }
 
 type packageJSON struct {
-	Main    string          `json:"main"`
-	Module  string          `json:"module"`
+	Main    json.RawMessage `json:"main"`
+	Module  json.RawMessage `json:"module"`
 	Exports json.RawMessage `json:"exports"`
 	Imports json.RawMessage `json:"imports"`
+}
+
+// stringField reads a package.json field real Node treats as a plain string
+// ("main", "module") when present, tolerating any other real-world value
+// (found via real, unmodified `math-intrinsics`: `"main": false` is real,
+// valid package.json - not a string per the informal convention, but not
+// invalid JSON either - npm never enforces "main" must be a string, and an
+// exports-map-only package like this one uses `false` deliberately to mean
+// "no legacy main entry, don't fall back to one"). Decoding straight into a
+// Go `string` field made the whole package.json unparseable the moment any
+// field held a non-string JSON value, which readPackageJSON then reported
+// as "invalid package.json" - indistinguishable from the package not
+// existing at all to every caller up through require()'s own generic
+// "Cannot find module" - even though every *other* field (including a
+// perfectly well-formed "exports" map covering the exact subpath being
+// resolved) was completely fine.
+func stringField(raw json.RawMessage) string {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 func resolverStartDir(fromPath string) (string, error) {
@@ -255,8 +277,8 @@ func resolveMainEntry(pkgDir string, cond exportsCondition) (string, error) {
 		// import would actually load - a different file with a
 		// different import graph and, it turned out, a different crash
 		// than the one real Node's own resolution would ever hit here.
-		if pkg.Main != "" {
-			return resolveRelativeEntry(pkgDir, pkg.Main)
+		if main := stringField(pkg.Main); main != "" {
+			return resolveRelativeEntry(pkgDir, main)
 		}
 	}
 

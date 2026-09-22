@@ -819,14 +819,21 @@ func buildSocketObject(vmInst *vm.VM, s *socketState) (*vm.PlainObject, vm.Value
 	}))
 
 	obj.SetOwn("end", vm.NewNativeFunction(2, true, "end", func(args []vm.Value) (vm.Value, error) {
+		// Same positional end([chunk[, encoding]][, callback]) shape as
+		// http_server.go's ServerResponse.end() (see its own doc comment
+		// for the real bug this exact "scan every arg, last non-callable
+		// wins" shape caused there) - fixed identically here since a
+		// plain net.Socket.end(chunk, "utf8") would hit the same silent
+		// data-corruption otherwise.
 		var data []byte
 		var cb vm.Value
-		for _, a := range args {
-			if a.IsCallable() {
-				cb = a
-			} else if !a.IsUndefined() && a.Type() != vm.TypeNull {
-				data = valueToBytes(vmInst, a)
-			}
+		rest := args
+		if len(rest) > 0 && rest[len(rest)-1].IsCallable() {
+			cb = rest[len(rest)-1]
+			rest = rest[:len(rest)-1]
+		}
+		if len(rest) > 0 && !rest[0].IsUndefined() && rest[0].Type() != vm.TypeNull {
+			data = valueToBytes(vmInst, rest[0])
 		}
 		s.queueWrite(vmInst, obj, data, true, cb)
 		return self, nil
