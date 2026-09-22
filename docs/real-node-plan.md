@@ -16825,3 +16825,72 @@ scoped `zlib.createGzip` gap. `chokidar` needs real `fs.watch` from
 scratch. Four clear, well-understood next steps, none of them mystery
 engine bugs anymore.
 
+## Round 146: paserati#512 pulled and confirmed fixed - one real noderati regression it caused fixed directly, one more real, distinct paserati bug found and filed immediately behind it (#514)
+
+Pulled paserati forward again (`ac5cb8be..ac2eb65c`, "Fix #512: bind
+ModuleBuilder.Class struct methods onto the shared prototype") and
+rebuilt.
+
+**A real regression, caught by the existing test suite, not
+assumed away**: `TestURLSearchParamsIteration` failed consistently
+(5/5 reruns, not flaky) with `"not a URLSearchParams instance"`.
+Root cause: `#512`'s own fix moved every `ModuleBuilder.Class`
+instance's bound methods off the instance itself and onto the class's
+shared prototype (the whole point of the fix) - but
+`urlsearchparams.go`'s own `rawPairsOf` (used by this codebase's own
+iteration-protocol implementation, not just JS-visible behavior) read
+`obj.GetOwn("rawPairs")` directly, an own-property-only lookup that
+stopped finding a method that no longer lives there. Fixed by
+switching to `obj.Get("rawPairs")` (prototype-chain-aware) - the exact
+same `Get`-not-`GetOwn` fix this codebase has already needed once
+before, for an unrelated reason (a real `Collector extends Writable`
+destination, round 101). Grepped every other `GetOwn` call site in the
+codebase for the same risk (a Go-side lookup expecting a *method*, not
+a data field, as an own property of a `ModuleBuilder.Class` instance);
+found no other real hits - the rest are either plain data fields
+(still correctly bound per-instance; unaffected) or objects built by a
+completely different, non-`Class`-based construction path.
+
+**With that fixed, re-ran `express`'s POST path end to end** - and hit
+a *second*, distinct, real crash immediately behind the first:
+`"method called on an object that is not a valid instance of this
+class"`, from inside `iconv-lite`'s own `bom-handling.js`, the instant
+`express.json()`'s body-parser tried to decode its first byte.
+Root-caused directly to `iconv-lite`'s own real constructor pattern
+(`encodings/internal.js`):
+
+```js
+function InternalDecoder(options, codec) {
+    StringDecoder.call(this, codec.enc);
+}
+InternalDecoder.prototype = StringDecoder.prototype;
+```
+
+the classic ES5 "call the parent constructor against my own `this`"
+idiom - completely ordinary, spec-mandated behavior for any JS
+function, constructor or not. `#512`'s own fix made the *method*
+lookup half of this pattern work (`InternalDecoder` instances now
+correctly find `write`/`end` through the borrowed prototype), but not
+the *construction* half: `StringDecoder.call(this, codec.enc)` (a
+`ModuleBuilder.Class`-declared, host-backed constructor invoked as a
+plain function with an explicit receiver, not via `new`) silently
+builds and discards its own, unrelated object instead of initializing
+the real `this` in place - so `InternalDecoder`'s own instances never
+receive the Go-side internal state `write`/`end` need, and the very
+first call to either throws.
+
+Reduced to a clean, noderati-free, iconv-lite-free Go repro directly
+against `pkg/driver` (careful this time to use the correct, lowercased
+JS method name after an initial false-alarm mixup with the Go method's
+own PascalCase name confused an early draft of this exact repro) and
+confirmed paserati's own new `#512` regression tests still pass while
+this fails. Filed as
+[paserati#514](https://github.com/nooga/paserati/issues/514).
+
+**Status**: `#512` confirmed fixed and load-bearing (its own two new
+regression tests pass; the one real noderati-side fallout from it is
+fixed). `express`'s POST path remains blocked, now on `#514`
+specifically - a distinct, later stage of the exact same real-world
+`iconv-lite` pattern `#512` partially unblocked. `go vet`/full suite
+clean throughout.
+

@@ -305,7 +305,17 @@ func installURLSearchParamsIteration(p *driver.Paserati) {
 		if obj == nil {
 			return nil, fmt.Errorf("not a URLSearchParams instance")
 		}
-		fn, ok := obj.GetOwn("rawPairs")
+		// Get, not GetOwn: paserati#512 moved a Class()-registered
+		// instance's own bound methods off the instance itself and onto
+		// the class's shared prototype (fixing a real, separate bug -
+		// prototype-borrowing across two constructors used to silently
+		// lose them). "rawPairs" now lives on URLSearchParams.prototype,
+		// not as an own property of each instance, so an own-property-
+		// only lookup here stopped finding it the moment that fix
+		// landed - same shape as stream.go's own Writable/Collector fix
+		// already documented elsewhere in this codebase, now needed
+		// here too.
+		fn, ok := obj.Get("rawPairs")
 		if !ok || !fn.IsCallable() {
 			return nil, fmt.Errorf("not a URLSearchParams instance")
 		}
