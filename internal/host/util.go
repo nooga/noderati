@@ -10,6 +10,28 @@ import (
 	"github.com/nooga/paserati/pkg/vm"
 )
 
+// functionPrototype reads fn.prototype the way real property access
+// (`fn.prototype` in JS) actually does - lazily creating it on first
+// access via FunctionObject.GetOrCreatePrototypeWithVM. Found the hard
+// way in util.inherits above: vmInst.GetProperty(fn, "prototype")
+// returns Undefined for a real, freshly-declared `function Foo(){}`
+// closure whose own `.prototype` was never yet materialized (JS
+// property access itself triggers that lazy creation; the generic
+// host-callable GetProperty API doesn't special-case "prototype" for
+// TypeClosure/TypeFunction the same way) - a genuine paserati-side gap
+// worth fixing upstream in its own right (filed), worked around here
+// directly since util.inherits needs it now.
+func functionPrototype(vmInst *vm.VM, v vm.Value) (vm.Value, error) {
+	switch v.Type() {
+	case vm.TypeClosure:
+		return v.AsClosure().Fn.GetOrCreatePrototypeWithVM(vmInst), nil
+	case vm.TypeFunction:
+		return v.AsFunction().GetOrCreatePrototypeWithVM(vmInst), nil
+	default:
+		return vmInst.GetProperty(v, "prototype")
+	}
+}
+
 func declareUtil(p *driver.Paserati) {
 	vmInst := p.GetVM()
 	p.DeclareModule("util", func(m *driver.ModuleBuilder) {
@@ -81,6 +103,52 @@ func declareUtil(p *driver.Paserati) {
 				props.Properties.SetOwn("enabled", vm.BooleanValue(enabled))
 			}
 			return fn
+		})
+		// inherits(ctor, superCtor) was missing entirely - found chasing
+		// real http-proxy (a real, transitive vite dependency, bundled
+		// into vite's own dist/node/chunks/dep-*.js) under noderati: its
+		// own real, unmodified source does
+		// `util.inherits(ProxyServer, EventEmitter3)` at module scope -
+		// this classic legacy API (superseded by ES classes in most
+		// modern code, but still genuinely real and still used by a lot
+		// of it) links ctor.prototype's own prototype chain to
+		// superCtor.prototype and stamps ctor.super_ = superCtor,
+		// exactly like real Node's own implementation. Delegates to the
+		// real global Object.setPrototypeOf rather than reimplementing
+		// prototype-chain manipulation here, so it shares whatever
+		// spec-correctness that already has.
+		m.Function("inherits", func(ctor, superCtor vm.Value) (vm.Value, error) {
+			ctorProto, err := functionPrototype(vmInst, ctor)
+			if err != nil {
+				return vm.Undefined, err
+			}
+			superProto, err := functionPrototype(vmInst, superCtor)
+			if err != nil {
+				return vm.Undefined, err
+			}
+			setProtoOf, ok := vmInst.GetGlobal("Object")
+			if !ok {
+				return vm.Undefined, fmt.Errorf("inherits: Object global missing")
+			}
+			setProtoOfFn, err := vmInst.GetProperty(setProtoOf, "setPrototypeOf")
+			if err != nil {
+				return vm.Undefined, err
+			}
+			if _, err := vmInst.Call(setProtoOfFn, vm.Undefined, []vm.Value{ctorProto, superProto}); err != nil {
+				return vm.Undefined, err
+			}
+			// The prototype-chain link above (the load-bearing part real
+			// callers actually depend on for `new Ctor() instanceof
+			// SuperCtor`) is real; this last step - stamping
+			// `ctor.super_ = superCtor`, matching real Node - is
+			// currently a silent no-op: vm.SetProperty has no
+			// TypeClosure/TypeFunction case (filed as paserati#500,
+			// alongside the identical gap functionPrototype above works
+			// around for the read side). No workaround here yet.
+			if err := vmInst.SetProperty(ctor, "super_", superCtor); err != nil {
+				return vm.Undefined, err
+			}
+			return vm.Undefined, nil
 		})
 		m.Default(nil)
 	})

@@ -138,25 +138,91 @@ func newJSURL(href string, base vm.Value) (*jsURL, error) {
 	}, nil
 }
 
+// hrefFromURLLike duck-types v as a URL instance (own `href`+`protocol`
+// string properties - real Node's own internal isURLInstance check is
+// a brand check this host has no equivalent for, since a returned
+// *jsURL value has no reliable link back to the URL class's own
+// prototype; see pathToFileURL's own doc comment), returning its href
+// if so. Shared by fs.go's pathArg (a real fs path argument) and
+// fileURLToPath above (both real Node APIs that accept a URL instance
+// or a string interchangeably).
+func hrefFromURLLike(v vm.Value) (string, bool) {
+	// vm.Value.AsPlainObject() panics for anything other than
+	// TypeObject (it is not a safe "nil for the wrong type" cast) -
+	// found the hard way here: a plain string or number argument
+	// reaching this duck-type check crashed the whole VM run with a Go
+	// panic (recovered, but as an opaque "[VM PANIC] recovered: value
+	// is not an object" rather than the ordinary ToString fallback this
+	// function's callers expect for a non-URL value.
+	if v.Type() != vm.TypeObject {
+		return "", false
+	}
+	obj := v.AsPlainObject()
+	if obj == nil {
+		return "", false
+	}
+	hrefVal, ok := obj.GetOwn("href")
+	if !ok || !hrefVal.IsString() {
+		return "", false
+	}
+	if _, ok := obj.GetOwn("protocol"); !ok {
+		return "", false
+	}
+	return hrefVal.ToString(), true
+}
+
+// fileURLStringToPath is url.fileURLToPath's real logic, factored out
+// so fs.go's pathArg (accepting a URL object as a real Node fs path
+// argument, e.g. readFileSync(new URL(..., import.meta.url))) can
+// share it instead of duplicating the scheme check/conversion.
+func fileURLStringToPath(fileURL string) (string, error) {
+	u, err := url.Parse(fileURL)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme != "file" {
+		return "", fmt.Errorf("fileURLToPath: must be a file URL")
+	}
+	return filepath.FromSlash(u.Path), nil
+}
+
 func declareURL(p *driver.Paserati) {
 	p.DeclareModule("url", func(m *driver.ModuleBuilder) {
 		m.Class("URL", &jsURL{}, newJSURL)
 		m.Class("URLSearchParams", &urlSearchParams{}, newURLSearchParams)
-		m.Function("fileURLToPath", func(fileURL string) (string, error) {
-			u, err := url.Parse(fileURL)
-			if err != nil {
-				return "", err
+		// Real Node's url.fileURLToPath() accepts a real URL instance or
+		// a string alike - this used to take a plain Go `string`
+		// parameter, so a URL object argument (the exact
+		// `fileURLToPath(pathToFileURL(p))` round trip real Node code
+		// uses) got auto-stringified generically instead of read via
+		// its `href`, breaking the moment pathToFileURL below was fixed
+		// to return a real URL object rather than a bare string.
+		m.Function("fileURLToPath", func(fileURLVal vm.Value) (string, error) {
+			if href, ok := hrefFromURLLike(fileURLVal); ok {
+				return fileURLStringToPath(href)
 			}
-			if u.Scheme != "file" {
-				return "", fmt.Errorf("fileURLToPath: must be a file URL")
-			}
-			return filepath.FromSlash(u.Path), nil
+			return fileURLStringToPath(fileURLVal.ToString())
 		})
-		m.Function("pathToFileURL", func(p string) (string, error) {
+		m.Function("pathToFileURL", func(p string) (*jsURL, error) {
+			// Real Node's url.pathToFileURL() returns a real URL
+			// instance, not a plain string - this used to return a bare
+			// Go string, which JS code that calls .href/.pathname/etc.
+			// on the result (a very common idiom: `require('url')
+			// .pathToFileURL(__filename).href` as a CJS-transpiled
+			// stand-in for `import.meta.url`) silently gets `undefined`
+			// back from, since a JS string has no such properties.
+			// Found chasing real vite's own CJS build
+			// (dist/node-cjs/publicUtils.cjs) under noderati: the
+			// resulting `undefined` became the *base* argument to a
+			// `new URL(relativePath, undefined)`, which WHATWG URL
+			// parsing treats as "no base at all" - correctly throwing
+			// "Invalid URL" for a relative-only string, but for the
+			// wrong reason (a silently-lost base, not a genuinely
+			// invalid path).
 			if !filepath.IsAbs(p) {
 				abs, err := filepath.Abs(p)
 				if err != nil {
-					return "", err
+					return nil, err
 				}
 				p = abs
 			}
@@ -164,7 +230,7 @@ func declareURL(p *driver.Paserati) {
 				Scheme: "file",
 				Path:   filepath.ToSlash(p),
 			}
-			return u.String(), nil
+			return newJSURL(u.String(), vm.Undefined)
 		})
 		m.Function("domainToASCII", func(domain string) (string, error) {
 			return idna.ToASCII(domain)

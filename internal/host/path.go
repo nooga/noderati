@@ -124,6 +124,52 @@ func declarePath(p *driver.Paserati) {
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:path", "path")
+
+	// `node:path/posix` and `node:path/win32` are real, standalone
+	// importable modules Node added alongside `path.posix`/`path.win32`
+	// (the same functions, just importable directly rather than only
+	// as a namespace property) - found missing chasing real vitest's
+	// own `startVitest()` under noderati: `import posix from
+	// "node:path/posix"` (used internally by vite's real dependency
+	// graph) failed with "No such built-in module" since only the
+	// `path.posix`/`path.win32` namespace forms existed. Same
+	// functions as the namespace blocks above, registered as their own
+	// top-level modules instead of nested under `path`.
+	p.DeclareModule("path/posix", func(m *driver.ModuleBuilder) {
+		m.Const("sep", "/")
+		m.Const("delimiter", ":")
+		m.Function("basename", func(p string) string { return gopath.Base(p) })
+		m.Function("dirname", gopath.Dir)
+		m.Function("extname", gopath.Ext)
+		m.Function("isAbsolute", gopath.IsAbs)
+		m.Function("join", func(parts ...string) string { return gopath.Join(parts...) })
+		m.Function("normalize", posixNormalize)
+		m.Function("resolve", posixResolve)
+		m.Function("relative", posixRelative)
+		m.Function("toNamespacedPath", func(p string) string { return p })
+		m.Function("parse", posixParse)
+		m.Function("format", func(obj map[string]interface{}) string { return formatPath("/", obj) })
+		m.Default(nil)
+	})
+	_ = p.DeclareModuleAlias("node:path/posix", "path/posix")
+
+	p.DeclareModule("path/win32", func(m *driver.ModuleBuilder) {
+		m.Const("sep", `\`)
+		m.Const("delimiter", ";")
+		m.Function("basename", win32Basename)
+		m.Function("dirname", win32Dirname)
+		m.Function("extname", win32Extname)
+		m.Function("isAbsolute", win32IsAbsolute)
+		m.Function("join", win32Join)
+		m.Function("normalize", win32Normalize)
+		m.Function("resolve", win32Resolve)
+		m.Function("relative", win32Relative)
+		m.Function("toNamespacedPath", func(p string) string { return p })
+		m.Function("parse", win32Parse)
+		m.Function("format", func(obj map[string]interface{}) string { return formatPath(`\`, obj) })
+		m.Default(nil)
+	})
+	_ = p.DeclareModuleAlias("node:path/win32", "path/win32")
 }
 
 // The top-level `path` module's functions delegate to Go's path/filepath,

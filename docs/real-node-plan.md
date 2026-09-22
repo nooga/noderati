@@ -15422,3 +15422,300 @@ post-13/13 candidate slate (after sql.js and eslint/typescript-eslint)
 to reach a genuine, byte-for-byte-matching-real-Node pass, and the
 first to also require multiple real, systemic noderati-side fixes
 (bugs 1-5 above) rather than only chasing upstream paserati issues.
+
+## Round 136: vitest probe - hit a real, pre-existing architectural wall (native `.node` addon loading via rollup), worked around it with rollup's own official WASM build, then found and fixed four more real noderati bugs chasing real vite's own module graph - CJS build loads end to end, ESM build isolates to one still-open gap
+
+Next candidate off the post-13/13 slate: real, unmodified `vitest@2.1.9`
+(`startVitest()`), chosen for a genuinely different shape than anything
+tested so far - a real test runner's own process/worker orchestration,
+not a bundler or linter.
+
+**Blocker 0 - native `.node` addon loading, confirmed as a real,
+pre-existing architectural gap, not a quick fix.** `vitest`/`vite` both
+depend on `rollup`, whose default parser is a compiled native binary
+(`@rollup/rollup-darwin-arm64`, a real, correctly-installed npm
+optional dependency). `import("rollup")` alone failed: noderati's
+`require()` has no native-addon loading at all (`process.dlopen`/N-API
+hosting), so it tried to parse the binary's raw bytes as JavaScript
+source ("Syntax Error: Invalid character") instead of loading it as a
+native module. This matches this doc's own long-standing "Native
+`.node` addon loading - unexplored" note precisely - a real, large,
+separate initiative (an N-API-compatible ABI inside a Go interpreter),
+not something to patch in passing. Asked the user how to proceed;
+chose to work around it rather than treat it as blocking or attempt it
+here: real rollup ships an official pure-JS/WASM build,
+`@rollup/wasm-node`, for exactly this situation (unsupported
+platforms) - aliased via `examples/package.json`'s `overrides` field
+(`"rollup": "npm:@rollup/wasm-node@^4"`), a legitimate alternate
+distribution of the same real project, not a shim written for this
+investigation. Confirmed real Node is unaffected by the override
+(`import("vite")` still succeeds); noderati's own `import("rollup")`
+alone then succeeded too, unblocking the rest of the investigation.
+
+**Bug 1 - fs path arguments only ever accepted a plain string,
+silently mis-stringifying a `URL` object to the literal text `"[object
+Object]"` instead (noderati-side, fixed directly, systemic - 17
+functions).** With rollup itself loading, `import("vite")` failed with
+`ENOENT: no such file or directory, open '[object Object]'`. Bisected
+down to real, unmodified `vite/dist/node/constants.js`:
+`` readFileSync(new URL("../../package.json", import.meta.url)) ``, an
+extremely common ESM idiom. Root cause: every `fs.*Sync` function
+(`readFileSync`, `writeFileSync`, `existsSync`, `statSync`, `mkdirSync`,
+`readdirSync`, `unlinkSync`, `renameSync`, `copyFileSync`, ... -17 in
+total) took a plain Go `string` parameter; paserati's generic
+reflection-based argument conversion coerces a non-string value via
+`vm.Value.ToString()`, which does not run the real JS ToString
+abstract operation (it never reaches an object's own `href`/custom
+`toString()`), producing the literal string `"[object Object]"` for
+any object argument - the same root shape as two bugs this codebase
+already fixed for Buffers (round 101, child_process.go round 135), now
+extended to URLs. Fixed by adding a shared `pathArg(vmInst, v
+vm.Value) (string, error)` helper (string passthrough, URL-object
+extraction via a new `hrefFromURLLike` duck-type check plus the
+existing `fileURLToPath` conversion logic - factored out as
+`fileURLStringToPath` so both share it - or a `valueToBytes` fallback
+for Buffer/TypedArray paths) and converting every one of those 17
+functions' Go signatures from `path string` to `pathVal vm.Value`.
+Verified directly: `fs.existsSync(new URL(...))`/
+`fs.readFileSync(new URL(...), "utf-8")` now match real Node exactly.
+
+**Bug 2 - `fs.readdir` (the classic callback-style async function, not
+`readdirSync`/`fs.promises.readdir`) was entirely missing (noderati-side,
+fixed directly).** Past the URL fix, `import("vite")` failed with
+`TypeError: The "original" argument must be of type function` -
+real vite's own dependency-scanning code does
+`` const readdir = promisify(fs$5.readdir) `` at module scope, and
+`fs.readdir` didn't exist under noderati at all (`fs.stat`, needed by
+the same line, already did). Added, mirroring the existing
+stat/lstat/access callback-style pattern (fs_async.go) and reusing
+`readdirEntries` (dirent.go) - the same helper `readdirSync` already
+calls - so `{withFileTypes: true}`/`{recursive: true}` behave
+identically between the sync and callback-style entry points. Verified
+directly against real Node: both the plain-names and
+`withFileTypes: true` shapes match exactly.
+
+**Bug 3 - `url.pathToFileURL()` returned a plain string, not a real
+`URL` instance (noderati-side, fixed directly).** Past bug 2,
+`import("vite")` failed with a bare, stack-less `TypeError: undefined
+is not a function`; requiring vite's CJS build instead (better error
+reporting - see the aside below) turned this into `Invalid URL:
+../../package.json`. Root cause: real vite's own CJS output does
+`` require('u'+'rl').pathToFileURL(__filename).href `` (a
+deliberately-obfuscated `require('url')`, presumably to dodge some
+bundler static-analysis heuristic) as a transpiled stand-in for
+`import.meta.url`; noderati's `pathToFileURL` returned a bare Go
+string, so `.href` on it was silently `undefined`, which then became
+the *base* argument to a later `new URL(relativePath, undefined)` -
+WHATWG URL parsing correctly treats an `undefined` base as "no base
+supplied," so the relative-only string correctly throws "Invalid URL,"
+just for the wrong reason (a lost base, not a genuinely bad path).
+Fixed: `pathToFileURL` now returns a real `*jsURL` (reusing the same
+`newJSURL` constructor `new URL(...)` itself calls) instead of a
+string. Confirmed `.href` now round-trips correctly; noted (not
+fixed - see aside) that the returned object is not `instanceof URL`,
+since nothing in this codebase currently tracks which prototype an
+auto-bound returned struct pointer should carry outside the `new
+X()` construction path itself.
+
+**Bug 4 (found while fixing bug 3) - `fileURLToPath()` broke on
+exactly the round trip it's meant for once bug 3 shipped
+(noderati-side, fixed directly).** `fileURLToPath(pathToFileURL(p))` -
+an existing, passing unit test (`TestURLFileRoundtrip`) and a real
+Node idiom alike - started failing the moment `pathToFileURL` began
+returning a real object instead of a string: `fileURLToPath` still
+took a plain `string` parameter, so it hit the *exact* bug 1 shape
+(`"[object Object]"`) on its own argument. Fixed identically: switched
+to a `vm.Value` parameter, extracting `href` via the same
+`hrefFromURLLike` helper bug 1 introduced (now shared by three call
+sites: `fs.go`'s `pathArg`, and both of `url.go`'s own functions).
+
+**A latent panic, found and fixed while verifying bug 4**: `hrefFromURLLike`'s
+first draft called `v.AsPlainObject()` unconditionally - a real,
+pre-existing paserati API footgun this codebase's own convention
+doesn't universally guard against: `AsPlainObject()` *panics* (not
+"returns nil") for anything other than `TypeObject`, unlike what
+several existing call sites elsewhere in this codebase (e.g.
+emitter.go's `pipe()` destination check) already assume. Passing a
+plain string to `fileURLToPath` crashed the whole VM run with a raw Go
+panic (recovered, but as an opaque `[VM PANIC] recovered: value is not
+an object` instead of the ordinary fallback path this function's
+callers expect). Fixed by checking `v.Type() == vm.TypeObject` before
+ever calling `AsPlainObject()` - worth a note for future call sites
+written the same way this one almost shipped.
+
+**Aside - module-load-time exceptions carry no stack trace, `require()`'s
+do**: repeatedly found across this round that a failure during
+`import()`'s own top-level module evaluation surfaces as a bare,
+stack-less message (`Runtime Error (<script>:1:1): ...`), while the
+identical failure reached via `require()` (vite's own CJS build,
+loaded through `createRequire`) carries a full, useful stack
+(`at ... /publicUtils.cjs:18:267`, etc.). Used this deliberately as a
+diagnostic technique this round - swapping a failing ESM import for
+its CJS equivalent to get a real stack trace - but it's plausibly a
+real, separate noderati gap in its own right (not investigated
+further this round).
+
+**Verification**: all four fixes confirmed directly against real
+Node's own behavior, not just inspected. `go vet ./...` clean; full
+suite (`go test ./... -skip TestEventsAddAbortListener -count=1`)
+clean (`TestURLSearchParamsIteration` reproduced its own
+already-documented pre-existing flakiness once mid-round, confirmed
+unrelated by rerunning immediately after - passed clean).
+
+With all four fixes in place, real, unmodified `vite`'s CJS build
+(`require("vite")`, via `createRequire`) now loads end to end under
+noderati. The ESM build (`import("vite")`, what `vitest` itself
+actually uses) still fails with a bare `TypeError: undefined is not a
+function` and no stack, somewhere inside the one remaining
+67,000-line bundled chunk (`dist/node/chunks/dep-BK3b2jBa.js`) that
+hasn't been isolated yet - its own ~40-import top-level preamble
+(`__cjs_fileURLToPath(import.meta.url)` etc.) was checked directly and
+works correctly in isolation as a real file, so the actual trigger is
+somewhere further into the chunk's body, not yet bisected.
+
+**Status**: vitest probe still open - CJS-vite loading is real,
+confirmed progress (and unblocked four real, systemic noderati bugs
+along the way), but the actual target (`vitest`'s own `startVitest()`,
+which needs the ESM build) isn't reached yet. Checking in before
+continuing further into the unbisected 67k-line chunk versus moving to
+a different post-13/13 candidate.
+
+## Round 136 (continued): the ESM build bisected to completion - `vite` and `vitest/node` now both load fully; six more real noderati bugs found and fixed; a real, pre-existing `http.createServer()` implementation discovered on an unmerged worktree branch and merged into `main`
+
+Kept going on the unbisected 67k-line chunk. Wrote a small
+acorn-based instrumentation tool
+([examples/instrument.mjs](../examples/instrument.mjs)) that inserts a
+`console.error` probe before every statement inside every
+`Program`/`BlockStatement` body in a target file (not just top-level -
+the earlier top-level-only version wasn't fine-grained enough once a
+single top-level statement turned out to span hundreds of lines),
+diffs cleanly against the pristine file, and is safe to re-run per
+file. Sanity-checked against real Node each time (probes must all fire
+and the import must still succeed) before trusting where noderati's
+own probes stopped.
+
+**Bug 6 - `os.type()` entirely missing (noderati-side, fixed
+directly).** Bisected the 67k-line chunk to
+`exports.isIBMi = os.type() === 'OS400'` inside real chokidar's own
+`dist/constants.js` (a real, transitive vite/vitest dependency, bundled
+inline). Added, mapping `runtime.GOOS` to the real uname-style strings
+(`"Darwin"`/`"Linux"`/`"Windows_NT"`) rather than reusing
+`os.platform()`'s lowercase spelling. Verified: matches real Node
+exactly on this host (`"Darwin"`).
+
+**Bug 7 (found chasing bug 6's next blocker) - a real, dangerous,
+pre-existing bug: `fs.openSync`/`fs.open` always opened
+`O_WRONLY|O_CREATE|O_TRUNC`, ignoring the real `flags` argument
+entirely (noderati-side, fixed directly).** The next blocker after
+`os.type()` was `promisify(fs.open)` failing the same way `readdir`
+did (missing entirely) - but fixing that first exposed something far
+worse: `fsOpen(path)` never looked at real Node's `flags` argument at
+all, so `fs.openSync(path)` (real Node default: `'r'`, read-only,
+`ENOENT` if missing) instead silently **created the file if missing
+and truncated it to empty if it existed** - confirmed directly (and
+accidentally reproduced against this very repo's own working tree
+mid-investigation: a stray zero-byte `package.json` appeared at
+`/Users/nooga/lab/noderati/package.json`, immediately deleted, not a
+real project file). Implemented a real `fsOpenFlags(flags)` mapping
+every documented Node open-flag string (`r`, `r+`, `rs+`, `w`, `wx`,
+`w+`, `wx+`, `a`, `ax`, `a+`, `ax+`) to the right Go `os.O_*` bits;
+`openSync`/async `open` both now read and pass the real flags
+argument, defaulting to `"r"` (real Node's own default) when omitted.
+Also added `fs.open`/`fs.close` (classic callback-style async - both
+entirely missing), which is what surfaced this in the first place
+(real chokidar's `NodeFsHandler` does
+`const open$2 = promisify$2(fs$7.open)` at module scope). Verified
+directly: `openSync(existing)` no longer truncates it; `openSync(missing)`
+correctly throws `ENOENT` instead of creating it.
+
+**Bug 8 - `util.inherits(ctor, superCtor)` entirely missing
+(noderati-side, fixed directly) - which surfaced two more real
+paserati-side gaps along the way, filed as paserati#500.** Next
+blocker: real, unmodified `http-proxy` (bundled into vite's own chunk)
+does `util.inherits(ProxyServer, EventEmitter3)` at module scope.
+Implementing it directly hit `vm.GetProperty(fn, "prototype")`
+returning `Undefined` for a real, freshly-declared `function Ctor(){}`
+- real JS lazily creates a function's own `.prototype` on first access
+(confirmed: `typeof Ctor.prototype === "object"` in real JS even
+before anything touches it), and this engine's own
+`FunctionObject.GetOrCreatePrototypeWithVM` clearly implements that
+lazy creation (ordinary bytecode `Ctor.prototype` access is correct),
+but the generic host-callable `GetProperty` API doesn't route through
+it for `TypeClosure`/`TypeFunction`. Separately, `vm.SetProperty` was
+found to silently no-op for any function value at all (`Foo.bar = 42`
+works via real bytecode, but `vm.SetProperty(fooValue, "bar", ...)`
+from Go host code does nothing - its switch has no
+`TypeClosure`/`TypeFunction` case). Filed both together as
+[paserati#500](https://github.com/nooga/paserati/issues/500). Worked
+around the read-side gap directly in noderati
+(`functionPrototype()`, calling `GetOrCreatePrototypeWithVM` directly
+for `TypeClosure`/`TypeFunction`, falling back to `GetProperty`
+otherwise) so `inherits()`'s actual load-bearing effect (the
+prototype-chain link real callers depend on for
+`new Ctor() instanceof SuperCtor`) works today; the write-side gap
+(`ctor.super_ = superCtor`, a real Node behavior but rarely
+introspected) has no workaround yet and stays a documented no-op
+pending the paserati fix. Verified `instanceof`/inherited-method
+behavior matches real Node exactly.
+
+**Bug 9 - `node:path/posix`/`node:path/win32` (standalone importable
+modules mirroring `path.posix`/`path.win32`) didn't exist at all
+(noderati-side, fixed directly).** Only the namespace-property form
+(`path.posix.join(...)`) existed; real, unmodified vite/vitest code
+does `import posix from "node:path/posix"` directly. Registered as
+two new top-level modules reusing the exact same functions the
+existing `path.posix`/`path.win32` namespaces already call. Verified
+directly against real Node.
+
+**Bug 10 - `events.EventEmitterAsyncResource` entirely missing
+(noderati-side, fixed directly).** Bisected further to real,
+unmodified `tinypool` (vitest's own real worker-pool dependency - its
+actual process/worker orchestration, exactly the shape this probe was
+chosen for) doing `class ... extends EventEmitterAsyncResource` (via
+`import { EventEmitterAsyncResource } from "node:events"`) at module
+scope. Implemented as a real subclass of the existing JS-shim
+`EventEmitter` (`internal/host/events.go`), delegating to the real,
+already-working `AsyncResource` (`node:async_hooks`) for
+`runInAsyncScope`/`emitDestroy`/`asyncId`/`triggerAsyncId` rather than
+reimplementing async-context tracking - `asyncId`/`triggerAsyncId` are
+real Node *getters* on this subclass specifically (unlike the base
+`AsyncResource`, where they're methods - checked directly against real
+Node before shipping, since guessing this shape wrong would have been
+an easy, silent mistake). Verified directly: matches real Node's
+`typeof e.asyncId === "number"` (not `"function"`) exactly.
+
+With bugs 6-10 fixed, both `import("vite")` and `import("vitest/node")`
+succeed completely under noderati. Reran the actual API surface this
+whole probe was aimed at
+(`startVitest("test", ["vitest-sample.test.js"], {watch: false, run:
+true})`, `examples/vitest_api_probe.mjs`) - progressed all the way into
+Vite's own `_createServer()` (vitest's dev-server-based module
+runner), reaching a new, precisely-isolated blocker:
+`TypeError: Right-hand side of 'instanceof' is not an object` at
+`handle instanceof http.Server` - **`http.Server`/`http.createServer`
+don't exist under noderati at all** (`internal/host/http.go` is
+explicitly, deliberately client-only by design - its own header
+comment says so - and `net.createServer` is equally explicitly
+"deliberately unbuilt" per this doc's own Round 69 entry). This is a
+different scale of gap than bugs 1-10 above: a real TCP+HTTP *server*
+(`net.createServer`, `http.createServer`, `Server`/`IncomingMessage`/
+`ServerResponse`) is a substantial subsystem, not a one-off fix.
+
+**Discovery**: checking in with the user surfaced that this exact
+subsystem already has real, working, committed code - just sitting on
+an until-now-unmerged worktree branch,
+`claude/node-server-worktree-075492`
+(`.claude/worktrees/charming-benz-5f15db`), 3 commits ahead of `main`:
+`http: implement createServer on Go's net/http.Server; verify against
+real Connect`, plus a `stream`/`signals` follow-up fix and a real
+`examples/compat/koa-server.mjs`. That branch was itself 30 commits
+*behind* `main` (missing every fix from Rounds 131-136). Merged
+`claude/node-server-worktree-075492` into `main` (a plain three-way
+merge - both branches had only diverged, no shared history was
+rewritten) to bring the two together.
+
+**Status**: `vite`/`vitest/node` loading is now **fully closed** -
+byte-for-byte the actual target this probe set out for. The real
+`startVitest()` run itself is next, now that a real `http.createServer()`
+exists on `main` post-merge - not yet attempted against the merged
+result this round.

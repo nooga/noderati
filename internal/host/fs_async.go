@@ -287,6 +287,43 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "rmdir", path, err))})
 		return vm.Undefined, nil
 	})
+	// open/close were entirely missing - found chasing real chokidar
+	// (a real, transitive vite/vitest dependency) under noderati: its
+	// own NodeFsHandler does `const open$2 = promisify$2(fs$7.open);`
+	// and `const close = promisify$2(fs$7.close);` at module scope,
+	// right next to the identical stat/lstat/realpath promisify calls
+	// this file already had callback-style variants for - open/close
+	// simply never got the same treatment. Reuse fsOpen/fsClose
+	// (fs.go), the same helpers openSync/closeSync already call, so the
+	// sync and callback-style entry points share one real
+	// implementation. Real fs.open(path[, flags[, mode]], callback)'s
+	// optional flags/mode args are accepted and ignored (matching
+	// openSync's own `_ ...interface{}` - flags/mode aren't modeled at
+	// this Go layer yet), same shape as stat/lstat/access's own
+	// optional leading args above.
+	m.Function("open", func(path string, opts ...vm.Value) (vm.Value, error) {
+		cb := findAsyncCallback(opts)
+		flags := "r"
+		for _, v := range opts {
+			if v.IsString() {
+				flags = v.ToString()
+				break
+			}
+		}
+		fd, err := fsOpen(path, flags)
+		if err != nil {
+			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "open", path, err))})
+			return vm.Undefined, nil
+		}
+		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, vm.IntegerValue(int32(fd))})
+		return vm.Undefined, nil
+	})
+	m.Function("close", func(fd int64, opts ...vm.Value) (vm.Value, error) {
+		cb := findAsyncCallback(opts)
+		err := fsClose(fd)
+		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "close", "", err))})
+		return vm.Undefined, nil
+	})
 	m.Function("realpath", func(path string, cb vm.Value) (vm.Value, error) {
 		resolved, err := filepath.EvalSymlinks(path)
 		if err != nil {
@@ -294,6 +331,45 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 			return vm.Undefined, nil
 		}
 		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, vm.NewString(resolved)})
+		return vm.Undefined, nil
+	})
+	// readdir was entirely missing - found chasing real vite under
+	// noderati: its own dependency-scanning code (dep-BK3b2jBa.js) does
+	// `const readdir = promisify(fs$5.readdir)` at module scope, and a
+	// real caller elsewhere does `this.#fs.readdir(fullpath, {
+	// withFileTypes: true }, cb)` - same trailing-options-then-callback
+	// shape as stat/lstat/access above, reusing readdirEntries
+	// (dirent.go), the exact helper readdirSync (fs.go) already calls,
+	// so withFileTypes/recursive behave identically between the sync
+	// and callback-style entry points.
+	m.Function("readdir", func(path string, opts ...vm.Value) (vm.Value, error) {
+		cb := vm.Undefined
+		optsMap := map[string]interface{}{}
+		for _, v := range opts {
+			if v.IsCallable() {
+				cb = v
+				continue
+			}
+			if obj := v.AsPlainObject(); obj != nil {
+				if wv, ok := obj.GetOwn("withFileTypes"); ok {
+					optsMap["withFileTypes"] = wv.IsTruthy()
+				}
+				if rv, ok := obj.GetOwn("recursive"); ok {
+					optsMap["recursive"] = rv.IsTruthy()
+				}
+			}
+		}
+		entries, err := readdirEntries(vmInst, path, optsMap)
+		if err != nil {
+			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "scandir", path, err))})
+			return vm.Undefined, nil
+		}
+		result := vm.NewArray()
+		resultArr := result.AsArray()
+		for _, e := range entries {
+			resultArr.Append(e)
+		}
+		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, result})
 		return vm.Undefined, nil
 	})
 	// access added alongside the others (docs/real-node-plan.md,

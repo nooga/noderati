@@ -93,14 +93,75 @@ func fsTouch(kind string, path string) {
 	})
 }
 
-func fsOpen(path string) (int64, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+// fsOpenFlags maps real Node's fs.open(Sync) flags string (default "r"
+// when omitted) to the Go os.OpenFile bits it actually means. Found the
+// hard way: the previous fsOpen(path) ignored flags entirely and always
+// opened O_WRONLY|O_CREATE|O_TRUNC - so `fs.openSync(path, "r")` (real
+// Node: open existing file read-only, ENOENT if missing) instead
+// silently created the file if it didn't exist, and silently truncated
+// it to empty if it did. A real, dangerous, pre-existing gap - not a
+// hypothetical, chasing real chokidar's own read-only file probing
+// under noderati is exactly what surfaced it. Every real flag Node
+// documents is mapped, not just the read-only case that happened to
+// matter here.
+func fsOpenFlags(flags string) (int, error) {
+	switch flags {
+	case "", "r":
+		return os.O_RDONLY, nil
+	case "rs", "sr":
+		return os.O_RDONLY, nil
+	case "r+":
+		return os.O_RDWR, nil
+	case "rs+", "sr+":
+		return os.O_RDWR, nil
+	case "w":
+		return os.O_WRONLY | os.O_CREATE | os.O_TRUNC, nil
+	case "wx", "xw":
+		return os.O_WRONLY | os.O_CREATE | os.O_TRUNC | os.O_EXCL, nil
+	case "w+":
+		return os.O_RDWR | os.O_CREATE | os.O_TRUNC, nil
+	case "wx+", "xw+":
+		return os.O_RDWR | os.O_CREATE | os.O_TRUNC | os.O_EXCL, nil
+	case "a":
+		return os.O_WRONLY | os.O_CREATE | os.O_APPEND, nil
+	case "ax", "xa":
+		return os.O_WRONLY | os.O_CREATE | os.O_APPEND | os.O_EXCL, nil
+	case "a+":
+		return os.O_RDWR | os.O_CREATE | os.O_APPEND, nil
+	case "ax+", "xa+":
+		return os.O_RDWR | os.O_CREATE | os.O_APPEND | os.O_EXCL, nil
+	default:
+		return 0, fmt.Errorf("Unknown file open flag: %s", flags)
+	}
+}
+
+func fsOpen(path string, flags string) (int64, error) {
+	goFlags, err := fsOpenFlags(flags)
+	if err != nil {
+		return 0, err
+	}
+	f, err := os.OpenFile(path, goFlags, 0644)
 	if err != nil {
 		return 0, err
 	}
 	id := fsFDID.Add(1)
 	fsFDs.Store(id, f)
 	return id, nil
+}
+
+// fsOpenFlagsArg picks the real Node flags-string argument out of
+// fs.open(Sync)'s optional `[flags[, mode]]` tail, defaulting to "r"
+// (real Node's own default) for anything else - omitted entirely, a
+// numeric fs.constants.O_* bitmask (not modeled at this layer yet), or
+// a callback (the async variant's own trailing argument, never a
+// flags string).
+func fsOpenFlagsArg(opts []interface{}) string {
+	if len(opts) > 0 {
+		if s, ok := opts[0].(string); ok {
+			return s
+		}
+	}
+	return "r"
 }
 
 func fsClose(fd int64) error {
@@ -145,10 +206,44 @@ func fsWrite(fd int64, data string) (int64, error) {
 	return int64(n), err
 }
 
+// pathArg extracts a filesystem path from a real Node fs path argument,
+// which can be a string, a Buffer/TypedArray (real Node decodes its
+// bytes as the path text), or a URL (a real `file:` URL - the same
+// conversion url.go's fileURLToPath exposes to JS, reused here as
+// fileURLStringToPath). Found via a real, extremely common ESM idiom
+// (real vite's own dist/node/constants.js: `readFileSync(new
+// URL("../../package.json", import.meta.url))`) that a plain `path
+// string` parameter type silently broke: it doesn't throw a helpful
+// error, it turns the URL object into the literal string "[object
+// Object]" - paserati's generic Go-string coercion for a non-string
+// value (vm.Value.ToString(), used by the reflection-based Function
+// wrapper for any `string`-typed parameter) doesn't run the real JS
+// ToString abstract operation, so it never reaches the URL's own
+// `href` - then reports a plausible-looking but wrong ENOENT for that
+// literal string. Not the Buffer.concat-on-a-string shape (silently
+// empty) this codebase has already fixed twice (round 101,
+// child_process.go last round), but the same root idea: a host
+// function typed to accept a plain string silently mis-stringifies a
+// real, valid non-string argument instead of handling or rejecting it
+// correctly.
+func pathArg(vmInst *vm.VM, v vm.Value) (string, error) {
+	if v.IsString() {
+		return v.ToString(), nil
+	}
+	if href, ok := hrefFromURLLike(v); ok {
+		return fileURLStringToPath(href)
+	}
+	return string(valueToBytes(vmInst, v)), nil
+}
+
 func declareFS(p *driver.Paserati) {
 	vmInst := p.GetVM()
 	p.DeclareModule("fs", func(m *driver.ModuleBuilder) {
-		m.Function("readFileSync", func(path string, opts ...interface{}) (vm.Value, error) {
+		m.Function("readFileSync", func(pathVal vm.Value, opts ...interface{}) (vm.Value, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return vm.Undefined, perr
+			}
 			fsTouch("read", path)
 			b, err := os.ReadFile(path)
 			if err != nil {
@@ -171,7 +266,11 @@ func declareFS(p *driver.Paserati) {
 			}
 			return vm.NewString(encodeBufferBytes(b, encoding)), nil
 		})
-		m.Function("writeFileSync", func(path string, data vm.Value, _ ...interface{}) (interface{}, error) {
+		m.Function("writeFileSync", func(pathVal vm.Value, data vm.Value, _ ...interface{}) (interface{}, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			// Real Node's fs.writeFileSync accepts a string or a real
 			// Buffer/TypedArray `data` argument and writes its raw
 			// bytes either way. valueToBytes (net.go) already draws
@@ -180,7 +279,11 @@ func declareFS(p *driver.Paserati) {
 			// mis-stringifying) a JS string as this used to.
 			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, valueToBytes(vmInst, data), 0644))
 		})
-		m.Function("appendFileSync", func(path string, data vm.Value) (interface{}, error) {
+		m.Function("appendFileSync", func(pathVal vm.Value, data vm.Value) (interface{}, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err != nil {
 				return nil, wrapFsErr(vmInst, "open", path, err)
@@ -189,17 +292,29 @@ func declareFS(p *driver.Paserati) {
 			_, err = f.Write(valueToBytes(vmInst, data))
 			return nil, wrapFsErr(vmInst, "write", path, err)
 		})
-		m.Function("existsSync", func(path string) bool {
+		m.Function("existsSync", func(pathVal vm.Value) bool {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return false
+			}
 			fsTouch("stat", path)
 			_, err := os.Stat(path)
 			return err == nil
 		})
-		m.Function("accessSync", func(path string, _ ...interface{}) (interface{}, error) {
+		m.Function("accessSync", func(pathVal vm.Value, _ ...interface{}) (interface{}, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			fsTouch("stat", path)
 			_, err := os.Stat(path)
 			return nil, wrapFsErr(vmInst, "access", path, err)
 		})
-		m.Function("chmodSync", func(path string, mode int64) (interface{}, error) {
+		m.Function("chmodSync", func(pathVal vm.Value, mode int64) (interface{}, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			return nil, wrapFsErr(vmInst, "chmod", path, os.Chmod(path, os.FileMode(mode)))
 		})
 		m.Namespace("constants", func(ns *driver.NamespaceBuilder) {
@@ -207,14 +322,22 @@ func declareFS(p *driver.Paserati) {
 				ns.Const(c.Name, c.Value)
 			}
 		})
-		m.Function("mkdirSync", func(path string, opts map[string]interface{}) (interface{}, error) {
+		m.Function("mkdirSync", func(pathVal vm.Value, opts map[string]interface{}) (interface{}, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			mkdirFn := os.Mkdir
 			if mkdirRecursiveRequested(opts) {
 				mkdirFn = os.MkdirAll
 			}
 			return nil, wrapFsErr(vmInst, "mkdir", path, mkdirFn(path, 0755))
 		})
-		m.Function("readdirSync", func(path string, opts map[string]interface{}) ([]vm.Value, error) {
+		m.Function("readdirSync", func(pathVal vm.Value, opts map[string]interface{}) ([]vm.Value, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			fsTouch("readdir", path)
 			entries, err := readdirEntries(vmInst, path, opts)
 			if err != nil {
@@ -222,13 +345,25 @@ func declareFS(p *driver.Paserati) {
 			}
 			return entries, nil
 		})
-		m.Function("unlinkSync", func(path string) (interface{}, error) {
+		m.Function("unlinkSync", func(pathVal vm.Value) (interface{}, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			return nil, wrapFsErr(vmInst, "unlink", path, os.Remove(path))
 		})
-		m.Function("rmdirSync", func(path string) (interface{}, error) {
+		m.Function("rmdirSync", func(pathVal vm.Value) (interface{}, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			return nil, wrapFsErr(vmInst, "rmdir", path, os.Remove(path))
 		})
-		m.Function("statSync", func(path string, _ ...interface{}) (*fsStats, error) {
+		m.Function("statSync", func(pathVal vm.Value, _ ...interface{}) (*fsStats, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			fsTouch("stat", path)
 			info, err := os.Stat(path)
 			if err != nil {
@@ -236,7 +371,11 @@ func declareFS(p *driver.Paserati) {
 			}
 			return newFsStats(vmInst, info), nil
 		})
-		m.Function("lstatSync", func(path string, _ ...interface{}) (*fsStats, error) {
+		m.Function("lstatSync", func(pathVal vm.Value, _ ...interface{}) (*fsStats, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			fsTouch("stat", path)
 			info, err := os.Lstat(path)
 			if err != nil {
@@ -244,12 +383,21 @@ func declareFS(p *driver.Paserati) {
 			}
 			return newFsStats(vmInst, info), nil
 		})
-		m.Function("realpathSync", func(path string, _ ...interface{}) (string, error) {
+		m.Function("realpathSync", func(pathVal vm.Value, _ ...interface{}) (string, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return "", perr
+			}
 			resolved, err := filepath.EvalSymlinks(path)
 			return resolved, wrapFsErr(vmInst, "realpath", path, err)
 		})
-		m.Function("openSync", func(path string, _ ...interface{}) (int64, error) {
-			fd, err := fsOpen(path)
+		m.Function("openSync", func(pathVal vm.Value, opts ...interface{}) (int64, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return 0, perr
+			}
+			flags := fsOpenFlagsArg(opts)
+			fd, err := fsOpen(path, flags)
 			return fd, wrapFsErr(vmInst, "open", path, err)
 		})
 		m.Function("closeSync", func(fd int64, _ ...interface{}) (interface{}, error) {
@@ -259,13 +407,33 @@ func declareFS(p *driver.Paserati) {
 			n, err := fsWrite(fd, data)
 			return n, wrapFsErr(vmInst, "write", "", err)
 		})
-		m.Function("copyFileSync", func(src, dst string) (interface{}, error) {
+		m.Function("copyFileSync", func(srcVal, dstVal vm.Value) (interface{}, error) {
+			src, perr := pathArg(vmInst, srcVal)
+			if perr != nil {
+				return nil, perr
+			}
+			dst, perr := pathArg(vmInst, dstVal)
+			if perr != nil {
+				return nil, perr
+			}
 			return nil, wrapFsErr(vmInst, "copyfile", src, copyFile(src, dst))
 		})
-		m.Function("renameSync", func(oldPath, newPath string) (interface{}, error) {
+		m.Function("renameSync", func(oldPathVal, newPathVal vm.Value) (interface{}, error) {
+			oldPath, perr := pathArg(vmInst, oldPathVal)
+			if perr != nil {
+				return nil, perr
+			}
+			newPath, perr := pathArg(vmInst, newPathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			return nil, wrapFsErr(vmInst, "rename", oldPath, os.Rename(oldPath, newPath))
 		})
-		m.Function("rmSync", func(path string) (interface{}, error) {
+		m.Function("rmSync", func(pathVal vm.Value) (interface{}, error) {
+			path, perr := pathArg(vmInst, pathVal)
+			if perr != nil {
+				return nil, perr
+			}
 			return nil, wrapFsErr(vmInst, "rm", path, os.RemoveAll(path))
 		})
 		declareFSAsync(m, vmInst)

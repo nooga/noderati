@@ -1,6 +1,8 @@
 package host
 
-const eventsShim = `class EventEmitter {
+const eventsShim = `import { AsyncResource } from "node:async_hooks";
+
+class EventEmitter {
   constructor() {
     this._events = Object.create(null);
   }
@@ -142,7 +144,48 @@ function addAbortListener(signal, listener) {
 }
 EventEmitter.addAbortListener = addAbortListener;
 
-export { EventEmitter, getMaxListeners, setMaxListeners, defaultMaxListeners, addAbortListener };
+// EventEmitterAsyncResource was entirely missing - found chasing real
+// tinypool (vitest's own real worker-pool dependency, its actual
+// process/worker orchestration - exactly what made this a worthwhile
+// probe target) under noderati: real, unmodified
+// tinypool/dist/index.js does 'class ... extends EventEmitterAsyncResource'
+// (via 'import { EventEmitterAsyncResource } from "node:events"') at
+// module scope. Real Node's own version binds an AsyncResource to an
+// EventEmitter so emitted events run within its own async execution
+// context (for async_hooks tracing) - implemented here by delegating
+// to the real AsyncResource this module already imports, rather than
+// reimplementing async-context tracking from scratch.
+class EventEmitterAsyncResource extends EventEmitter {
+  constructor(options) {
+    let name = "EventEmitterAsyncResource";
+    let asyncResourceOptions;
+    let emitterOptions;
+    if (typeof options === "string") {
+      name = options;
+    } else if (options && typeof options === "object") {
+      const { name: optName, ...rest } = options;
+      if (optName) name = optName;
+      asyncResourceOptions = rest;
+      emitterOptions = rest;
+    }
+    super(emitterOptions);
+    this.asyncResource = new AsyncResource(name, asyncResourceOptions);
+  }
+  emit(...args) {
+    return this.asyncResource.runInAsyncScope(() => super.emit(...args), this);
+  }
+  emitDestroy() {
+    this.asyncResource.emitDestroy();
+  }
+  get asyncId() {
+    return this.asyncResource.asyncId();
+  }
+  get triggerAsyncId() {
+    return this.asyncResource.triggerAsyncId();
+  }
+}
+
+export { EventEmitter, EventEmitterAsyncResource, getMaxListeners, setMaxListeners, defaultMaxListeners, addAbortListener };
 export default EventEmitter;
 `
 

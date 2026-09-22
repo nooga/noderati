@@ -24,6 +24,26 @@ func hostEndianness() string {
 	return "BE"
 }
 
+// hostOSType implements real Node's os.type(): the uname-style system
+// name ("Linux", "Darwin", "Windows_NT"), not the lowercase runtime.GOOS
+// spelling os.platform() already exposes. Found chasing real chokidar's
+// own dist/constants.js under noderati (a real, transitive vite/vitest
+// dependency): `exports.isIBMi = os.type() === 'OS400'` at module scope,
+// which threw "undefined is not a function" since os.type didn't exist
+// at all.
+func hostOSType() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "Darwin"
+	case "linux":
+		return "Linux"
+	case "windows":
+		return "Windows_NT"
+	default:
+		return runtime.GOOS
+	}
+}
+
 func declareOS(p *driver.Paserati) {
 	eol := "\n"
 	if runtime.GOOS == "windows" {
@@ -53,6 +73,7 @@ func declareOS(p *driver.Paserati) {
 		})
 		m.Function("cpus", cpuInfos)
 		m.Function("endianness", hostEndianness)
+		m.Function("type", hostOSType)
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:os", "os")
