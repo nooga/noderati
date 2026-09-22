@@ -16894,3 +16894,45 @@ specifically - a distinct, later stage of the exact same real-world
 `iconv-lite` pattern `#512` partially unblocked. `go vet`/full suite
 clean throughout.
 
+## Round 147: paserati#514 pulled and confirmed fixed - `express`'s POST path (real `iconv-lite`, real `express.json()`) now works end to end
+
+Pulled paserati `main`. `git merge --ff-only` refused with "diverging
+branches" - the local checkout's own `#514` commit (`00e86437`) and
+origin's (`97c42851`) had different hashes despite being the fix for
+the same issue with the identical parent (`ac2eb65c`); `git diff
+00e86437 97c42851` came back empty, confirming it was an upstream
+rebase/re-push of byte-identical content, not a real divergence, so
+`git reset --hard origin/main` was the correct (and safe) way to
+fast-forward a sibling dependency checkout that isn't the source of
+truth for any work of ours.
+
+Rebuilt `noderati` against paserati `97c42851`. Full suite (`go
+vet`/`go test ./...`) passes clean - no regression this time, unlike
+`#512`. Ran paserati's own new regression test directly
+(`TestClassConstructorCallInitializesThisInPlace`, in
+`pkg/driver/issue_514_test.go`) - passes.
+
+Re-ran the real, unmodified `express_probe.mjs` end to end against the
+rebuilt binary:
+
+- `GET /` (etag) - 200, real `Etag` header, byte-identical to real
+  Express
+- `GET /users/:id?foo=bar` (route params + query string) - 200,
+  `{"id":"42","query":{"foo":"bar"}}`
+- `POST /echo` with a real JSON body, through real `express.json()` -
+  through real `iconv-lite`'s `InternalDecoder`/`StringDecoder.call(this,
+  ...)` prototype-and-constructor-borrowing pattern - 200,
+  `{"received":{"hello":"world","n":42}}`
+- unmatched route - 404, real Express JSON error shape
+
+All four routes now work, byte-for-byte matching real Express/Node
+behavior. This closes out the `iconv-lite` construction/method-binding
+saga that spanned `#512` and `#514`: real, unmodified `iconv-lite` now
+works correctly under noderati end to end, and so does everything
+built on top of it (`express.json()`'s body parsing, most
+`Content-Type: application/json` request handling in general).
+
+**Status**: `express` probe fully passes (GET with params/query/etag,
+POST with a real JSON body, 404 fallback). `#512` and `#514` are both
+closed and both load-bearing. `go vet`/full suite clean.
+
