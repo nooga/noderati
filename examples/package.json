@@ -13,6 +13,7 @@
     "escape-string-regexp": "^5.0.0",
     "eslint": "9.36.0",
     "express": "^4.22.3",
+    "jsonwebtoken": "^9.0.3",
     "koa": "^3.2.1",
     "minimatch": "^10.0.1",
     "semver": "^7.7.1",

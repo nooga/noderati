@@ -16447,3 +16447,115 @@ TypedArray), #500 (function-as-object property access), and #501
 (import/parameter shadowing), all still open upstream. Picking a
 fresh target next round that doesn't depend on any of these four,
 rather than waiting on them.
+
+## Round 142: real, unmodified `jsonwebtoken` - full HS256 sign/verify/decode round-trip working end to end, RS256 flagged as a real, honest, separate gap
+
+Deliberately picked a non-server target this round: `express`'s POST
+path is blocked on paserati#503 (any long-lived server + a first-time
+`require()` anywhere in a request handler deadlocks), and `fastify`/
+`ws` would hit the exact same wall immediately, being equally
+server-based. `jsonwebtoken` stresses `crypto.go` instead - real,
+common, well-defined, no listening server involved anywhere in its own
+code, so no risk of landing on #503 by construction.
+
+Verified throughout by running the exact same probe script against
+both `noderati` and real Node (`node --version` v26.3.0, available on
+this machine) and diffing the two outputs directly - not just checking
+that noderati didn't crash.
+
+**Bug 1 - `crypto.KeyObject` didn't exist at all.** Real,
+unmodified `jsonwebtoken@9`'s own `sign.js` does
+`secretOrPrivateKey instanceof KeyObject` unconditionally, for every
+algorithm including plain HS256 with a string secret - with no
+`KeyObject` export anywhere on this module, that line threw "Right-hand
+side of 'instanceof' is not an object" before a single token could be
+signed. Added `KeyObject` as a nominal marker class (matching
+http_shim.go's existing `Server`/`IncomingMessage`/`ServerResponse`
+precedent) - a plain string secret correctly answers `false` to the
+`instanceof` check without this class needing to do anything beyond
+existing.
+
+**Bug 2 - `crypto.createSecretKey`/`createPrivateKey`/
+`createPublicKey` didn't exist.** Once `instanceof KeyObject` stopped
+throwing, `sign.js`'s own fallback chain (`createPrivateKey(secret)`,
+caught, then `createSecretKey(Buffer.from(secret))`) had nothing to
+call. Added a real, working `createSecretKey(keyMaterial)`: returns a
+plain object with `.type === "secret"` and a callable `.export()`
+returning the raw bytes as a real Buffer - exactly the shape both
+`jsonwebtoken`'s own `sign.js` (`.type` check) and `jwa` (jsonwebtoken's
+signing engine, via its own `checkIsSecretKey` guard - `.export`
+callable) require, verified by reading both directly rather than
+guessing at the contract. `createPrivateKey`/`createPublicKey` are
+real, honestly-unimplemented stubs (throw when actually called) -
+`createPrivateKey`'s stub throwing is itself load-bearing: `sign.js`
+relies on it throwing so its `catch` falls through to
+`createSecretKey` for a plain HMAC secret, exactly mirroring what real
+Node's own `createPrivateKey` does when handed key material that isn't
+actually a private key.
+
+**Bug 3 - `createHmac(algorithm, key)` couldn't accept a `KeyObject`
+argument.** Real Node's `createHmac` accepts a `KeyObject` directly,
+not just a string/Buffer - and real, unmodified `jwa`'s own
+`createHmacSigner` passes exactly `createSecretKey`'s own result
+straight through as `key`. The existing `valueToBytes` helper (shared
+with streams/sockets/buffers generally) has no way to know about this
+crypto-specific object shape, and would have silently stringified it
+into garbage (`"[object Object]"`) instead of throwing - a silent
+wrong-signature bug, not a crash. Added `keyBytesFromValue`, which
+checks for `createSecretKey`'s own internal-slot marker first
+(`obj.InternalSlots()`, the same mechanism `pendingStreamData` already
+uses in emitter.go) and falls back to `valueToBytes` for everything
+else, and switched `createHmac` to use it.
+
+**Bug 4 - `crypto.timingSafeEqual` was missing entirely, sending real
+code down a broken, incompatible-but-installed compat fallback path
+instead.** `jwa`'s own `createHmacVerifier` does
+`'timingSafeEqual' in crypto ? crypto.timingSafeEqual(...) :
+require('buffer-equal-constant-time')(...)` - a real, unconditional
+check on every HS256 `jwt.verify()` call. With it missing, real code
+silently took the fallback branch, which itself references
+`require('buffer').SlowBuffer.prototype` - a *second*, real, separate
+gap (`SlowBuffer` isn't implemented at all) that would have needed its
+own fix. Added a real `crypto.timingSafeEqual(a, b)` (Go's own
+`crypto/subtle.ConstantTimeCompare`) instead of chasing `SlowBuffer` -
+this is what real Node itself has, so real code takes the fast,
+correct path and never touches the fallback at all, exactly matching
+real Node's own behavior rather than papering over the fallback's own
+separate bug.
+
+With all four fixed, a **full real JWT round trip - sign, verify,
+decode, an expired token correctly rejected as `TokenExpiredError`, a
+tampered/wrong-secret token correctly rejected as `JsonWebTokenError`
+- now works completely under noderati**, verified by running the
+identical probe script against real Node (v26.3.0) side by side and
+diffing the output: matching field-for-field (payload contents, error
+names, error messages), byte-different only where expected (the actual
+HMAC signature bytes, which depend on wall-clock `iat`/`exp` timestamps
+that differ between the two runs).
+
+**RS256 (asymmetric) flagged as a real, separate, honest gap, not
+attempted this round.** Real Node's `generateKeyPairSync`/full
+`createPublicKey`/`createPrivateKey` (actual RSA key
+generation/parsing) and RSA-PKCS1v15 signing aren't implemented -
+`crypto.go`'s `createPrivateKey`/`createPublicKey` exist only as
+KeyObject-feature-detection stubs (see bug 2), deliberately still
+throwing if a caller actually tries to use them for real asymmetric key
+material. A substantially larger, separate feature (real key
+parsing/generation via Go's own `crypto/rsa`+`crypto/x509`+
+`encoding/pem`) than this round's scope - the probe's own final check
+confirms this fails the way it's expected to (`generateKeyPairSync`
+throwing "not a function"), rather than silently pretending to work.
+
+**Verification**: `go vet ./...` clean; full suite clean. Every claim
+in this entry - the working HS256 round trip, the exact error
+names/messages, the RS256 gap - checked by running the exact same
+script against real Node directly, not assumed from reading library
+source alone.
+
+**Status**: `jsonwebtoken`'s HS256 path (the overwhelmingly common
+real-world case - sign, verify, decode, expiry, tampering) is fully
+verified working end to end. RS256/asymmetric algorithms remain a
+real, documented gap for a future, dedicated round. Four real,
+independent noderati bugs found and fixed this round, all in
+`crypto.go` - none of them depended on any of the four currently-open
+paserati issues (#500-#503).

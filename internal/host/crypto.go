@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -20,6 +21,69 @@ import (
 type hashHasher struct {
 	h      hash.Hash
 	vmInst *vm.VM
+}
+
+// keyObjectMarker backs crypto.KeyObject - a nominal marker only, the
+// same "exists so instanceof doesn't throw" shape as http_shim.go's own
+// Server/IncomingMessage/ServerResponse. Real Node's KeyObject wraps an
+// actual asymmetric/symmetric key with export()/type/asymmetricKeyType/
+// etc, none of which is implemented here - found via real, unmodified
+// jsonwebtoken: sign.js does
+// `secretOrPrivateKey instanceof KeyObject` unconditionally, for every
+// algorithm, even HS256 with a plain string secret - with no KeyObject
+// export on this module at all, that line threw "Right-hand side of
+// 'instanceof' is not an object" immediately, before a single token
+// could ever be signed. A plain string/Buffer secret (the only kind
+// this file's own createHmac/createHash support today) correctly
+// answers `false` to that check without this class needing to do
+// anything beyond existing. createSecretKey below builds its own
+// separate object (not chained to this marker's prototype - nothing
+// downstream ever re-checks `instanceof KeyObject` on its result, only
+// `.type`/`.export`, so the two don't need to share a prototype).
+type keyObjectMarker struct{}
+
+// secretKeyObjectData is the internal payload createSecretKey's own
+// returned object carries - checked directly by keyBytesFromValue
+// (below) so createHmac/createHash can recover the real key bytes
+// without a JS round-trip through .export().
+type secretKeyObjectData struct {
+	secret []byte
+}
+
+// createSecretKeyObject builds the plain object real Node's own
+// crypto.createSecretKey(keyMaterial) returns: `.type === "secret"`
+// (checked directly by jsonwebtoken's own sign.js once a plain secret
+// has been wrapped) and a callable `.export()` (checked by jwa's own
+// checkIsSecretKey guard, which every real HS256 sign/verify call goes
+// through) that hands back the raw bytes as a real Buffer.
+func createSecretKeyObject(vmInst *vm.VM, secret []byte) vm.Value {
+	obj := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+	obj.SetInternalSlots(&secretKeyObjectData{secret: secret})
+	obj.SetOwn("type", vm.NewString("secret"))
+	obj.SetOwn("symmetricKeySize", vm.NumberValue(float64(len(secret))))
+	obj.SetOwn("export", vm.NewNativeFunction(0, true, "export", func(_ []vm.Value) (vm.Value, error) {
+		return wrapBuffer(vmInst, secret), nil
+	}))
+	return vm.NewValueFromPlainObject(obj)
+}
+
+// keyBytesFromValue recovers raw key material from a value that might
+// be one of createSecretKey's own KeyObject-shaped objects (checked via
+// its internal slot, no JS call needed) - used by createHmac so a
+// KeyObject argument (real Node accepts one directly, and real,
+// unmodified jwa's own createHmacSigner passes exactly the
+// createSecretKey result straight through) is unwrapped correctly
+// instead of being stringified into garbage by valueToBytes' own
+// generic ".toString()" fallback for a plain object.
+func keyBytesFromValue(vmInst *vm.VM, v vm.Value) []byte {
+	if v.Type() == vm.TypeObject {
+		if obj := v.AsPlainObject(); obj != nil {
+			if data, ok := obj.InternalSlots().(*secretKeyObjectData); ok {
+				return data.secret
+			}
+		}
+	}
+	return valueToBytes(vmInst, v)
 }
 
 // Update accepts a real vm.Value (not a plain Go string) and extracts
@@ -142,6 +206,27 @@ func declareCrypto(p *driver.Paserati) {
 			}
 			return arr
 		})
+		// timingSafeEqual(a, b): missing entirely - found via real,
+		// unmodified jsonwebtoken/jwa: jwa's own createHmacVerifier calls
+		// `'timingSafeEqual' in crypto ? crypto.timingSafeEqual(...) :
+		// require('buffer-equal-constant-time')(...)`, unconditionally,
+		// for every HS256 verify() call - with this missing, real code
+		// silently took the `buffer-equal-constant-time` fallback branch
+		// instead (a real, separate npm package, still installed as a
+		// transitive dependency for exactly this compat case), which
+		// itself references `require('buffer').SlowBuffer.prototype` - a
+		// second, real gap (SlowBuffer isn't implemented at all here)
+		// this sidesteps entirely by giving real code the fast path it
+		// actually expects to take. Panics (a length mismatch) rather
+		// than erroring: real Node's own timingSafeEqual throws
+		// synchronously for exactly this, not a JS-catchable rejection.
+		m.Function("timingSafeEqual", func(a, b vm.Value) (bool, error) {
+			aBytes, bBytes := valueToBytes(vmInst, a), valueToBytes(vmInst, b)
+			if len(aBytes) != len(bBytes) {
+				return false, fmt.Errorf("Input buffers must have the same byte length")
+			}
+			return subtle.ConstantTimeCompare(aBytes, bBytes) == 1, nil
+		})
 		m.Function("createHash", func(algo string) (*hashHasher, error) {
 			switch strings.ToLower(algo) {
 			case "md5":
@@ -177,7 +262,7 @@ func declareCrypto(p *driver.Paserati) {
 		// Buffer/Uint8Array key (the previous HMAC round's own raw
 		// digest output) just as often as a plain string one.
 		m.Function("createHmac", func(algo string, key vm.Value) (*hashHasher, error) {
-			keyBytes := valueToBytes(vmInst, key)
+			keyBytes := keyBytesFromValue(vmInst, key)
 			switch strings.ToLower(algo) {
 			case "md5":
 				return &hashHasher{h: hmac.New(md5.New, keyBytes), vmInst: vmInst}, nil
@@ -192,6 +277,40 @@ func declareCrypto(p *driver.Paserati) {
 			default:
 				return nil, fmt.Errorf("Digest algorithm %q is not supported", algo)
 			}
+		})
+		m.Class("KeyObject", &keyObjectMarker{}, func() (*keyObjectMarker, error) {
+			return nil, fmt.Errorf("crypto.KeyObject is not constructible directly")
+		})
+		// createSecretKey(keyMaterial): real Node wraps any HMAC secret in
+		// one of these before using it, and real, unmodified jsonwebtoken's
+		// own sign.js does exactly that for every HS256 token
+		// (`createSecretKey(Buffer.from(secretOrPrivateKey))`), then reads
+		// `.type` straight off the result to confirm it's usable for an
+		// HS* algorithm - a real, unconditional call, not a hypothetical
+		// one. See createSecretKeyObject's own doc comment for the shape
+		// jwa's own checkIsSecretKey guard additionally requires
+		// (`.export()` callable).
+		m.Function("createSecretKey", func(key vm.Value) (vm.Value, error) {
+			return createSecretKeyObject(vmInst, valueToBytes(vmInst, key)), nil
+		})
+		// createPublicKey/createPrivateKey: real asymmetric-key support
+		// (RSA/EC key parsing, sign()/verify() against them) isn't
+		// implemented here at all - an honest, flagged gap, not a silent
+		// one. createPublicKey exists as a real function anyway because
+		// real, unmodified jwa (jsonwebtoken's own signing/verification
+		// engine) feature-detects KeyObject support this exact way:
+		// `var supportsKeyObjects = typeof crypto.createPublicKey ===
+		// 'function'`, unconditionally, at module load - with it
+		// undefined, jwa treats KeyObjects as universally unsupported and
+		// rejects createSecretKey's own result (a real KeyObject-shaped
+		// value) before ever reaching the `.type`/`.export` checks that
+		// would otherwise accept it, breaking plain HS256 signing too,
+		// not just RS256/ES256.
+		m.Function("createPublicKey", func(_ vm.Value) (vm.Value, error) {
+			return vm.Undefined, fmt.Errorf("crypto.createPublicKey is not implemented")
+		})
+		m.Function("createPrivateKey", func(_ vm.Value) (vm.Value, error) {
+			return vm.Undefined, fmt.Errorf("crypto.createPrivateKey is not implemented")
 		})
 		m.Default(nil)
 	})
