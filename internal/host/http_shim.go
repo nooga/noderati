@@ -53,6 +53,8 @@ function get(urlOrOptions, maybeOptionsOrCb, maybeCb) {
   return req;
 }
 
+__NODERATI_CREATE_SERVER__
+
 __NODERATI_EXPORTS__
 `
 
@@ -72,7 +74,29 @@ __NODERATI_EXPORTS__
 // edge case.
 const httpMaxHeaderSizeDecl = "const maxHeaderSize = 16384;"
 
-func renderHTTPShim(scheme string, withMaxHeaderSize bool) string {
+// createServerDecl is only wired into node:http's shim, not node:https' -
+// doHTTPCreateServer (http_server.go) builds a plain-TCP net/http.Server,
+// with no TLS equivalent yet, so https.createServer stays unavailable
+// rather than silently handing back an insecure server under a secure
+// name.
+// Server is a nominal marker class, not what createServer() actually
+// returns (that's a plain EventEmitter-shaped object built in Go - see
+// doHTTPCreateServer/http_server.go) - real Connect's own use() (index.js)
+// unconditionally runs `handle instanceof http.Server` against every
+// middleware function it's given, which throws outright ("Right-hand side
+// of 'instanceof' is not an object") if http.Server doesn't exist at all,
+// not just evaluate false. Every real call site in Connect only ever
+// checks this against a plain function (never against a real server
+// object), so a class that exists without appearing in createServer()'s
+// own prototype chain is enough to stop that throw without needing full
+// prototype wiring between the two.
+const createServerDecl = `class Server {}
+function createServer(optionsOrRequestListener, maybeRequestListener) {
+  const requestListener = typeof optionsOrRequestListener === "function" ? optionsOrRequestListener : maybeRequestListener;
+  return globalThis.__noderatiHTTPCreateServer(requestListener);
+}`
+
+func renderHTTPShim(scheme string, withMaxHeaderSize bool, withCreateServer bool) string {
 	s := strings.ReplaceAll(httpModuleShimTemplate, "__NODERATI_SCHEME__", scheme)
 	exportsList := "request, get, Agent"
 	defaultExports := "{ request, get, Agent }"
@@ -82,10 +106,17 @@ func renderHTTPShim(scheme string, withMaxHeaderSize bool) string {
 		exportsList = "request, get, Agent, maxHeaderSize"
 		defaultExports = "{ request, get, Agent, maxHeaderSize }"
 	}
+	createServer := ""
+	if withCreateServer {
+		createServer = createServerDecl
+		exportsList += ", createServer, Server"
+		defaultExports = strings.Replace(defaultExports, "}", ", createServer, Server }", 1)
+	}
 	s = strings.ReplaceAll(s, "__NODERATI_MAX_HEADER_SIZE__", maxHeaderSizeDecl)
+	s = strings.ReplaceAll(s, "__NODERATI_CREATE_SERVER__", createServer)
 	s = strings.ReplaceAll(s, "__NODERATI_EXPORTS__", "export { "+exportsList+" };\nexport default "+defaultExports+";")
 	return s
 }
 
-var httpShim = renderHTTPShim("http", true)
-var httpsShim = renderHTTPShim("https", false)
+var httpShim = renderHTTPShim("http", true, true)
+var httpsShim = renderHTTPShim("https", false, false)

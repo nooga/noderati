@@ -25,11 +25,16 @@ go build -o noderati ./cmd/noderati
   `assert`, `buffer`, `events`, `crypto`, `child_process.spawnSync`, `readline`,
   `tty`, `worker_threads`, `perf_hooks`, `module` (`createRequire`), `constants`,
   plus `node:` aliases
+- `http`/`https` client (`request`/`get`/`Agent`) on Go's `net/http.Client`;
+  `http.createServer` (real Connect/Koa-style `app.listen()`) on Go's
+  `net/http.Server` - two independent implementations, not layered on
+  each other; `net` is still client-only (`net.connect`), no
+  `net.createServer`
 - `require()` for CommonJS; ESM `import` of CJS packages (default export)
 - `node_modules` resolution (incl. package.json `"imports"` `#specifiers`);
   relative imports from the real OS path of the entry file
-- Not yet: `net`/`tls`, N-API, a real `stream` beyond a basic EventEmitter base,
-  a real `string_decoder`
+- Not yet: `net.createServer`/`tls` server, N-API, a real `stream` beyond a
+  basic EventEmitter base, a real `string_decoder`
 
 This list is the shipped Node surface only. For the actual state of the effort
 — what's a real implementation vs. a package-specific fake still waiting to be
