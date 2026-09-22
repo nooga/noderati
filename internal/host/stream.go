@@ -423,17 +423,45 @@ class Transform extends EventEmitter {
   _flush(callback) {
     callback();
   }
+  // _write, calling _transform by default, exists so an instance-level
+  // _write override (not a subclass's own _transform override) still
+  // gets consulted - real Node's own Transform genuinely is a Writable
+  // (its _write internally drives _transform), so write()/end() below
+  // call this._write rather than this._transform directly. Found the
+  // hard way chasing real vite's own dependency (fast-glob's
+  // ReaderStream.static(), bundled into vite's real dep chunk) under
+  // noderati: it does const stream = new PassThrough({objectMode:
+  // true}); stream._write = (index, enc, done) => {...} - a plain,
+  // real Node idiom (assign _write directly on the instance, no
+  // subclassing) - and this write()/end() calling this._transform
+  // straight through meant that override was never consulted at all:
+  // every write() silently ran PassThrough's own default identity
+  // _transform instead, the real override's own done() (which is
+  // what was supposed to eventually call stream.end()) never ran, and
+  // the stream never emitted "end" - hanging a real vite dev-server
+  // startup (dependency pre-bundling) forever with no error, not just
+  // a synthetic repro.
+  _write(chunk, encoding, callback) {
+    this._transform(chunk, encoding, (err, data) => {
+      if (err) {
+        callback(err);
+        return;
+      }
+      if (data !== undefined && data !== null) this.emit("data", data);
+      callback();
+    });
+  }
   write(chunk, encoding, cb) {
     if (typeof encoding === "function") {
       cb = encoding;
       encoding = undefined;
     }
-    this._transform(chunk, encoding, (err, data) => {
+    this._write(chunk, encoding, (err) => {
       if (err) {
         this.emit("error", err);
+        if (typeof cb === "function") cb(err);
         return;
       }
-      if (data !== undefined && data !== null) this.emit("data", data);
       if (typeof cb === "function") cb();
     });
     return true;
@@ -455,12 +483,11 @@ class Transform extends EventEmitter {
       if (typeof cb === "function") cb();
     };
     if (chunk !== undefined) {
-      this._transform(chunk, encoding, (err, data) => {
+      this._write(chunk, encoding, (err) => {
         if (err) {
           this.emit("error", err);
           return;
         }
-        if (data !== undefined && data !== null) this.emit("data", data);
         this._flush(finishUp);
       });
     } else {

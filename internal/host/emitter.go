@@ -1,6 +1,8 @@
 package host
 
 import (
+	"fmt"
+
 	"github.com/nooga/paserati/pkg/vm"
 )
 
@@ -332,22 +334,62 @@ func removeListener(obj *vm.PlainObject, event string, listener vm.Value) vm.Val
 	return vm.NewValueFromPlainObject(obj)
 }
 
+// reportIfUnhandledError implements real Node's own special-cased
+// EventEmitter contract: emitting "error" with no listener registered
+// crashes the process (throwing the error itself when it's a real
+// Error, or a generic "Unhandled error." otherwise) instead of
+// silently doing nothing, unlike every other event name. Found
+// chasing real tinypool's own worker-pool setup under noderati:
+// worker/fork creation failures (both worker_threads.Worker and
+// child_process.fork are still unimplemented) get reported via
+// `this.emit('error', err)` internally with no listener yet attached,
+// and this used to just return false - not a visible crash, a
+// promise nothing would ever settle, hanging forever instead of
+// failing loudly. Every call site of emitOnObject already treats a
+// listener's own thrown exception as unconditionally
+// process-crashing (reportUncaughtCallbackException, just above this
+// function) regardless of whether the call originated synchronously
+// from JS or from a background goroutine's own error path - this
+// matches that same existing precedent for the "nobody's listening
+// for error at all" case too, rather than threading a distinguishable
+// Go error back through every one of this function's ~30 call sites.
+// A synchronous `try { emitter.emit('error', e) } catch {}` in real
+// Node would catch the throw locally instead of crashing - this
+// still crashes the whole process for that case, the same known,
+// pre-existing imprecision the listener-throw path above already
+// has, not a new one introduced here.
+func reportIfUnhandledError(vmInst *vm.VM, event string, args []vm.Value) bool {
+	if event != "error" {
+		return false
+	}
+	var er vm.Value = vm.Undefined
+	if len(args) > 0 {
+		er = args[0]
+	}
+	reportUncaughtCallbackException(vmInst, unhandledErrorEventError(er))
+	return false
+}
+
+func unhandledErrorEventError(er vm.Value) error {
+	return fmt.Errorf("Unhandled error event: %s", er.Inspect())
+}
+
 func emitOnObject(vmInst *vm.VM, obj *vm.PlainObject, event string, args ...vm.Value) bool {
 	eventsVal, ok := obj.GetOwn("_events")
 	if !ok {
-		return false
+		return reportIfUnhandledError(vmInst, event, args)
 	}
 	eventsTable := eventsVal.AsPlainObject()
 	if eventsTable == nil {
-		return false
+		return reportIfUnhandledError(vmInst, event, args)
 	}
 	existing, ok := eventsTable.GetOwn(event)
 	if !ok {
-		return false
+		return reportIfUnhandledError(vmInst, event, args)
 	}
 	arr := existing.AsArray()
 	if arr == nil || arr.Length() == 0 {
-		return false
+		return reportIfUnhandledError(vmInst, event, args)
 	}
 	listeners := make([]vm.Value, arr.Length())
 	for i := 0; i < arr.Length(); i++ {

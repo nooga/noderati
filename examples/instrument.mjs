@@ -47,7 +47,7 @@ let probeId = 0;
 for (const offset of insertOffsets) {
   if (offset < cursor) continue;
   out += src.slice(cursor, offset);
-  out += `console.error("PROBE_${probeId}_line_${lineOf(offset)}");\n`;
+  out += `process.stderr.write("PROBE_${probeId}_line_${lineOf(offset)}\\n");\n`;
   probeId++;
   cursor = offset;
 }

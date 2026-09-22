@@ -15995,3 +15995,133 @@ death if the fix were subtly wrong.
 `http.createServer` implementation and every fix from Rounds 102-136
 above. Not yet rebuilt/retested post-merge as of this entry - that
 verification is the next thing this doc records.
+
+## Round 139: post-merge verification (`dns.promises` added, `net.createServer` confirmed not actually needed); two more real, systemic noderati bugs found chasing vitest's own worker-pool startup
+
+Rebuilt and reran the full suite post-merge - `go vet ./...` clean,
+full suite clean, including the newly-merged
+`internal/host/http_server_test.go`/`internal/host/signals_test.go`.
+Sanity-checked the merged `examples/compat/connect-server.cjs` live
+(real curl against a real running noderati process) - works.
+
+**Answering the open question from Round 136's own status line
+directly: `net.createServer` is not actually needed for vite's dev
+server.** Wrote a minimal, standalone probe
+(`examples/vite_server_probe.mjs`: `createServer()` →
+`.listen()` → real `.address()` → `.close()`) - real vite's own dev
+server works completely on the merged `http.createServer()` alone; the
+`node:net` import vite's own bundle has goes unused in this path.
+
+**Bug 11 - `dns.promises.lookup` (and standalone `node:dns/promises`)
+entirely missing (noderati-side, fixed directly).** Continuing the
+`vitest_api_probe.mjs` run past the now-real `http.Server`, hit
+`Cannot read property 'lookup' of undefined` in real vite's own
+`getLocalhostAddressIfDiffersFromDNS` (`import { promises } from
+"node:dns"`). Only the callback-style `dns.lookup` existed. Added a
+thin Promise wrapper reusing the existing real callback implementation
+(resolving to `{address, family}`, or the raw array when `options.all`
+was requested - the same branch the Go-native callback already
+handles), plus a standalone `node:dns/promises` module mirroring the
+`node:path/posix` pattern from Round 136. Verified directly against
+real Node.
+
+With bug 11 fixed, `startVitest()` gets all the way to printing
+vitest's own real `RUN v2.1.9` reporter banner - then hangs. Chased it
+with a purpose-built acorn-based instrumentation tool
+(`examples/instrument.mjs`, recursively probing every statement in
+every `Program`/`BlockStatement` body, not just top-level), which
+surfaced two more real, independent, and each individually
+confirmed-against-real-Node bugs:
+
+**Bug 12 - `EventEmitter.emit("error", ...)` never throws when nothing
+is listening, unlike real Node's own special-cased contract for that
+one event name (noderati-side, fixed in *both* EventEmitter
+implementations this codebase has).** First found in the JS-shim
+`class EventEmitter` (`events.go`) that real user code (`class X
+extends EventEmitter`) actually gets; confirmed real Node's own
+behavior directly (`e.emit("error", new Error("boom"))` with no
+listener throws "boom" synchronously) before touching anything. Fixed
+by special-casing `event === "error"` in `emit()`'s own
+no-listener branch, throwing the passed value directly if it's a real
+`Error`, or a generic "Unhandled error." otherwise - matching real
+Node's own algorithm exactly. Found and fixed the identical gap in the
+*other*, Go-native `emitOnObject` (`emitter.go` - backs every
+EventEmitter-shaped construct built from Go: process, streams,
+sockets, HTTP, child_process) in the same pass, via a
+`reportIfUnhandledError` helper reusing the existing
+`reportUncaughtCallbackException` crash-and-report path this
+codebase's own listener-throw handling already uses unconditionally
+for every one of `emitOnObject`'s ~30 call sites (a known, existing,
+and now-shared imprecision: a synchronous `try { emitter.emit('error',
+e) } catch {} }` in real Node would catch the throw locally instead of
+crashing the whole process - this still crashes uniformly, matching
+the pre-existing behavior of a listener's own thrown exception rather
+than introducing a new inconsistency). Verified directly: an
+unhandled `child_process` spawn error (`spawn nonexistent-binary:
+ENOENT`) now correctly crashes with exit code 1 instead of silently
+continuing as if nothing happened.
+
+**Bug 13 (the actual load-bearing one for this investigation) -
+`Transform`/`PassThrough`'s `write()`/`end()` call `this._transform(...)`
+directly, never consulting an instance-level `_write` override
+(noderati-side, fixed directly).** Bisected past bug 12 to real,
+bundled `fast-glob` (vite's own real dependency, inlined into its dist
+chunk): `ReaderStream.static()` does
+`const stream = new PassThrough({objectMode: true}); stream._write =
+(index, enc, done) => {...}` - a completely ordinary real Node idiom
+(assign `_write` directly on the instance; no subclassing at all).
+Real Node's actual `Transform` genuinely *is* a `Writable` whose own
+default `_write` internally drives `_transform` - so an instance-level
+`_write` override always takes priority, exactly like overriding any
+other inherited method. This engine's own `Transform.write()`/`.end()`
+called `this._transform(...)` straight through instead, so the
+override was never consulted at all: every `.write()` silently ran
+`PassThrough`'s own default identity `_transform`, the real override's
+own `done()` (which was supposed to eventually call `stream.end()`)
+never ran, and the stream never emitted `"end"` - a promise waiting on
+it hangs forever, no error, matching this investigation's exact
+symptom precisely. Fixed by giving `Transform` its own default
+`_write` (delegating to `_transform`, preserving existing behavior for
+every caller that doesn't override `_write`) and routing
+`write()`/`end()` through `this._write(...)` instead, mirroring how
+`Writable`/`Duplex` already do it. Verified directly: the exact
+minimal repro (a `PassThrough` with an instance-level `_write`
+override) now matches real Node's own output exactly.
+
+**Both bugs verified real and necessary, but neither turned out to be
+the full story**: fixing bug 13 alone made real vite's own dependency
+scanning (`fast-glob`'s glob-pattern directory walk, `dynamic()`/
+`fsWalk.walkStream` - a separate, real recursive-walk code path from
+`static()`) work correctly, confirmed via a new standalone probe
+(`examples/vite_scan_probe.mjs`: a bare `createServer()` with explicit
+`optimizeDeps.entries`, forcing the exact dependency-scan bare vite's
+own default config had been skipping in every earlier round's probe -
+this now completes, reaching a real (and separately-broken) esbuild
+service-protocol error afterward, not a hang). But the actual
+`vitest_api_probe.mjs` - `startVitest()` itself, not bare
+`createServer()` - still hangs identically after both fixes, at the
+exact same "no microtasks to process" point. Whatever's different
+about `startVitest()`'s/`createVitest()`'s own wrapping of vite's
+server (extra plugins/config vitest adds beyond bare `createServer()`)
+isn't isolated yet - the acorn-based static-module-load instrumentation
+that found bugs 6-13 can't see inside an already-loaded function's own
+*runtime* invocation, only a module's one-time top-level evaluation,
+so a different, more targeted tracing technique is needed to go
+further.
+
+**Verification**: bugs 11-13 each confirmed directly against real
+Node's own behavior before being called fixed, not just inspected.
+`go vet ./...` clean; full suite clean (`TestURLSearchParamsIteration`
+reproduced its own already-documented pre-existing flakiness once
+mid-round, confirmed unrelated by an immediate clean rerun, same as
+every prior round that's hit it).
+
+**Status**: `vitest`'s own `startVitest()` still hangs, one layer
+deeper than before - not a worker-pool/tinypool issue after all (the
+original suspicion), but something specific to `createVitest()`'s own
+wrapping of vite's dev server, not yet isolated. Three more real,
+independent, confirmed bugs fixed along the way this round
+(`dns.promises`, `EventEmitter`'s unhandled-`"error"`-event contract in
+both implementations, `Transform`'s `_write`-override bypass) - genuine
+progress, but the specific remaining blocker needs a different
+bisection technique than the one that got this far.

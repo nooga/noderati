@@ -28,9 +28,34 @@ class EventEmitter {
     if (i >= 0) list.splice(i, 1);
     return this;
   }
+  // "error" is special-cased per real Node's own EventEmitter contract:
+  // emitting it with no listener registered throws (the error itself,
+  // if that's what was passed) instead of silently doing nothing like
+  // every other event name - found missing chasing real tinypool's own
+  // worker-pool setup under noderati: worker/fork creation failures
+  // (both worker_threads.Worker and child_process.fork are still
+  // unimplemented here) get reported via this.emit('error', err)
+  // internally, and with no listener yet attached at that exact
+  // moment, this used to just return false and vanish - not a thrown,
+  // visible crash the way real Node's own "Unhandled 'error' event"
+  // behavior would surface it, but a promise nothing will ever settle,
+  // silently hanging forever instead. The same root shape as the
+  // emitOnObject fix (round 135) for a different EventEmitter
+  // implementation (the Go-native one backing streams/child_process/
+  // http, not this JS-shim one instantiated by real user code that
+  // extends EventEmitter directly) - worth having in both.
   emit(event, ...args) {
     const list = this._events[event];
-    if (!list || list.length === 0) return false;
+    if (!list || list.length === 0) {
+      if (event === "error") {
+        const er = args[0];
+        if (er instanceof Error) throw er;
+        const err = new Error("Unhandled error." + (er !== undefined ? " (" + er + ")" : ""));
+        err.context = er;
+        throw err;
+      }
+      return false;
+    }
     for (const fn of list.slice()) fn.call(this, ...args);
     return true;
   }

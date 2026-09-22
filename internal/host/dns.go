@@ -25,6 +25,7 @@ import (
 // `all` is true.
 func declareDNS() {
 	registerJSShim("dns", dnsShim)
+	registerJSShim("dns/promises", dnsPromisesShim)
 }
 
 func installDNSNatives(p *driver.Paserati) {
@@ -120,6 +121,39 @@ function lookup(hostname, optionsOrCallback, maybeCallback) {
   return __lookup(hostname, options, callback);
 }
 
+// promises.lookup was entirely missing - found chasing real vite's own
+// resolveHostname (a real, transitive vitest/vite dependency) under
+// noderati: 'import { promises } from "node:dns"; ...
+// promises.lookup("localhost")' at real Vite dev-server startup.
+// A thin Promise wrapper over the already-real callback-style lookup()
+// above, matching real Node's dns.promises API exactly (resolves to
+// {address, family}, or the raw addresses array when options.all was
+// requested - the same "all" branch the Go-native callback already
+// implements, just awaited instead of passed a callback).
+function lookupPromise(hostname, options) {
+  const opts = typeof options === "number" ? { family: options } : (options ?? {});
+  return new Promise((resolve, reject) => {
+    lookup(hostname, opts, (err, address, family) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(opts.all ? address : { address, family });
+    });
+  });
+}
+const promises = { lookup: lookupPromise };
+
+export { lookup, promises };
+export default { lookup, promises };
+`
+
+// node:dns/promises is a real, standalone importable module in real
+// Node too (not just dns.promises), mirroring the node:path/posix
+// pattern - re-exports the same promises object the main dns shim
+// already builds, rather than duplicating lookupPromise.
+const dnsPromisesShim = `import { promises } from "node:dns";
+const { lookup } = promises;
 export { lookup };
-export default { lookup };
+export default promises;
 `
