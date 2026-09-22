@@ -16125,3 +16125,148 @@ independent, confirmed bugs fixed along the way this round
 both implementations, `Transform`'s `_write`-override bypass) - genuine
 progress, but the specific remaining blocker needs a different
 bisection technique than the one that got this far.
+
+## Round 140: the "worker-pool hang" wasn't the worker pool at all - a paserati closure-scoping bug
+
+Picked up exactly where Round 139 left off: `vitest`'s own
+`startVitest()` still hung with the identical "Top-level await: promise
+remains pending with no microtasks to process" diagnostic, even after
+fixing the `Transform._write` bug that resolved the equivalent bare-vite
+dependency-scan hang. The working hypothesis going in (`docs`'s own
+title for this round of chasing, "worker-pool hang") was that this was
+`tinypool`'s fault - `createVitest()`'s default test pool
+(`pool: "forks"`, real `child_process.fork()` + IPC under the hood,
+confirmed via reading `tinypool`'s own source: `fork(...)` from
+`node:child_process`, `this.process.send(message)`/`.on("message", ...)`)
+is something noderati has **zero** support for (no `fork`, no `exec`, no
+`IPC` at all in `child_process.go` - only `spawn`/`spawnSync`, confirmed
+by grep). That looked like a plausible, large, genuinely-missing-feature
+explanation.
+
+It was wrong. First real finding: switching `startVitest()`'s `pool`
+option to `"threads"` (which noderati *does* have real support for -
+`worker_threads.go`/`message_port_global.go` already exist) hung
+**identically**, at the exact same point. Whatever was wrong, it wasn't
+tinypool, `fork()`, or IPC - the hang happens before any pool is even
+created.
+
+Confirmed this precisely by adding direct `process.stderr.write` trace
+probes straight into the real, installed
+`node_modules/vitest/dist/chunks/cli-api.DqsSTaIi.js` (gitignored, safe
+to hand-edit for tracing, reverted with a clean `npm install vitest`
+afterward) at every step of `Vitest.start()`: `onInit` → banner printed
+→ `globTestFiles()` → **hang**, before `filterTestsBySource()` or
+`runFiles()` (where the pool actually gets created) is ever reached.
+This is the real acorn-based static instrumentation's known blind
+spot from last round finally paying off in reverse - once you know
+which *runtime* call to trace by hand instead of trying to
+instrument an entire module's load-time evaluation, tracing a single
+method call tree directly is straightforward.
+
+`globTestFiles()` bottoms out in vitest's own bundled `fast-glob`
+(the same `Transform`-dependent copy Round 139 already touched, but a
+different internal code path this time): for a *dynamic* glob pattern
+(anything with `**`, which is vitest's own default `include`), fast-glob
+uses `ReaderAsync.dynamic()`, which wraps a callback-style
+`@nodelib/fs.walk` directory walker in `new Promise((resolve, reject) =>
+{ this._walkAsync(root, options, (error, entries) => { if (error ===
+null) resolve(entries); ... }) })`. Traced every layer of this by hand
+(the queue/fastq-based walker, its `EventEmitter`-based
+`onEntry`/`onError`/`onEnd` wiring, the `AsyncProvider` wrapper) and
+watched it all execute *correctly*: root directory scanned, one
+subdirectory recursed into, the one real matching test file found, the
+walker's internal queue drains cleanly, `"end"` fires, `AsyncProvider`'s
+`onEnd` handler runs, `callSuccessCallback(callback, storage)` calls
+the `ReaderAsync.dynamic()` callback with `(null, [oneMatchingEntry])`
+- straight through to the line `resolve(entries)`, printed
+`"before resolve()"`... and then nothing. No `"after resolve()"`. No
+exception. No progress. Eventually the top-level await's own deadlock
+detector (correctly) gives up.
+
+This looked exactly like a hang *inside* `resolve()` itself - until
+wrapping that exact call in a `try/catch` for one more probe run. It
+doesn't hang. **It throws**, silently swallowed several stack frames up
+(the throw propagates out of the whole nested callback chain into a
+host callback-dispatch site with nothing above it to report it) - and
+the thing it throws from is `pathe`'s own `resolve()` (a path-joining
+function), called with `entries` (an array of `{dirent, name, path}`
+objects) as its argument, which `pathe` can't make sense of. The real
+`Promise` executor's own `resolve` parameter - two function scopes
+inward (`new Promise((resolve, reject) => { walkAsync(root, options,
+(error, entries) => { resolve(entries) }) })`) - was never called at
+all. The identifier `resolve` inside that innermost callback resolved to
+**`cli-api.DqsSTaIi.js`'s own top-level `import { resolve } from
+'pathe'`** instead of the executor's own parameter two scopes out.
+
+Reduced this to a minimal, completely noderati/vitest-free repro,
+confirmed against the standalone `paserati` CLI directly (no host
+involved at all):
+
+```js
+// lib.mjs
+export function resolve(...args) { return "MODULE:" + args.join(","); }
+
+// main.mjs
+import { resolve } from "./lib.mjs";
+
+function test(resolve) {
+  function inner() {
+    console.log(resolve(1, 2));
+  }
+  inner();
+}
+
+test((...args) => "PARAM:" + args.join(","));
+```
+
+Expected (real Node/V8): `PARAM:1,2` - `inner()` should see `test`'s own
+`resolve` parameter via ordinary closure capture, the same way it would
+for literally any other name. Actual, under `paserati main.mjs`:
+`MODULE:1,2` - `inner()` incorrectly resolves to the *module-level
+import binding* instead.
+
+Narrowed further: calling `resolve(1, 2)` **directly inside `test`'s own
+body** (no extra `inner()` nesting) resolves correctly to the parameter
+- the bug needs at least one additional nested function boundary
+(regular `function inner(){}` and arrow `const inner = () => {}` both
+trigger it identically). And replacing the `import` with a plain
+top-level `function resolve(){}` or `const resolve = () => {}` (same
+name, same module scope, *no* `import`) makes the bug disappear
+entirely - `inner()` then correctly sees the parameter. So this is
+specific to the interaction between **`import` bindings** and
+**parameter shadowing across a nested function boundary**: an imported
+name appears to get resolved via something like a module-namespace/
+global-like lookup that skips over an intermediate function's own
+parameter of the same name, while a plain module-scope declaration
+doesn't have this problem.
+
+This is a paserati (engine) bug, not a noderati one - filed upstream as
+[paserati#501](https://github.com/nooga/paserati/issues/501). No Go
+source changes on the noderati side this round; the real fix has to
+land in paserati's variable/closure resolution.
+
+**Why this was so hard to isolate**: the failure mode is uniquely
+misleading. It's not a crash, not a missing feature, not an obviously
+wrong return value at the call site that threw - it's a *silent*
+wrong-function-call three scopes away from where anything visibly goes
+wrong, whose only symptom is a promise that quietly never settles,
+surfacing an unrelated number of `await` layers up as a *generic*
+top-level-deadlock diagnostic that (correctly, as designed) can't
+distinguish "genuinely stuck" from "the resolver function got silently
+swapped out from under it." Every piece of this session's own
+instrumentation toolkit (the acorn static-instrumentation script, the
+"is it the worker pool" hypothesis, tracing pool creation) was reaching
+for the wrong *kind* of bug (a missing feature, a scheduling race) when
+the actual defect was a one-line variable-resolution mistake that
+happened to land on an identifier already in scope for an unrelated
+reason (`pathe`'s own `resolve` export, imported for path-joining
+elsewhere in the same bundled file, having nothing at all to do with
+Promises).
+
+**Status**: root cause of the "worker-pool hang" fully identified and
+is a confirmed paserati engine bug (paserati#501), not a noderati gap -
+`child_process.fork()`/IPC and `net.createServer()` remain honestly
+unimplemented but were **not** what was blocking `vitest`, contrary to
+this investigation's own working title. `vitest`'s `startVitest()`
+itself stays blocked until #501 lands upstream; picking a fresh target
+next round rather than waiting on it.
