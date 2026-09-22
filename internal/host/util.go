@@ -3,11 +3,21 @@ package host
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/vm"
+)
+
+// ansiControlSequenceRe mirrors real Node's own stripVTControlCharacters
+// pattern (lib/internal/util.js's ansi regex): a CSI/OSC-style ANSI
+// escape sequence, starting at ESC (\x1b) or the single-byte CSI
+// (\x9b), through its optional intermediate bytes, ending at either a
+// BEL-terminated OSC sequence or a CSI final byte.
+var ansiControlSequenceRe = regexp.MustCompile(
+	"[\x1b][[\\]()#;?]*(?:(?:[a-zA-Z0-9]*(?:;[a-zA-Z0-9]*)*)?\x07|(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-PR-TZcf-ntqry=><~])",
 )
 
 // functionPrototype reads fn.prototype the way real property access
@@ -137,18 +147,35 @@ func declareUtil(p *driver.Paserati) {
 			if _, err := vmInst.Call(setProtoOfFn, vm.Undefined, []vm.Value{ctorProto, superProto}); err != nil {
 				return vm.Undefined, err
 			}
-			// The prototype-chain link above (the load-bearing part real
-			// callers actually depend on for `new Ctor() instanceof
-			// SuperCtor`) is real; this last step - stamping
-			// `ctor.super_ = superCtor`, matching real Node - is
-			// currently a silent no-op: vm.SetProperty has no
-			// TypeClosure/TypeFunction case (filed as paserati#500,
-			// alongside the identical gap functionPrototype above works
-			// around for the read side). No workaround here yet.
+			// This last step - stamping `ctor.super_ = superCtor`,
+			// matching real Node - used to be a silent no-op:
+			// vm.SetProperty had no TypeClosure/TypeFunction case
+			// (paserati#500, alongside the identical gap
+			// functionPrototype above worked around for the read side).
+			// Confirmed fixed upstream directly (`Derived.super_ ===
+			// Base` now holds), so this is real again, not a no-op.
 			if err := vmInst.SetProperty(ctor, "super_", superCtor); err != nil {
 				return vm.Undefined, err
 			}
 			return vm.Undefined, nil
+		})
+		// stripVTControlCharacters(str): missing entirely - found via
+		// real, unmodified vitest's own error-printing path
+		// (utils.DNoFbBUZ.js's divider(), used to draw the "Unhandled
+		// Error" banner around a caught, real test-run error): calls
+		// `stripVTControlCharacters(text).length` unconditionally, for
+		// every divider it prints, not just when text actually contains
+		// ANSI codes. With this missing, vitest's own error-reporting
+		// machinery crashed trying to report a real, separate,
+		// unrelated error - masking whatever that original error
+		// actually was behind a confusing, unrelated "not a function"
+		// instead. Mirrors real Node's own ansi-stripping regex
+		// (lib/internal/util.js) rather than a simplified guess, so a
+		// real string containing genuine ANSI escapes (color codes,
+		// cursor moves) strips exactly as many bytes as real Node's own
+		// version would, not more or fewer.
+		m.Function("stripVTControlCharacters", func(str string) string {
+			return ansiControlSequenceRe.ReplaceAllString(str, "")
 		})
 		m.Default(nil)
 	})

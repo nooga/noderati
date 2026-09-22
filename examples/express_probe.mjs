@@ -1,7 +1,6 @@
 import express from "express";
 
 const app = express();
-app.set("etag", false); // paserati#502: 'in' operator throws on TypedArray
 app.use(express.json());
 
 app.get("/", (req, res) => {

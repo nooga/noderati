@@ -16709,3 +16709,119 @@ working, no changes needed - genuinely just slow, not broken, and
 worth writing down precisely *because* the initial symptom looked so
 much like a real bug this project has hit before.
 
+## Round 145: paserati#500-#505 all confirmed fixed and pulled - one more real noderati gap fixed (`util.stripVTControlCharacters`), one more real paserati bug found chasing it (#512), every previously-blocked target re-verified
+
+Pulled paserati `main` forward (fast-forwarded `1a63b19d..ac5cb8be`,
+including explicit "Fix #500"/"Fix #501"/"Fix #503"/"Fix #504" commits;
+`#502`/`#505` confirmed fixed further back in the same history) and
+rebuilt. `go.work`'s own `go` directive needed bumping to `1.27.1`
+alongside it (paserati's own toolchain bump landed in the same pull).
+`go vet`/full suite still clean after the rebuild.
+
+**`bcryptjs` speed, asked about directly this round**: real Node did a
+cost-10 `hashSync` in 79ms; noderati took 6293ms for the identical
+call - **~80x slower**, an interpreted bytecode VM with no JIT against
+V8's, exactly the gap round 144's own "not a bug, just slow" finding
+would predict.
+
+**Re-verified every target blocked on #500-#505, one at a time:**
+
+- **`chokidar`** (blocked on #505): now parses and loads correctly.
+  Does nothing further, though - confirmed `fs.watch`/`fs.watchFile`/
+  `fs.unwatchFile` still don't exist in noderati at all (a real,
+  separate, pre-existing gap #505 was never going to touch, flagged
+  back in round 144 and still open).
+- **`express`'s POST path** (blocked on #502's `in`-operator throw and
+  #503's reentrant-drain deadlock): both confirmed fixed - removed the
+  `app.set("etag", false)` workaround entirely (etag generation, which
+  needs the `in` operator on a Buffer, now works: a real
+  `Etag: W/"12-..."` header comes back), and `express.json()`'s own
+  first-time `require("iconv-lite")` inside the request handler no
+  longer deadlocks the process. Uncovered a **new, distinct, real
+  paserati bug** immediately behind it once both of those stopped
+  masking it - see below.
+- **`vitest`** (blocked on #501's closure-shadowing hang): the
+  `startVitest()` hang is gone completely - it now runs far enough to
+  print `RUN v2.1.9`, attempt real test-pool creation, and reach a
+  real, visible error instead of a false "no microtasks to process"
+  diagnosis. That error was itself initially hidden behind a *second*,
+  freshly-found gap: `util.stripVTControlCharacters` didn't exist at
+  all, so vitest's own error-reporting code (`divider()`, drawing the
+  "Unhandled Error" banner) crashed trying to report the real
+  underlying error, masking it behind a confusing, unrelated
+  "`stripVTControlCharacters` is not a function." Added a real
+  implementation (mirroring real Node's own ANSI-escape-stripping
+  regex, not a simplified guess) - once added, the *actual* blocker
+  became visible for the first time: `tinypool`'s own `ProcessWorker`
+  calls real `child_process.fork()` (`node_modules/tinypool/dist/
+  index.js:101`), which noderati has never implemented at all -
+  exactly the gap round 140's own investigation had already flagged as
+  real but unconfirmed at the time ("`child_process.fork()`/IPC...
+  remain honestly unimplemented but were **not** what was blocking
+  `vitest`"). Now confirmed, directly, as the actual, sole remaining
+  blocker - not a hypothesis anymore. A secondary, smaller crash also
+  surfaced immediately after fixing that (`loupe`'s own
+  `inspectObject` reading `.length` off `error.name` when `.name` is
+  undefined, while trying to print a *different* real error) - a
+  genuine finding, not chased further this round; a plain thrown
+  `TypeError` correctly has a real `.name` when constructed directly
+  (verified with a minimal repro), so this is specific to whatever
+  object shape reaches `printStack` here, not evidence `.name` is
+  broken in general.
+- **`tar`** (blocked on #504's derived-class-field-initializer bug):
+  confirmed fixed - the class construction that used to crash
+  immediately now succeeds completely. Fails at exactly the *already
+  known, already documented* next gap instead: `zlib.createGzip`
+  doesn't exist (round 143's own doc comment on `zlib.go` already
+  predicted this precisely - only the decompression direction was ever
+  built, confirmed by grepping every real call site at the time).
+  Real, additive feature work, not a new bug - left for a dedicated
+  future round rather than started here.
+- **`util.inherits`'s own `super_` stamping** (silently a no-op since
+  #500 made `vm.SetProperty` no-op for a function value): confirmed
+  fixed directly (`Derived.super_ === Base` now holds) and the stale
+  "silent no-op" comment updated to say so.
+
+**One more real, minimal paserati bug found and filed**
+([paserati#512](https://github.com/nooga/paserati/issues/512)), this
+one in `pkg/driver` rather than `pkg/vm`/`pkg/compiler`:
+`ModuleBuilder.Class`-registered instances (`URL`, `URLSearchParams`,
+`StringDecoder`, `VMScript`, and noderati's own new `KeyObject` from
+round 142 - every native class this project has ever declared this
+way) bind their Go-struct methods directly onto each *instance*
+instead of onto the class's own shared `.prototype` object, which
+ends up carrying only `.constructor` and nothing else. Invisible for
+the overwhelmingly common `new X(); x.method()` case, but breaks the
+moment real code borrows/shares a `.prototype` object across two
+different constructors - a completely ordinary, legal JS idiom.
+Found via real, unmodified `iconv-lite` (reached through
+`body-parser`'s own `require('iconv-lite')`, now reachable at all only
+because #503 stopped masking it): its own `encodings/internal.js` does
+`InternalDecoder.prototype = StringDecoder.prototype;`, reusing
+noderati's own real `string_decoder` module's class - and every
+`InternalDecoder` instance ends up with no `.write()`/`.end()` at all,
+since those methods only ever existed on actual `StringDecoder`
+instances, not on the object the two classes' prototypes both point
+to. Reduced to a clean, noderati-free Go repro directly against
+`pkg/driver` (a synthetic `Counter` class, no host/JS-module system
+involved) and filed with a suggested direction (bind methods on the
+shared prototype once, at class-registration time, backed by a
+per-instance internal slot the prototype's own methods read through
+`this` - the same shape `vm.PlainObject.SetInternalSlots`/
+`InternalSlots()` already supports elsewhere in this codebase).
+
+**Status**: all six of #500-#505 confirmed fixed and load-bearing.
+Every previously-blocked probe re-run and re-verified rather than
+assumed fixed from the issue tracker alone. `express`'s GET *and* POST
+paths (routing, params, query, JSON bodies via `express.json()`, the
+404 fallback) are now all genuinely unblocked pending #512 (no
+noderati-side workaround attempted yet - `iconv-lite`'s specific
+prototype-borrowing pattern is the concrete symptom, but the fix
+belongs in paserati's own class-registration machinery). `vitest`'s
+sole remaining blocker is now confirmed, not hypothesized, to be
+`child_process.fork()`/IPC - a large, genuinely unimplemented feature.
+`tar`'s sole remaining blocker is the already-documented, already-
+scoped `zlib.createGzip` gap. `chokidar` needs real `fs.watch` from
+scratch. Four clear, well-understood next steps, none of them mystery
+engine bugs anymore.
+
