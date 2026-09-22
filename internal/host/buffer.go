@@ -132,6 +132,25 @@ func typedArrayBytes(ta *vm.TypedArrayObject) []byte {
 	return out
 }
 
+// typedArrayLiveBytes is typedArrayBytes without the copy: the returned
+// slice aliases the view's backing ArrayBuffer, for callers that must
+// write into the JS-visible memory (fs.read into a caller's Buffer).
+func typedArrayLiveBytes(ta *vm.TypedArrayObject) []byte {
+	if ta == nil {
+		return nil
+	}
+	buf := ta.GetBuffer()
+	if buf == nil || buf.IsDetached() {
+		return nil
+	}
+	data := buf.GetData()
+	off, ln := ta.GetByteOffset(), ta.GetByteLength()
+	if off < 0 || ln < 0 || off+ln > len(data) {
+		return nil
+	}
+	return data[off : off+ln]
+}
+
 func normalizeBufferEncoding(e string) string {
 	switch strings.ToLower(strings.TrimSpace(e)) {
 	case "utf-8":

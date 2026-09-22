@@ -33,12 +33,12 @@ func declareFSPromises(p *driver.Paserati) {
 			// write its raw bytes.
 			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, valueToBytes(vmInst, data), 0644))
 		})
-		m.AsyncFunction("mkdir", func(path string, opts map[string]interface{}) (interface{}, error) {
-			mkdirFn := os.Mkdir
-			if mkdirRecursiveRequested(opts) {
-				mkdirFn = os.MkdirAll
+		m.AsyncFunction("mkdir", func(path string, opts ...vm.Value) (vm.Value, error) {
+			first, err := fsMkdir(path, argAt(opts, 0))
+			if err != nil {
+				return vm.Undefined, wrapFsErr(vmInst, "mkdir", path, err)
 			}
-			return nil, wrapFsErr(vmInst, "mkdir", path, mkdirFn(path, 0755))
+			return optionalString(first), nil
 		})
 		m.AsyncFunction("readdir", func(path string, opts map[string]interface{}) ([]vm.Value, error) {
 			fsTouch("readdir", path)
@@ -48,21 +48,21 @@ func declareFSPromises(p *driver.Paserati) {
 			}
 			return entries, nil
 		})
-		m.AsyncFunction("stat", func(path string, _ ...interface{}) (*fsStats, error) {
+		m.AsyncFunction("stat", func(path string, _ ...interface{}) (vm.Value, error) {
 			fsTouch("stat", path)
 			info, err := os.Stat(path)
 			if err != nil {
-				return nil, wrapFsErr(vmInst, "stat", path, err)
+				return vm.Undefined, wrapFsErr(vmInst, "stat", path, err)
 			}
-			return newFsStats(vmInst, info), nil
+			return fsStatsValue(vmInst, info), nil
 		})
-		m.AsyncFunction("lstat", func(path string, _ ...interface{}) (*fsStats, error) {
+		m.AsyncFunction("lstat", func(path string, _ ...interface{}) (vm.Value, error) {
 			fsTouch("stat", path)
 			info, err := os.Lstat(path)
 			if err != nil {
-				return nil, wrapFsErr(vmInst, "lstat", path, err)
+				return vm.Undefined, wrapFsErr(vmInst, "lstat", path, err)
 			}
-			return newFsStats(vmInst, info), nil
+			return fsStatsValue(vmInst, info), nil
 		})
 		m.AsyncFunction("access", func(path string, _ ...interface{}) (interface{}, error) {
 			fsTouch("stat", path)

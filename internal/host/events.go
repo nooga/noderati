@@ -20,17 +20,42 @@ class EventEmitter {
     // ...)' inside express's defaultConfiguration() threw immediately
     // trying to read a property off 'this._events' while it was still
     // undefined.
+    return this._addListener(event, listener, false);
+  }
+  addListener(event, listener) {
+    return this._addListener(event, listener, false);
+  }
+  prependListener(event, listener) {
+    return this._addListener(event, listener, true);
+  }
+  _addListener(event, listener, prepend) {
     if (!this._events) this._events = Object.create(null);
+    if (this._events.newListener) this.emit("newListener", event, listener.listener ? listener.listener : listener);
     if (!this._events[event]) this._events[event] = [];
-    this._events[event].push(listener);
+    if (prepend) this._events[event].unshift(listener);
+    else this._events[event].push(listener);
     return this;
   }
+  // The wrapper keeps the original as .listener so removeListener(event,
+  // original) and listeners() can still find it, and unregisters itself
+  // before running, exactly like real Node's own _onceWrap.
+  _onceWrap(event, listener) {
+    let fired = false;
+    const target = this;
+    function wrapper(...args) {
+      if (fired) return;
+      fired = true;
+      target.removeListener(event, wrapper);
+      return listener.apply(target, args);
+    }
+    wrapper.listener = listener;
+    return wrapper;
+  }
   once(event, listener) {
-    const wrapper = (...args) => {
-      this.off(event, wrapper);
-      listener(...args);
-    };
-    return this.on(event, wrapper);
+    return this._addListener(event, this._onceWrap(event, listener), false);
+  }
+  prependOnceListener(event, listener) {
+    return this._addListener(event, this._onceWrap(event, listener), true);
   }
   off(event, listener) {
     return this.removeListener(event, listener);
@@ -39,9 +64,48 @@ class EventEmitter {
     if (!this._events) return this;
     const list = this._events[event];
     if (!list) return this;
-    const i = list.indexOf(listener);
-    if (i >= 0) list.splice(i, 1);
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i] === listener || list[i].listener === listener) {
+        const removed = list[i];
+        list.splice(i, 1);
+        if (list.length === 0) delete this._events[event];
+        if (this._events.removeListener) this.emit("removeListener", event, removed.listener || removed);
+        break;
+      }
+    }
     return this;
+  }
+  removeAllListeners(event) {
+    if (!this._events) return this;
+    if (!this._events.removeListener) {
+      if (event === undefined) this._events = Object.create(null);
+      else delete this._events[event];
+      return this;
+    }
+    if (event === undefined) {
+      for (const key of Reflect.ownKeys(this._events)) {
+        if (key !== "removeListener") this.removeAllListeners(key);
+      }
+      this.removeAllListeners("removeListener");
+      this._events = Object.create(null);
+      return this;
+    }
+    const list = this._events[event];
+    if (list) {
+      for (let i = list.length - 1; i >= 0; i--) this.removeListener(event, list[i]);
+    }
+    return this;
+  }
+  listeners(event) {
+    const list = this._events && this._events[event];
+    return list ? list.map((l) => l.listener || l) : [];
+  }
+  rawListeners(event) {
+    const list = this._events && this._events[event];
+    return list ? list.slice() : [];
+  }
+  eventNames() {
+    return this._events ? Reflect.ownKeys(this._events) : [];
   }
   // Missing entirely - found adding stream.go's own legacy Stream.pipe()
   // (needed to check for an attached 'error' listener before deciding

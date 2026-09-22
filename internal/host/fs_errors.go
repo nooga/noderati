@@ -31,6 +31,7 @@ var errnoToCode = map[syscall.Errno]string{
 	syscall.EXDEV:        "EXDEV",
 	syscall.ENOSPC:       "ENOSPC",
 	syscall.EROFS:        "EROFS",
+	syscall.EBADF:        "EBADF",
 }
 
 // fsSystemError is a Go error implementing vm.ExceptionError, wrapping a
@@ -72,7 +73,11 @@ func wrapFsErr(vmInst *vm.VM, syscallName, path string, err error) error {
 
 	message := err.Error()
 	if code != "" {
-		message = fmt.Sprintf("%s: %s, %s '%s'", code, detail, syscallName, path)
+		if path == "" {
+			message = fmt.Sprintf("%s: %s, %s", code, detail, syscallName)
+		} else {
+			message = fmt.Sprintf("%s: %s, %s '%s'", code, detail, syscallName, path)
+		}
 	}
 
 	exception, built := vm.Undefined, false
@@ -95,7 +100,9 @@ func wrapFsErr(vmInst *vm.VM, syscallName, path string, err error) error {
 			obj.SetOwn("errno", vm.NumberValue(float64(errno)))
 		}
 		obj.SetOwn("syscall", vm.NewString(syscallName))
-		obj.SetOwn("path", vm.NewString(path))
+		if path != "" {
+			obj.SetOwn("path", vm.NewString(path))
+		}
 	}
 
 	return &fsSystemError{exception: exception, message: message}

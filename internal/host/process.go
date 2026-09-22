@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/nooga/paserati/pkg/builtins"
@@ -130,6 +131,37 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 			return vm.NewString(""), nil
 		}
 		return vm.NewString(cwd), nil
+	}))
+	for name, fn := range map[string]func() int{
+		"getuid": syscall.Getuid, "geteuid": syscall.Geteuid,
+		"getgid": syscall.Getgid, "getegid": syscall.Getegid,
+	} {
+		get := fn
+		processObj.SetOwn(name, vm.NewNativeFunction(0, false, name, func(_ []vm.Value) (vm.Value, error) {
+			return vm.NumberValue(float64(get())), nil
+		}))
+	}
+	processObj.SetOwn("getgroups", vm.NewNativeFunction(0, false, "getgroups", func(_ []vm.Value) (vm.Value, error) {
+		groups, err := syscall.Getgroups()
+		if err != nil {
+			return vm.Undefined, err
+		}
+		arr := vm.NewArray()
+		for _, g := range groups {
+			arr.AsArray().Append(vm.NumberValue(float64(g)))
+		}
+		return arr, nil
+	}))
+	// process.umask() reads the mask; process.umask(mask) sets it and
+	// returns the previous one. Reading has to set-and-restore: there is no
+	// read-only umask syscall.
+	processObj.SetOwn("umask", vm.NewNativeFunction(1, false, "umask", func(args []vm.Value) (vm.Value, error) {
+		if len(args) == 0 || isNullish(args[0]) {
+			old := syscall.Umask(0)
+			syscall.Umask(old)
+			return vm.NumberValue(float64(old)), nil
+		}
+		return vm.NumberValue(float64(syscall.Umask(int(modeArg(args[0], 0o022))))), nil
 	}))
 	rt := vmInstance.GetAsyncRuntime()
 	processObj.SetOwn("nextTick", vm.NewNativeFunction(1, true, "nextTick", func(args []vm.Value) (vm.Value, error) {

@@ -2,39 +2,10 @@ package host
 
 import (
 	"os"
-	"path/filepath"
-	"time"
 
 	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/vm"
 )
-
-// fsStatsToVM manually builds the same object shape a typed `m.Function`
-// return gets for free via paserati's struct-reflection (see statSync's
-// `*fsStats` return) -- needed here because a classic Node callback-style
-// function hands its result to a JS callback directly, not through a Go
-// function return, so there's no reflection step to piggyback on. Mirrors
-// dirent.go's newDirent, which manually builds a vm object for exactly the
-// same reason.
-func fsStatsToVM(vmInst *vm.VM, s *fsStats) vm.Value {
-	obj := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
-	obj.SetOwn("size", vm.NumberValue(float64(s.Size)))
-	obj.SetOwn("mtimeMs", vm.NumberValue(s.MtimeMs))
-	obj.SetOwn("mtime", s.Mtime)
-	boolFn := func(v bool) vm.Value {
-		return vm.NewNativeFunction(0, false, "", func(_ []vm.Value) (vm.Value, error) {
-			return vm.BooleanValue(v), nil
-		})
-	}
-	obj.SetOwn("isFile", boolFn(s.IsFile()))
-	obj.SetOwn("isDirectory", boolFn(s.IsDirectory()))
-	obj.SetOwn("isSymbolicLink", boolFn(s.IsSymbolicLink()))
-	obj.SetOwn("isBlockDevice", boolFn(s.IsBlockDevice()))
-	obj.SetOwn("isCharacterDevice", boolFn(s.IsCharacterDevice()))
-	obj.SetOwn("isFIFO", boolFn(s.IsFIFO()))
-	obj.SetOwn("isSocket", boolFn(s.IsSocket()))
-	return vm.NewValueFromPlainObject(obj)
-}
 
 // fsErrToVM extracts the real JS Error value wrapFsErr built (.code,
 // .errno, .syscall, .path and all), for handing to a Node-style
@@ -170,6 +141,7 @@ func findAsyncCallback(opts []vm.Value) vm.Value {
 // Extend further only when another real package's real call site demands
 // more of the callback surface -- don't build ahead of evidence.
 func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
+	declareFSFd(m, vmInst)
 	m.Function("readFile", func(path string, opts ...vm.Value) (vm.Value, error) {
 		// Real Node's fs.readFile(path, [options], callback) - the
 		// callback is always the *last* argument, whether or not an
@@ -231,18 +203,6 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "open", path, err))})
 		return vm.Undefined, nil
 	})
-	// os.Mkdir (non-recursive), deliberately -- matches real Node's own
-	// fs.mkdir default (no {recursive:true} means parent dirs must
-	// already exist) and is load-bearing here: proper-lockfile's whole
-	// mutual-exclusion protocol depends on this call failing with EEXIST
-	// when the lock dir already exists. fs.mkdirSync (fs.go) uses
-	// os.MkdirAll instead -- a pre-existing divergence from real Node's
-	// own default, predating this file, not mirrored here on purpose.
-	m.Function("mkdir", func(path string, cb vm.Value) (vm.Value, error) {
-		err := os.Mkdir(path, 0755)
-		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "mkdir", path, err))})
-		return vm.Undefined, nil
-	})
 	m.Function("stat", func(path string, opts ...vm.Value) (vm.Value, error) {
 		// Real Node's fs.stat(path[, options], callback) -- same trailing-
 		// callback shape as readFile/writeFile above. Fixed-arity `cb
@@ -259,7 +219,7 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "stat", path, err))})
 			return vm.Undefined, nil
 		}
-		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, fsStatsToVM(vmInst, newFsStats(vmInst, info))})
+		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, fsStatsValue(vmInst, info)})
 		return vm.Undefined, nil
 	})
 	// lstat added alongside stat (docs/real-node-plan.md, Round 122): real
@@ -279,58 +239,7 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "lstat", path, err))})
 			return vm.Undefined, nil
 		}
-		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, fsStatsToVM(vmInst, newFsStats(vmInst, info))})
-		return vm.Undefined, nil
-	})
-	m.Function("rmdir", func(path string, cb vm.Value) (vm.Value, error) {
-		err := os.Remove(path)
-		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "rmdir", path, err))})
-		return vm.Undefined, nil
-	})
-	// open/close were entirely missing - found chasing real chokidar
-	// (a real, transitive vite/vitest dependency) under noderati: its
-	// own NodeFsHandler does `const open$2 = promisify$2(fs$7.open);`
-	// and `const close = promisify$2(fs$7.close);` at module scope,
-	// right next to the identical stat/lstat/realpath promisify calls
-	// this file already had callback-style variants for - open/close
-	// simply never got the same treatment. Reuse fsOpen/fsClose
-	// (fs.go), the same helpers openSync/closeSync already call, so the
-	// sync and callback-style entry points share one real
-	// implementation. Real fs.open(path[, flags[, mode]], callback)'s
-	// optional flags/mode args are accepted and ignored (matching
-	// openSync's own `_ ...interface{}` - flags/mode aren't modeled at
-	// this Go layer yet), same shape as stat/lstat/access's own
-	// optional leading args above.
-	m.Function("open", func(path string, opts ...vm.Value) (vm.Value, error) {
-		cb := findAsyncCallback(opts)
-		flags := "r"
-		for _, v := range opts {
-			if v.IsString() {
-				flags = v.ToString()
-				break
-			}
-		}
-		fd, err := fsOpen(path, flags)
-		if err != nil {
-			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "open", path, err))})
-			return vm.Undefined, nil
-		}
-		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, vm.IntegerValue(int32(fd))})
-		return vm.Undefined, nil
-	})
-	m.Function("close", func(fd int64, opts ...vm.Value) (vm.Value, error) {
-		cb := findAsyncCallback(opts)
-		err := fsClose(fd)
-		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "close", "", err))})
-		return vm.Undefined, nil
-	})
-	m.Function("realpath", func(path string, cb vm.Value) (vm.Value, error) {
-		resolved, err := filepath.EvalSymlinks(path)
-		if err != nil {
-			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "realpath", path, err))})
-			return vm.Undefined, nil
-		}
-		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, vm.NewString(resolved)})
+		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, fsStatsValue(vmInst, info)})
 		return vm.Undefined, nil
 	})
 	// readdir was entirely missing - found chasing real vite under
@@ -415,19 +324,6 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 			return vm.Undefined, nil
 		}
 		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, vm.NewString(target)})
-		return vm.Undefined, nil
-	})
-	m.Function("utimes", func(path string, atime, mtime vm.Value, cb vm.Value) (vm.Value, error) {
-		// atime/mtime arrive as JS Date instances (proper-lockfile's own
-		// mtime-precision.js always passes `new Date(...)`) or, per real
-		// Node's own accepted forms, plain numbers -- ToFloat() covers
-		// both, since a Date's numeric coercion (ToNumber -> valueOf ->
-		// getTime()) already yields the same millisecond value a bare
-		// number would.
-		at := time.UnixMilli(int64(atime.ToFloat()))
-		mt := time.UnixMilli(int64(mtime.ToFloat()))
-		err := os.Chtimes(path, at, mt)
-		scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "utimes", path, err))})
 		return vm.Undefined, nil
 	})
 }

@@ -2,63 +2,172 @@ package host
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/vm"
 )
 
-type fsStats struct {
-	Size    int64    `json:"size"`
-	MtimeMs float64  `json:"mtimeMs"`
-	Mtime   vm.Value `json:"mtime"`
-	file    bool
-	dir     bool
-	symlink bool
+// statSys is the raw stat(2) data behind a real fs.Stats, filled per
+// platform by statSysFields (fs_stat_*.go).
+type statSys struct {
+	dev, ino, nlink, rdev   uint64
+	mode, uid, gid          uint32
+	blksize, blocks         int64
+	atime, ctime, birthtime time.Time
 }
 
-func (s *fsStats) IsFile() bool            { return s.file }
-func (s *fsStats) IsDirectory() bool       { return s.dir }
-func (s *fsStats) IsSymbolicLink() bool    { return s.symlink }
-func (s *fsStats) IsBlockDevice() bool     { return false }
-func (s *fsStats) IsCharacterDevice() bool { return false }
-func (s *fsStats) IsFIFO() bool            { return false }
-func (s *fsStats) IsSocket() bool          { return false }
+// POSIX S_IFMT file-type bits, which real Node's stats.mode carries.
+const (
+	sIFMT   = 0o170000
+	sIFSOCK = 0o140000
+	sIFLNK  = 0o120000
+	sIFREG  = 0o100000
+	sIFBLK  = 0o060000
+	sIFDIR  = 0o040000
+	sIFCHR  = 0o020000
+	sIFIFO  = 0o010000
+)
 
-// newFsStats builds an fsStats from a Go os.FileInfo, including a real JS
-// Date for .mtime — real Node's fs.Stats has both .mtimeMs (a number) and
-// .mtime (a Date); real packages call .mtime.getTime() directly
-// (proper-lockfile's mtime-precision.js is what surfaced this gap).
-// info.IsDir() is false for a symlink even when it points at a
-// directory — correct for lstat's own result (which must describe the
-// link itself, not its target), which is the whole reason lstat exists
-// as distinct from stat.
-func newFsStats(vmInst *vm.VM, info os.FileInfo) *fsStats {
-	mtimeMs := float64(info.ModTime().UnixMilli())
-	mtime := vm.Undefined
+// modeFromFileInfo reconstructs a POSIX st_mode for platforms without a
+// syscall.Stat_t.
+func modeFromFileInfo(info os.FileInfo) uint32 {
+	m := info.Mode()
+	mode := uint32(m.Perm())
+	switch {
+	case m&os.ModeSymlink != 0:
+		mode |= sIFLNK
+	case m.IsDir():
+		mode |= sIFDIR
+	case m&os.ModeNamedPipe != 0:
+		mode |= sIFIFO
+	case m&os.ModeSocket != 0:
+		mode |= sIFSOCK
+	case m&os.ModeCharDevice != 0:
+		mode |= sIFCHR
+	case m&os.ModeDevice != 0:
+		mode |= sIFBLK
+	default:
+		mode |= sIFREG
+	}
+	if m&os.ModeSetuid != 0 {
+		mode |= 0o4000
+	}
+	if m&os.ModeSetgid != 0 {
+		mode |= 0o2000
+	}
+	if m&os.ModeSticky != 0 {
+		mode |= 0o1000
+	}
+	return mode
+}
+
+var statsProtos sync.Map // *vm.VM -> *vm.PlainObject
+
+// statsPrototype is the shared prototype every Stats object gets: the
+// is*() predicates read this.mode, like real Node's own StatsBase.
+func statsPrototype(vmInst *vm.VM) *vm.PlainObject {
+	if p, ok := statsProtos.Load(vmInst); ok {
+		return p.(*vm.PlainObject)
+	}
+	proto := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+	for name, bits := range map[string]uint32{
+		"isFile": sIFREG, "isDirectory": sIFDIR, "isSymbolicLink": sIFLNK,
+		"isBlockDevice": sIFBLK, "isCharacterDevice": sIFCHR, "isFIFO": sIFIFO, "isSocket": sIFSOCK,
+	} {
+		want := bits
+		proto.SetOwn(name, vm.NewNativeFunction(0, false, name, func(_ []vm.Value) (vm.Value, error) {
+			obj := vmInst.GetThis().AsPlainObject()
+			if obj == nil {
+				return vm.False, nil
+			}
+			modeVal, _ := obj.Get("mode")
+			return vm.BooleanValue(uint32(modeVal.ToFloat())&sIFMT == want), nil
+		}))
+	}
+	// Real Node (22+) exposes the Date fields as lazy prototype accessors
+	// over the *Ms numbers (so they're absent from Object.keys until used);
+	// the first read, or any write, replaces the accessor with a plain own
+	// enumerable data property.
+	yes := true
+	for _, name := range []string{"atime", "mtime", "ctime", "birthtime"} {
+		field := name
+		getter := vm.NewNativeFunction(0, false, "get "+field, func(_ []vm.Value) (vm.Value, error) {
+			obj := vmInst.GetThis().AsPlainObject()
+			if obj == nil {
+				return vm.Undefined, nil
+			}
+			ms, _ := obj.Get(field + "Ms")
+			date := newJSDate(vmInst, math.Trunc(ms.ToFloat()))
+			obj.DefineOwnProperty(field, date, &yes, &yes, &yes)
+			return date, nil
+		})
+		setter := vm.NewNativeFunction(1, false, "set "+field, func(args []vm.Value) (vm.Value, error) {
+			if obj := vmInst.GetThis().AsPlainObject(); obj != nil {
+				obj.DefineOwnProperty(field, argAt(args, 0), &yes, &yes, &yes)
+			}
+			return vm.Undefined, nil
+		})
+		proto.DefineAccessorProperty(field, getter, true, setter, true, &yes, &yes)
+	}
+	actual, _ := statsProtos.LoadOrStore(vmInst, proto)
+	return actual.(*vm.PlainObject)
+}
+
+func newJSDate(vmInst *vm.VM, ms float64) vm.Value {
 	if dateCtor, ok := vmInst.GetGlobal("Date"); ok {
-		if v, err := vmInst.Construct(dateCtor, []vm.Value{vm.NumberValue(mtimeMs)}); err == nil {
-			mtime = v
+		if v, err := vmInst.Construct(dateCtor, []vm.Value{vm.NumberValue(ms)}); err == nil {
+			return v
 		}
 	}
-	isSymlink := info.Mode()&os.ModeSymlink != 0
-	return &fsStats{
-		Size:    info.Size(),
-		MtimeMs: mtimeMs,
-		Mtime:   mtime,
-		file:    info.Mode().IsRegular(),
-		dir:     info.IsDir(),
-		symlink: isSymlink,
+	return vm.Undefined
+}
+
+func timeToMs(t time.Time) float64 {
+	return float64(t.UnixNano()) / 1e6
+}
+
+// fsStatsValue builds a real Node-shaped fs.Stats object (every numeric
+// field plus the atime/mtime/ctime/birthtime Dates) from a Go FileInfo.
+// Real packages read far more than size/mtime: tar writes mode/uid/gid/
+// atime/ctime into every header and keys hardlink detection on dev:ino
+// when nlink > 1.
+func fsStatsValue(vmInst *vm.VM, info os.FileInfo) vm.Value {
+	sys, ok := statSysFields(info)
+	if !ok {
+		mt := info.ModTime()
+		sys = statSys{mode: modeFromFileInfo(info), nlink: 1, blksize: 4096, atime: mt, ctime: mt, birthtime: mt}
+		sys.blocks = (info.Size() + 511) / 512
 	}
+	obj := vm.NewObject(vm.NewValueFromPlainObject(statsPrototype(vmInst))).AsPlainObject()
+	num := func(name string, v float64) { obj.SetOwn(name, vm.NumberValue(v)) }
+	num("dev", float64(sys.dev))
+	num("mode", float64(sys.mode))
+	num("nlink", float64(sys.nlink))
+	num("uid", float64(sys.uid))
+	num("gid", float64(sys.gid))
+	num("rdev", float64(sys.rdev))
+	num("blksize", float64(sys.blksize))
+	num("ino", float64(sys.ino))
+	num("size", float64(info.Size()))
+	num("blocks", float64(sys.blocks))
+	for _, t := range []struct {
+		name string
+		at   time.Time
+	}{{"atime", sys.atime}, {"mtime", info.ModTime()}, {"ctime", sys.ctime}, {"birthtime", sys.birthtime}} {
+		num(t.name+"Ms", timeToMs(t.at))
+	}
+	return vm.NewValueFromPlainObject(obj)
 }
 
 var (
-	fsFDs  sync.Map
-	fsFDID atomic.Int64
+	fsFDs sync.Map // real OS fd (int64) -> *os.File
 
 	fsStatReads atomic.Int64
 	fsStatStats atomic.Int64
@@ -135,18 +244,41 @@ func fsOpenFlags(flags string) (int, error) {
 	}
 }
 
-func fsOpen(path string, flags string) (int64, error) {
+// fsOpen opens path and registers it under its real OS file descriptor,
+// so fd numbers mean what they do in real Node (never colliding with
+// stdio's 0/1/2) and fd-based calls reach the right file.
+func fsOpen(path string, flags string, mode os.FileMode) (int64, error) {
 	goFlags, err := fsOpenFlags(flags)
 	if err != nil {
 		return 0, err
 	}
-	f, err := os.OpenFile(path, goFlags, 0644)
+	return fsOpenRaw(path, goFlags, mode)
+}
+
+func fsOpenRaw(path string, goFlags int, mode os.FileMode) (int64, error) {
+	f, err := os.OpenFile(path, goFlags, mode)
 	if err != nil {
 		return 0, err
 	}
-	id := fsFDID.Add(1)
-	fsFDs.Store(id, f)
-	return id, nil
+	fd := int64(f.Fd())
+	fsFDs.Store(fd, f)
+	return fd, nil
+}
+
+// fsFile resolves a JS fd: one this process opened, or stdio.
+func fsFile(fd int64) (*os.File, bool) {
+	if v, ok := fsFDs.Load(fd); ok {
+		return v.(*os.File), true
+	}
+	switch fd {
+	case 0:
+		return os.Stdin, true
+	case 1:
+		return os.Stdout, true
+	case 2:
+		return os.Stderr, true
+	}
+	return nil, false
 }
 
 // fsOpenFlagsArg picks the real Node flags-string argument out of
@@ -167,7 +299,7 @@ func fsOpenFlagsArg(opts []interface{}) string {
 func fsClose(fd int64) error {
 	v, ok := fsFDs.LoadAndDelete(fd)
 	if !ok {
-		return nil
+		return syscall.EBADF
 	}
 	return v.(*os.File).Close()
 }
@@ -195,15 +327,6 @@ func fsReadEncoding(opts []interface{}) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func fsWrite(fd int64, data string) (int64, error) {
-	v, ok := fsFDs.Load(fd)
-	if !ok {
-		return 0, os.ErrInvalid
-	}
-	n, err := v.(*os.File).WriteString(data)
-	return int64(n), err
 }
 
 // pathArg extracts a filesystem path from a real Node fs path argument,
@@ -322,17 +445,6 @@ func declareFS(p *driver.Paserati) {
 				ns.Const(c.Name, c.Value)
 			}
 		})
-		m.Function("mkdirSync", func(pathVal vm.Value, opts map[string]interface{}) (interface{}, error) {
-			path, perr := pathArg(vmInst, pathVal)
-			if perr != nil {
-				return nil, perr
-			}
-			mkdirFn := os.Mkdir
-			if mkdirRecursiveRequested(opts) {
-				mkdirFn = os.MkdirAll
-			}
-			return nil, wrapFsErr(vmInst, "mkdir", path, mkdirFn(path, 0755))
-		})
 		m.Function("readdirSync", func(pathVal vm.Value, opts map[string]interface{}) ([]vm.Value, error) {
 			path, perr := pathArg(vmInst, pathVal)
 			if perr != nil {
@@ -352,36 +464,35 @@ func declareFS(p *driver.Paserati) {
 			}
 			return nil, wrapFsErr(vmInst, "unlink", path, os.Remove(path))
 		})
-		m.Function("rmdirSync", func(pathVal vm.Value) (interface{}, error) {
+		m.Function("statSync", func(pathVal vm.Value, opts ...vm.Value) (vm.Value, error) {
 			path, perr := pathArg(vmInst, pathVal)
 			if perr != nil {
-				return nil, perr
-			}
-			return nil, wrapFsErr(vmInst, "rmdir", path, os.Remove(path))
-		})
-		m.Function("statSync", func(pathVal vm.Value, _ ...interface{}) (*fsStats, error) {
-			path, perr := pathArg(vmInst, pathVal)
-			if perr != nil {
-				return nil, perr
+				return vm.Undefined, perr
 			}
 			fsTouch("stat", path)
 			info, err := os.Stat(path)
 			if err != nil {
-				return nil, wrapFsErr(vmInst, "stat", path, err)
+				if statThrowIfNoEntryFalse(opts) && os.IsNotExist(err) {
+					return vm.Undefined, nil
+				}
+				return vm.Undefined, wrapFsErr(vmInst, "stat", path, err)
 			}
-			return newFsStats(vmInst, info), nil
+			return fsStatsValue(vmInst, info), nil
 		})
-		m.Function("lstatSync", func(pathVal vm.Value, _ ...interface{}) (*fsStats, error) {
+		m.Function("lstatSync", func(pathVal vm.Value, opts ...vm.Value) (vm.Value, error) {
 			path, perr := pathArg(vmInst, pathVal)
 			if perr != nil {
-				return nil, perr
+				return vm.Undefined, perr
 			}
 			fsTouch("stat", path)
 			info, err := os.Lstat(path)
 			if err != nil {
-				return nil, wrapFsErr(vmInst, "lstat", path, err)
+				if statThrowIfNoEntryFalse(opts) && os.IsNotExist(err) {
+					return vm.Undefined, nil
+				}
+				return vm.Undefined, wrapFsErr(vmInst, "lstat", path, err)
 			}
-			return newFsStats(vmInst, info), nil
+			return fsStatsValue(vmInst, info), nil
 		})
 		m.Function("realpathSync", func(pathVal vm.Value, _ ...interface{}) (string, error) {
 			path, perr := pathArg(vmInst, pathVal)
@@ -390,22 +501,6 @@ func declareFS(p *driver.Paserati) {
 			}
 			resolved, err := filepath.EvalSymlinks(path)
 			return resolved, wrapFsErr(vmInst, "realpath", path, err)
-		})
-		m.Function("openSync", func(pathVal vm.Value, opts ...interface{}) (int64, error) {
-			path, perr := pathArg(vmInst, pathVal)
-			if perr != nil {
-				return 0, perr
-			}
-			flags := fsOpenFlagsArg(opts)
-			fd, err := fsOpen(path, flags)
-			return fd, wrapFsErr(vmInst, "open", path, err)
-		})
-		m.Function("closeSync", func(fd int64, _ ...interface{}) (interface{}, error) {
-			return nil, wrapFsErr(vmInst, "close", "", fsClose(fd))
-		})
-		m.Function("writeSync", func(fd int64, data string, _ ...interface{}) (int64, error) {
-			n, err := fsWrite(fd, data)
-			return n, wrapFsErr(vmInst, "write", "", err)
 		})
 		m.Function("copyFileSync", func(srcVal, dstVal vm.Value) (interface{}, error) {
 			src, perr := pathArg(vmInst, srcVal)

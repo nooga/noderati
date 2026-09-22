@@ -16936,3 +16936,141 @@ built on top of it (`express.json()`'s body parsing, most
 POST with a real JSON body, 404 fallback). `#512` and `#514` are both
 closed and both load-bearing. `go vet`/full suite clean.
 
+
+## Round 148: unblocking `tar` on the noderati side - real zlib compression classes, a complete fd-based `fs`, Node-shaped `Stats`, `EventEmitter` gaps, `process` ids/umask; five more paserati bugs found behind them (#516-#521)
+
+Goal for this round was the three targets last round left blocked on
+noderati-side gaps (`tar` on `zlib.createGzip`, `chokidar` on `fs.watch`,
+`vitest` on `child_process.fork`). This entry covers `tar`.
+
+**zlib (`zlib.go`, new `zlib_sync.go`).** Real `tar` never calls
+`createGzip()`. It goes through `minizlib`, which constructs real zlib
+*classes* (`new zlib.Gzip(opts)`, `new zlib.Unzip(opts)`) and drives them
+only through the **synchronous** `_processChunk(chunk, flushFlag)`,
+monkeypatching `_handle.close` around each call. So compression needed a
+synchronous handle, not another goroutine stream:
+- Compressors wrap Go's `gzip`/`zlib`/`flate` writers. Flush modes map to
+  real zlib semantics: `Z_NO_FLUSH` buffers, the sync/full/partial/block
+  modes `Flush()`, and `Z_FINISH` `Close()`s.
+- Decompressors keep Go's pull-based readers on a goroutine behind a
+  "starved" handoff. `process()` blocks only until the decoder has either
+  consumed every byte fed so far or finished, so incremental input still
+  streams.
+- On top of that: `Gzip`/`Gunzip`/`Deflate`/`Inflate`/`DeflateRaw`/
+  `InflateRaw`/`Unzip` classes (Transform-based), `createGzip`/
+  `createDeflate`/`createDeflateRaw`/`createUnzip`, all seven `*Sync`
+  functions and callback forms, and the full numeric `constants` table.
+- The existing goroutine-pumped `createGunzip`/`createInflate`/
+  `createInflateRaw` are untouched (undici's `fetch()` depends on them).
+
+Each of these was measured against real Node before being called right:
+- **Gzip header OS byte.** Real Node on macOS writes `19` (zlib's
+  `OS_CODE` for Apple), not `3`. Go's default is `255`.
+- **Trailing data after a gzip member.** My first assumption ("ignore
+  it") was wrong. Real zlib ignores trailing data only when it starts with
+  `0x00`. Anything else gets parsed as the next member's header, so
+  garbage gives `Z_DATA_ERROR incorrect header check` and a lone `0x1f`
+  gives `Z_BUF_ERROR unexpected end of file`.
+- **Bad magic is rejected early.** Real zlib checks the magic before a
+  full 10-byte header arrives, so `"not gzip"` gives `incorrect header
+  check`, not EOF.
+- **Empty `unzip` input** is an error.
+
+A 12-case edge-error matrix is now byte-identical to Node. Payloads
+written by each runtime decompress correctly in the other.
+
+**EventEmitter (`events.go`).**
+- Added `removeAllListeners`, `addListener`, `prependListener`,
+  `prependOnceListener`, `listeners`, `rawListeners`, `eventNames`, and
+  the `newListener`/`removeListener` meta-events. minizlib calls
+  `removeAllListeners('error')` after every chunk.
+- Fixed a real, pre-existing bug. `once()` wrappers didn't keep the
+  original as `.listener`, so `removeListener(ev, fn)` could never remove
+  a `once` listener. They also didn't unregister before running, and
+  called the listener with the wrong `this`.
+- Empty event keys are now deleted, as in Node. A 30-step reference trace
+  captured from real Node is identical.
+
+**fs (new `fs_fd.go`, `fs_stat_{darwin,linux,other}.go`; `fs.go`,
+`fs_async.go`, `fspromises.go`, `fs_errors.go`).** `fs-minipass` (tar's
+file streams) calls `fs.write(fd, buf, off, len, pos, cb)`, which didn't
+exist. Enumerating every `fs` method tar's bundle can reach turned up a
+lot more:
+- **New:** `open`, `close`, `fstat`, `read`, `write`, `writev`,
+  `futimes`, `fchmod`, `fchown`, `fsync`, `fdatasync`, `ftruncate`,
+  `chown`, `lchown`, `utimes`, `symlink`, `link` (callback and `*Sync`
+  forms, in all their real argument shapes), plus async `chmod`,
+  `rename`, `unlink`, `realpath`, and `readlinkSync`.
+- **Fixed, pre-existing, would have hung tar:** async `mkdir`/`rmdir`/
+  `realpath`/`utimes` took the callback in a *fixed* position, so tar's
+  `fs.mkdir(dir, mode, cb)` would never have called back. `mkdir` now
+  honors `mode`/`recursive` and returns the first directory created (sync,
+  callback, and promise forms). tar uses that return value.
+- **Fixed:** `utimes` treated a number as milliseconds. Real Node treats
+  numbers and numeric strings as *seconds* (fractional allowed) and Dates
+  as ms (measured).
+- **Fixed:** noderati's own fd counter started at 1, colliding with
+  stdio. Files are now keyed by their real OS fd, with 0/1/2 resolving to
+  stdio, so `fs.writeSync(1, ...)` works. `open` now honors `mode` and
+  numeric flags. Closing an unknown fd is `EBADF`, and fd errors omit the
+  empty `'path'` suffix exactly as Node's messages do.
+- **Stats are now Node-shaped:** `dev`/`mode` (with `S_IFMT` bits)/
+  `nlink`/`uid`/`gid`/`rdev`/`blksize`/`ino`/`size`/`blocks` and all four
+  `*Ms`, in Node's key order. The `is*()` predicates live on a shared
+  prototype and read `this.mode`. `atime`/`mtime`/`ctime`/`birthtime` are
+  lazy prototype accessors that turn into own enumerable properties on
+  first read or write, matching Node 22+ exactly. `statSync` supports
+  `throwIfNoEntry: false`. The two separate stats builders (struct
+  reflection for sync/promise, a hand-built object for callbacks) are now
+  one, so they can't drift apart again.
+
+A 39-step fs parity script is byte-identical to real Node.
+
+**process (`process.go`).** Added `getuid`, `geteuid`, `getgid`,
+`getegid`, `getgroups`, and `umask` (read, and set-returning-previous).
+All were missing. tar decides header owner names with `stat.uid ===
+process.getuid()`.
+
+**Result: `tar.c()` output is now byte-identical to real Node's** except
+for one byte, and that byte is an engine bug (below). Archives created
+under noderati list correctly with system `tar -tvf`.
+
+**Engine bugs found behind these, each reduced to a noderati-free repro
+and filed:**
+- [paserati#516](https://github.com/nooga/paserati/issues/516):
+  `JSON.stringify` HTML-escapes `<>&` and U+2028/2029 in object *keys*
+  only. Keys go through Go's `json.Marshal`.
+- [paserati#517](https://github.com/nooga/paserati/issues/517): a
+  TypeError that `prepareCall` raises in-band at a **tail call** (`return
+  f()` where `f` isn't callable, a class called without `new`, a revoked
+  proxy) skips `catch` *and* `finally` and silently halts the script with
+  exit 0. `OpCall` re-syncs frame state after `prepareCall`, but the
+  `OpTailCall`/`OpTailCallMethod` fallbacks don't. This was the most
+  dangerous one found: it made the next bug look like tar exiting cleanly
+  with no output.
+- [paserati#518](https://github.com/nooga/paserati/issues/518):
+  `super[symbol]` reads and writes the *string* key `"Symbol(desc)"`.
+  minizlib's `Gzip` does `return super[_superWrite](data)`, so every gzip
+  write fails (and via #517, silently).
+- [paserati#519](https://github.com/nooga/paserati/issues/519): `new
+  Date(1.7).getTime()` returns `1.7` (missing TimeClip). Worked around on
+  the noderati side for Stats Dates.
+- [paserati#520](https://github.com/nooga/paserati/issues/520): an arrow
+  function created *before* `super()` in a derived constructor captures
+  the uninitialized `this` by value forever. tar's `Unpack` does
+  `t.ondone=()=>{this[...]...}, super(t)`, so every extraction throws when
+  it finishes.
+- [paserati#521](https://github.com/nooga/paserati/issues/521):
+  `Object.assign` bypasses inherited setters and defines own properties
+  instead of doing a real [[Set]]. tar's `Header` stores `type` through a
+  class setter, so directories get typeflag `'0'` instead of `'5'`. That
+  is the one byte of archive difference above.
+
+**Status**:
+- `tar` creation (uncompressed) works end to end, minus #521's byte.
+- `tar` extraction is blocked on #520.
+- gzip'd tar is blocked on #518 (and #517).
+- Nothing tar needs from noderati itself is missing any more.
+- New regression tests are in `node_parity_test.go`. Every expected value
+  there was captured from real Node running the identical script.
+- `go vet` and the full suite are clean.
