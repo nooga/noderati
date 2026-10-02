@@ -2,9 +2,13 @@ package host
 
 const eventsShim = `import { AsyncResource } from "node:async_hooks";
 
+const kCapture = Symbol("kCapture");
+const kRejection = Symbol.for("nodejs.rejection");
+const errorMonitor = Symbol("events.errorMonitor");
+
 class EventEmitter {
-  constructor() {
-    this._events = Object.create(null);
+  constructor(opts) {
+    EventEmitter.init.call(this, opts);
   }
   on(event, listener) {
     // Every method below re-checks 'this._events' itself rather than
@@ -130,6 +134,7 @@ class EventEmitter {
   // http, not this JS-shim one instantiated by real user code that
   // extends EventEmitter directly) - worth having in both.
   emit(event, ...args) {
+    if (event === "error" && this._events && this._events[errorMonitor]) this.emit(errorMonitor, ...args);
     const list = this._events && this._events[event];
     if (!list || list.length === 0) {
       if (event === "error") {
@@ -141,7 +146,14 @@ class EventEmitter {
       }
       return false;
     }
-    for (const fn of list.slice()) fn.call(this, ...args);
+    for (const fn of list.slice()) {
+      const result = fn.call(this, ...args);
+      // captureRejections: a rejected promise returned by a listener is
+      // routed to this[Symbol.for("nodejs.rejection")] or 'error'.
+      if (result !== undefined && result !== null && this[kCapture] && typeof result.then === "function") {
+        result.then(undefined, (err) => process.nextTick(emitUnhandledRejectionOrErr, this, err, event, args));
+      }
+    }
     return true;
   }
   // setMaxListeners/getMaxListeners INSTANCE methods were missing
@@ -260,6 +272,188 @@ function addAbortListener(signal, listener) {
 }
 EventEmitter.addAbortListener = addAbortListener;
 
+// The rest of lib/events.js's module surface, following Node's own
+// implementation: init (what the constructor runs), captureRejections,
+// errorMonitor, the static listenerCount/getEventListeners, and the
+// promise/async-iterator helpers once() and on().
+EventEmitter.init = function init(opts) {
+  if (this._events === undefined || this._events === Object.getPrototypeOf(this)._events) {
+    this._events = Object.create(null);
+  }
+  if (opts && opts.captureRejections !== undefined) {
+    if (typeof opts.captureRejections !== "boolean") {
+      throw invalidArgType("options.captureRejections", "boolean", opts.captureRejections);
+    }
+    this[kCapture] = opts.captureRejections;
+  } else if (EventEmitter.prototype[kCapture]) {
+    this[kCapture] = true;
+  }
+};
+EventEmitter.prototype[kCapture] = false;
+Object.defineProperty(EventEmitter, "captureRejections", {
+  get() { return EventEmitter.prototype[kCapture]; },
+  set(value) {
+    if (typeof value !== "boolean") throw invalidArgType("EventEmitter.captureRejections", "boolean", value);
+    EventEmitter.prototype[kCapture] = value;
+  },
+  enumerable: true,
+});
+EventEmitter.captureRejectionSymbol = kRejection;
+EventEmitter.errorMonitor = errorMonitor;
+EventEmitter.usingDomains = false;
+
+function emitUnhandledRejectionOrErr(ee, err, type, args) {
+  if (typeof ee[kRejection] === "function") {
+    ee[kRejection](err, type, ...args);
+    return;
+  }
+  const prev = ee[kCapture];
+  try {
+    ee[kCapture] = false;
+    ee.emit("error", err);
+  } finally {
+    ee[kCapture] = prev;
+  }
+}
+
+function invalidArgType(name, expected, actual) {
+  let received;
+  if (actual == null) received = " Received " + actual;
+  else if (typeof actual === "function") received = " Received function " + (actual.name || "<anonymous>");
+  else if (typeof actual === "object") received = " Received an instance of " + ((actual.constructor && actual.constructor.name) || "Object");
+  else received = " Received type " + typeof actual + " (" + (typeof actual === "string" ? "'" + actual + "'" : String(actual)) + ")";
+  const err = new TypeError('The "' + name + '" property must be of type ' + expected + "." + received);
+  err.code = "ERR_INVALID_ARG_TYPE";
+  return err;
+}
+
+function abortError(signal) {
+  const err = new Error("The operation was aborted", signal ? { cause: signal.reason } : undefined);
+  err.name = "AbortError";
+  err.code = "ABORT_ERR";
+  return err;
+}
+
+function listenerCount(emitter, type) {
+  if (typeof emitter.listenerCount === "function") return emitter.listenerCount(type);
+  return EventEmitter.prototype.listenerCount.call(emitter, type);
+}
+EventEmitter.listenerCount = listenerCount;
+
+function getEventListeners(emitterOrTarget, type) {
+  if (emitterOrTarget && typeof emitterOrTarget.listeners === "function") return emitterOrTarget.listeners(type);
+  if (emitterOrTarget && typeof emitterOrTarget.addEventListener === "function") return [];
+  throw invalidArgType("emitter", "EventEmitter or EventTarget", emitterOrTarget);
+}
+
+function agnosticAdd(emitter, name, listener, once) {
+  if (typeof emitter.on === "function") {
+    if (once) emitter.once(name, listener);
+    else emitter.on(name, listener);
+  } else if (typeof emitter.addEventListener === "function") {
+    emitter.addEventListener(name, listener, { once });
+  } else {
+    throw invalidArgType("emitter", "EventEmitter", emitter);
+  }
+}
+function agnosticRemove(emitter, name, listener) {
+  if (typeof emitter.removeListener === "function") emitter.removeListener(name, listener);
+  else if (typeof emitter.removeEventListener === "function") emitter.removeEventListener(name, listener);
+}
+
+async function once(emitter, name, options = {}) {
+  const signal = options ? options.signal : undefined;
+  if (signal && signal.aborted) throw abortError(signal);
+  return new Promise((resolve, reject) => {
+    const errorListener = (err) => {
+      emitter.removeListener(name, resolver);
+      if (signal) agnosticRemove(signal, "abort", abortListener);
+      reject(err);
+    };
+    const resolver = (...args) => {
+      if (typeof emitter.removeListener === "function") emitter.removeListener("error", errorListener);
+      if (signal) agnosticRemove(signal, "abort", abortListener);
+      resolve(args);
+    };
+    agnosticAdd(emitter, name, resolver, true);
+    if (name !== "error" && typeof emitter.once === "function") emitter.once("error", errorListener);
+    function abortListener() {
+      agnosticRemove(emitter, name, resolver);
+      agnosticRemove(emitter, "error", errorListener);
+      reject(abortError(signal));
+    }
+    if (signal) agnosticAdd(signal, "abort", abortListener, true);
+  });
+}
+
+const AsyncIteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf(async function* () {}).prototype);
+
+function on(emitter, event, options = {}) {
+  const signal = options ? options.signal : undefined;
+  if (signal && signal.aborted) throw abortError(signal);
+  const closeEvents = (options && options.close) || [];
+  const unconsumedEvents = [];
+  const unconsumedPromises = [];
+  let error = null;
+  let finished = false;
+
+  const iterator = Object.setPrototypeOf({
+    next() {
+      if (unconsumedEvents.length > 0) return Promise.resolve({ value: unconsumedEvents.shift(), done: false });
+      if (error) {
+        const p = Promise.reject(error);
+        error = null;
+        return p;
+      }
+      if (finished) return closeHandler();
+      return new Promise((resolve, reject) => unconsumedPromises.push({ resolve, reject }));
+    },
+    return() {
+      return closeHandler();
+    },
+    throw(err) {
+      if (!(err instanceof Error)) throw invalidArgType("EventEmitter.AsyncIterator", "Error", err);
+      errorHandler(err);
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  }, AsyncIteratorPrototype);
+
+  agnosticAdd(emitter, event, eventHandler, false);
+  if (event !== "error" && typeof emitter.on === "function") emitter.on("error", errorHandler);
+  for (const name of closeEvents) agnosticAdd(emitter, name, closeHandler, false);
+  const abortListener = () => errorHandler(abortError(signal));
+  if (signal) agnosticAdd(signal, "abort", abortListener, true);
+  return iterator;
+
+  function removeAll() {
+    agnosticRemove(emitter, event, eventHandler);
+    agnosticRemove(emitter, "error", errorHandler);
+    for (const name of closeEvents) agnosticRemove(emitter, name, closeHandler);
+    if (signal) agnosticRemove(signal, "abort", abortListener);
+  }
+  function eventHandler(...args) {
+    if (unconsumedPromises.length > 0) unconsumedPromises.shift().resolve({ value: args, done: false });
+    else unconsumedEvents.push(args);
+  }
+  function errorHandler(err) {
+    if (unconsumedPromises.length === 0) error = err;
+    else unconsumedPromises.shift().reject(err);
+    closeHandler();
+  }
+  function closeHandler() {
+    removeAll();
+    finished = true;
+    const done = { value: undefined, done: true };
+    while (unconsumedPromises.length > 0) unconsumedPromises.shift().resolve(done);
+    return Promise.resolve(done);
+  }
+}
+EventEmitter.once = once;
+EventEmitter.on = on;
+EventEmitter.getEventListeners = getEventListeners;
+
 // EventEmitterAsyncResource was entirely missing - found chasing real
 // tinypool (vitest's own real worker-pool dependency, its actual
 // process/worker orchestration - exactly what made this a worthwhile
@@ -301,7 +495,12 @@ class EventEmitterAsyncResource extends EventEmitter {
   }
 }
 
-export { EventEmitter, EventEmitterAsyncResource, getMaxListeners, setMaxListeners, defaultMaxListeners, addAbortListener };
+EventEmitter.EventEmitterAsyncResource = EventEmitterAsyncResource;
+const captureRejectionSymbol = kRejection;
+const usingDomains = false;
+const init = EventEmitter.init;
+export { EventEmitter, EventEmitterAsyncResource, getMaxListeners, setMaxListeners, defaultMaxListeners, addAbortListener,
+  once, on, errorMonitor, captureRejectionSymbol, getEventListeners, listenerCount, usingDomains, init };
 export default EventEmitter;
 `
 

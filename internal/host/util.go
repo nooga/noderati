@@ -262,7 +262,13 @@ func installUtilNatives(p *driver.Paserati) {
 		}
 		return vm.BooleanValue(ta.GetElementType() == vm.TypedArrayUint8), nil
 	}))
+	addUtilTypePredicates(typesObj)
 	exports["types"] = vm.NewValueFromPlainObject(typesObj)
+	installSystemErrorHelpers(vmInst, exports)
+	if dl, ok := exports["debuglog"]; ok {
+		exports["debug"] = dl
+	}
+	exports["isArray"] = jsGlobalMethod(vmInst, "Array", "isArray")
 
 	// Also exposed as globalThis.__noderatiUtilTypes so the separate
 	// "node:util/types" module (util_types.go - a real, distinct Node
@@ -289,12 +295,27 @@ func installUtilNatives(p *driver.Paserati) {
 	// lib/mock/mock-client.js's `close()`, is mock-only and never
 	// exercised by a real fetch), but this needs to actually work rather
 	// than merely exist, so it's built for real rather than guessed at.
-	exports["promisify"] = vm.NewNativeFunction(1, false, "promisify", func(args []vm.Value) (vm.Value, error) {
+	//
+	// As in Node: util.promisify.custom (Symbol.for(
+	// "nodejs.util.promisify.custom")) on the original wins outright; the
+	// callback's first result is what resolves (extra results are
+	// dropped); `this` is forwarded; and the wrapper is tagged with the
+	// custom symbol so promisifying it again returns it unchanged.
+	customSym := jsSymbolFor(vmInst, "nodejs.util.promisify.custom")
+	promisifyFn := vm.NewNativeFunctionWithProps(1, false, "promisify", func(args []vm.Value) (vm.Value, error) {
 		if len(args) == 0 || !args[0].IsCallable() {
-			return vm.Undefined, vmInst.NewTypeError("The \"original\" argument must be of type function")
+			return vm.Undefined, newNodeTypeError(vmInst, "ERR_INVALID_ARG_TYPE", "The \"original\" argument must be of type function."+receivedSuffix(vmInst, argAt(args, 0)))
 		}
 		original := args[0]
+		if custom, err := jsReflectGet(vmInst, original, customSym); err == nil && !isNullish(custom) {
+			if !custom.IsCallable() {
+				return vm.Undefined, newNodeTypeError(vmInst, "ERR_INVALID_ARG_TYPE", "The \"util.promisify.custom\" argument must be of type function."+receivedSuffix(vmInst, custom))
+			}
+			_ = jsDefineHidden(vmInst, custom, customSym, custom)
+			return custom, nil
+		}
 		wrapped := vm.NewNativeFunction(-1, true, "promisified", func(callArgs []vm.Value) (vm.Value, error) {
+			thisVal := vmInst.GetThis()
 			resolveFn := vm.Undefined
 			rejectFn := vm.Undefined
 			executor := vm.NewNativeFunction(2, false, "executor", func(rr []vm.Value) (vm.Value, error) {
@@ -311,35 +332,28 @@ func installUtilNatives(p *driver.Paserati) {
 				return vm.Undefined, perr
 			}
 			cb := vm.NewNativeFunction(-1, true, "callback", func(cbArgs []vm.Value) (vm.Value, error) {
-				if len(cbArgs) > 0 && !cbArgs[0].IsUndefined() && cbArgs[0].Type() != vm.TypeNull {
+				if len(cbArgs) > 0 && cbArgs[0].IsTruthy() {
 					_, _ = vmInst.Call(rejectFn, vm.Undefined, []vm.Value{cbArgs[0]})
 					return vm.Undefined, nil
 				}
-				result := vm.Undefined
-				switch {
-				case len(cbArgs) == 2:
-					result = cbArgs[1]
-				case len(cbArgs) > 2:
-					arr := vm.NewArray()
-					a := arr.AsArray()
-					for _, v := range cbArgs[1:] {
-						a.Append(v)
-					}
-					result = arr
-				}
-				_, _ = vmInst.Call(resolveFn, vm.Undefined, []vm.Value{result})
+				_, _ = vmInst.Call(resolveFn, vm.Undefined, []vm.Value{argAt(cbArgs, 1)})
 				return vm.Undefined, nil
 			})
 			fullArgs := append(append([]vm.Value{}, callArgs...), cb)
-			if _, err := vmInst.Call(original, vm.Undefined, fullArgs); err != nil {
+			if _, err := vmInst.Call(original, thisVal, fullArgs); err != nil {
 				if rejectFn.IsCallable() {
 					_, _ = vmInst.Call(rejectFn, vm.Undefined, []vm.Value{errorValueFromGo(vmInst, err)})
 				}
 			}
 			return promise, nil
 		})
+		_ = jsDefineHidden(vmInst, wrapped, customSym, wrapped)
 		return wrapped, nil
 	})
+	if props := promisifyFn.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+		props.Properties.SetOwn("custom", customSym)
+	}
+	exports["promisify"] = promisifyFn
 
 	// util.TextEncoder/util.TextDecoder: real Node re-exports the global
 	// WHATWG constructors here too (a long-standing legacy alias -

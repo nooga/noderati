@@ -176,7 +176,9 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 			return vm.Undefined, nil
 		}
 		fn := args[0]
-		fnArgs := args[1:]
+		// A copy: args aliases the VM's argument window, which is reused
+		// before the tick runs.
+		fnArgs := append([]vm.Value(nil), args[1:]...)
 		rt.ScheduleNextTick(func() {
 			// Mirrors #484's own fix (docs/real-node-plan.md, this
 			// round): this is noderati's own separate process.nextTick

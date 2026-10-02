@@ -330,8 +330,7 @@ func TestStreamWritableDefaultWriteThrows(t *testing.T) {
 		import { Writable } from "node:stream";
 		const w = new Writable();
 		let code = "";
-		w.on("error", (e) => { code = e.code; });
-		w.write("x");
+		try { w.write("x"); } catch (e) { code = e.code; }
 		code
 	`, driver.RunOptions{})
 	if len(errs) > 0 {

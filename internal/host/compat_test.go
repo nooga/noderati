@@ -490,7 +490,7 @@ func TestSpawnSyncArgs(t *testing.T) {
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
 		import { spawnSync } from "node:child_process";
-		const r = spawnSync("echo", "hello", "world");
+		const r = spawnSync("echo", ["hello", "world"], { encoding: "utf8" });
 		r.stdout.trim()
 	`, driver.RunOptions{})
 	if len(errs) > 0 {

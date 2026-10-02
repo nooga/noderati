@@ -813,66 +813,486 @@ function readableFrom(iterable, opts) {
 // codebase's own dependency tree does override _write, so this is
 // purely about not silently misrepresenting "nothing happened" as
 // success on the one hypothetical caller that doesn't.
-function notImplementedWriteError() {
-  const err = new Error("The _write() method is not implemented");
-  err.code = "ERR_METHOD_NOT_IMPLEMENTED";
+function nodeError(Base, code, message) {
+  const err = new Base(message);
+  err.code = code;
   return err;
+}
+function streamReceived(v) {
+  if (v == null) return " Received " + v;
+  if (typeof v === "function") return " Received function " + (v.name || "<anonymous>");
+  if (typeof v === "object") return " Received an instance of " + ((v.constructor && v.constructor.name) || "Object");
+  let s = typeof v === "string" ? "'" + v + "'" : String(v);
+  if (typeof v === "string" && v.length > 28) s = "'" + v.slice(0, 25) + "'...";
+  return " Received type " + typeof v + " (" + s + ")";
+}
+function notImplementedWriteError() {
+  return nodeError(Error, "ERR_METHOD_NOT_IMPLEMENTED", "The _write() method is not implemented");
+}
+const kOnFinished = Symbol("kOnFinished");
+function nop() {}
+
+function writableHighWaterMark(opts, objectMode) {
+  const hwm = opts == null ? undefined : (opts.writableHighWaterMark ?? opts.highWaterMark);
+  if (hwm == null) return defaultHighWaterMark(objectMode);
+  if (!Number.isInteger(hwm) || hwm < 0) {
+    throw nodeError(RangeError, "ERR_INVALID_ARG_VALUE", 'The property \'options.highWaterMark\' is invalid. Received ' + hwm);
+  }
+  return hwm;
+}
+
+class WritableState {
+  constructor(opts, stream) {
+    opts = opts || {};
+    this.objectMode = !!(opts.objectMode || opts.writableObjectMode);
+    this.highWaterMark = writableHighWaterMark(opts, this.objectMode);
+    this.finalCalled = false;
+    this.needDrain = false;
+    this.ending = false;
+    this.ended = false;
+    this.finished = false;
+    this.destroyed = false;
+    this.decodeStrings = opts.decodeStrings !== false;
+    this.defaultEncoding = opts.defaultEncoding || "utf8";
+    this.length = 0;
+    this.writing = false;
+    this.corked = 0;
+    this.sync = true;
+    this.bufferProcessing = false;
+    this.onwrite = (er) => onwrite(stream, er);
+    this.writecb = null;
+    this.writelen = 0;
+    this.afterWriteTickInfo = null;
+    this.buffered = [];
+    this.pendingcb = 0;
+    this.constructed = true;
+    this.prefinished = false;
+    this.errorEmitted = false;
+    this.emitClose = opts.emitClose !== false;
+    this.autoDestroy = opts.autoDestroy !== false;
+    this.errored = null;
+    this.closed = false;
+    this.closeEmitted = false;
+    this[kOnFinished] = [];
+  }
 }
 
 class Writable extends EventEmitter {
-  constructor(_opts) {
+  constructor(opts) {
     super();
-    this.writable = true;
+    opts = opts || {};
+    this._writableState = new WritableState(opts, this);
+    if (typeof opts.write === "function") this._write = opts.write;
+    if (typeof opts.writev === "function") this._writev = opts.writev;
+    if (typeof opts.destroy === "function") this._destroy = opts.destroy;
+    if (typeof opts.final === "function") this._final = opts.final;
+    if (typeof opts.construct === "function") this._construct = opts.construct;
+    if (typeof this._construct === "function") {
+      const state = this._writableState;
+      state.constructed = false;
+      process.nextTick(() => {
+        let called = false;
+        this._construct((err) => {
+          if (called) return errorOrDestroyW(this, nodeError(Error, "ERR_MULTIPLE_CALLBACK", "Callback called multiple times"));
+          called = true;
+          state.constructed = true;
+          this.emit("__noderatiConstructed");
+          if (err) errorOrDestroyW(this, err, true);
+          else if (!state.destroyed) {
+            clearBuffer(this, state);
+            finishMaybe(this, state);
+          }
+        });
+      });
+    }
   }
-  _write(chunk, _encoding, callback) {
-    callback(notImplementedWriteError());
+  get writable() {
+    const w = this._writableState;
+    return !!w && w.writable !== false && !w.destroyed && !w.errored && !w.ending && !w.ended;
   }
-  _final(callback) {
-    callback();
+  set writable(val) {
+    if (this._writableState) this._writableState.writable = !!val;
+  }
+  get writableFinished() { return this._writableState ? this._writableState.finished : false; }
+  get writableObjectMode() { return this._writableState ? this._writableState.objectMode : false; }
+  get writableBuffer() { return this._writableState && this._writableState.buffered.map((b) => b.chunk); }
+  get writableEnded() { return this._writableState ? this._writableState.ending : false; }
+  get writableNeedDrain() {
+    const w = this._writableState;
+    return w ? !w.destroyed && !w.ending && w.needDrain : false;
+  }
+  get writableHighWaterMark() { return this._writableState && this._writableState.highWaterMark; }
+  get writableCorked() { return this._writableState ? this._writableState.corked : 0; }
+  get writableLength() { return this._writableState && this._writableState.length; }
+  get errored() { return this._writableState ? this._writableState.errored : null; }
+  get closed() { return this._writableState ? this._writableState.closed : false; }
+  get destroyed() { return this._writableState ? this._writableState.destroyed : false; }
+  set destroyed(v) { if (this._writableState) this._writableState.destroyed = v; }
+  get writableAborted() {
+    const w = this._writableState;
+    return !!(w.writable !== false && (w.destroyed || w.errored) && !w.finished);
+  }
+
+  _write(chunk, encoding, cb) {
+    if (this._writev) this._writev([{ chunk, encoding }], cb);
+    else throw notImplementedWriteError();
   }
   write(chunk, encoding, cb) {
-    if (typeof encoding === "function") {
-      cb = encoding;
-      encoding = undefined;
+    return writeInternal(this, chunk, encoding, cb) === true;
+  }
+  cork() {
+    this._writableState.corked++;
+  }
+  uncork() {
+    const state = this._writableState;
+    if (state.corked) {
+      state.corked--;
+      if (!state.writing) clearBuffer(this, state);
     }
-    this._write(chunk, encoding, (err) => {
-      if (err) {
-        this.emit("error", err);
-        if (typeof cb === "function") cb(err);
-        return;
-      }
-      if (typeof cb === "function") cb();
-    });
-    return true;
+  }
+  setDefaultEncoding(encoding) {
+    if (typeof encoding === "string") encoding = encoding.toLowerCase();
+    if (!Buffer.isEncoding(encoding)) throw nodeError(TypeError, "ERR_UNKNOWN_ENCODING", "Unknown encoding: " + encoding);
+    this._writableState.defaultEncoding = encoding;
+    return this;
   }
   end(chunk, encoding, cb) {
+    const state = this._writableState;
     if (typeof chunk === "function") {
       cb = chunk;
-      chunk = undefined;
+      chunk = null;
+      encoding = null;
     } else if (typeof encoding === "function") {
       cb = encoding;
+      encoding = null;
     }
-    const finishUp = (err) => {
-      if (err) {
-        this.emit("error", err);
-        if (typeof cb === "function") cb(err);
-        return;
-      }
-      this.emit("finish");
-      if (typeof cb === "function") cb();
-    };
-    if (chunk !== undefined) {
-      this._write(chunk, encoding, (err) => {
-        if (err) {
-          finishUp(err);
-          return;
-        }
-        this._final(finishUp);
-      });
-    } else {
-      this._final(finishUp);
+    let err;
+    if (chunk !== null && chunk !== undefined) {
+      const ret = writeInternal(this, chunk, encoding);
+      if (ret instanceof Error) err = ret;
+    }
+    if (state.corked) {
+      state.corked = 1;
+      this.uncork();
+    }
+    if (err) {
+      // the write already failed
+    } else if (!state.errored && !state.ending) {
+      state.ending = true;
+      finishMaybe(this, state, true);
+      state.ended = true;
+    } else if (state.finished) {
+      err = nodeError(Error, "ERR_STREAM_ALREADY_FINISHED", "Cannot call end after a stream was finished");
+    } else if (state.destroyed) {
+      err = nodeError(Error, "ERR_STREAM_DESTROYED", "Cannot call end after a stream was destroyed");
+    }
+    if (typeof cb === "function") {
+      if (err) process.nextTick(cb, err);
+      else if (state.finished) process.nextTick(cb, null);
+      else state[kOnFinished].push(cb);
     }
     return this;
+  }
+  destroy(err, cb) {
+    const state = this._writableState;
+    if (!state.destroyed && (state.buffered.length || state[kOnFinished].length)) process.nextTick(errorBuffer, state);
+    if (state.destroyed) {
+      if (typeof cb === "function") cb();
+      return this;
+    }
+    if (err && !state.errored) state.errored = err;
+    state.destroyed = true;
+    const run = () => {
+      let called = false;
+      const onDestroy = (e) => {
+        if (called) return;
+        called = true;
+        if (e && !state.errored) state.errored = e;
+        state.closed = true;
+        if (typeof cb === "function") cb(e);
+        process.nextTick(() => {
+          if (e && !state.errorEmitted) {
+            state.errorEmitted = true;
+            this.emit("error", e);
+          }
+          state.closeEmitted = true;
+          if (state.emitClose) this.emit("close");
+        });
+      };
+      try {
+        this._destroy(err || null, onDestroy);
+      } catch (e) {
+        onDestroy(e);
+      }
+    };
+    if (!state.constructed) this.once("__noderatiConstructed", run);
+    else run();
+    return this;
+  }
+  _destroy(err, cb) {
+    cb(err);
+  }
+  [Symbol.asyncDispose]() {
+    return new Promise((resolve, reject) => {
+      this.destroy(null, (err) => (err ? reject(err) : resolve()));
+    });
+  }
+}
+
+function errorOrDestroyW(stream, err, sync) {
+  const w = stream._writableState;
+  if (w.destroyed) return stream;
+  if (w.autoDestroy) {
+    stream.destroy(err);
+  } else if (err) {
+    if (!w.errored) w.errored = err;
+    if (sync) process.nextTick(() => emitErrorW(stream, err));
+    else emitErrorW(stream, err);
+  }
+  return stream;
+}
+
+function emitErrorW(stream, err) {
+  const w = stream._writableState;
+  if (w.errorEmitted) return;
+  w.errorEmitted = true;
+  stream.emit("error", err);
+}
+
+function writeInternal(stream, chunk, encoding, cb) {
+  const state = stream._writableState;
+  if (typeof encoding === "function") {
+    cb = encoding;
+    encoding = state.objectMode ? undefined : state.defaultEncoding;
+  } else {
+    if (!encoding) encoding = state.objectMode ? undefined : state.defaultEncoding;
+    else if (encoding !== "buffer" && !Buffer.isEncoding(encoding)) throw nodeError(TypeError, "ERR_UNKNOWN_ENCODING", "Unknown encoding: " + encoding);
+    if (typeof cb !== "function") cb = nop;
+  }
+  if (chunk === null) {
+    throw nodeError(TypeError, "ERR_STREAM_NULL_VALUES", "May not write null values to stream");
+  } else if (!state.objectMode) {
+    if (typeof chunk === "string") {
+      if (state.decodeStrings !== false) {
+        chunk = Buffer.from(chunk, encoding);
+        encoding = "buffer";
+      }
+    } else if (chunk instanceof Buffer) {
+      encoding = "buffer";
+    } else if (ArrayBuffer.isView(chunk)) {
+      chunk = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      encoding = "buffer";
+    } else {
+      throw nodeError(TypeError, "ERR_INVALID_ARG_TYPE",
+        'The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView.' + streamReceived(chunk));
+    }
+  }
+  let err;
+  if (state.ending) err = nodeError(Error, "ERR_STREAM_WRITE_AFTER_END", "write after end");
+  else if (state.destroyed) err = nodeError(Error, "ERR_STREAM_DESTROYED", "Cannot call write after a stream was destroyed");
+  if (err) {
+    process.nextTick(cb, err);
+    errorOrDestroyW(stream, err, true);
+    return err;
+  }
+  state.pendingcb++;
+  return writeOrBuffer(stream, state, chunk, encoding, cb);
+}
+
+function writeOrBuffer(stream, state, chunk, encoding, callback) {
+  const len = state.objectMode ? 1 : chunk.length;
+  state.length += len;
+  const ret = state.length < state.highWaterMark;
+  if (!ret) state.needDrain = true;
+  if (state.writing || state.corked || state.errored || !state.constructed) {
+    state.buffered.push({ chunk, encoding, callback });
+  } else {
+    state.writelen = len;
+    state.writecb = callback;
+    state.writing = true;
+    state.sync = true;
+    stream._write(chunk, encoding, state.onwrite);
+    state.sync = false;
+  }
+  return ret && !state.errored && !state.destroyed;
+}
+
+function doWrite(stream, state, writev, len, chunk, encoding, cb) {
+  state.writelen = len;
+  state.writecb = cb;
+  state.writing = true;
+  state.sync = true;
+  if (state.destroyed) state.onwrite(nodeError(Error, "ERR_STREAM_DESTROYED", "Cannot call write after a stream was destroyed"));
+  else if (writev) stream._writev(chunk, state.onwrite);
+  else stream._write(chunk, encoding, state.onwrite);
+  state.sync = false;
+}
+
+function onwrite(stream, er) {
+  const state = stream._writableState;
+  const sync = state.sync;
+  const cb = state.writecb;
+  if (typeof cb !== "function") {
+    errorOrDestroyW(stream, nodeError(Error, "ERR_MULTIPLE_CALLBACK", "Callback called multiple times"));
+    return;
+  }
+  state.writing = false;
+  state.writecb = null;
+  state.length -= state.writelen;
+  state.writelen = 0;
+  if (er) {
+    if (!state.errored) state.errored = er;
+    if (sync) process.nextTick(onwriteError, stream, state, er, cb);
+    else onwriteError(stream, state, er, cb);
+  } else {
+    if (state.buffered.length > 0) clearBuffer(stream, state);
+    if (sync) {
+      if (state.afterWriteTickInfo !== null && state.afterWriteTickInfo.cb === cb) {
+        state.afterWriteTickInfo.count++;
+      } else {
+        state.afterWriteTickInfo = { count: 1, cb, stream, state };
+        process.nextTick(afterWriteTick, state.afterWriteTickInfo);
+      }
+    } else {
+      afterWrite(stream, state, 1, cb);
+    }
+  }
+}
+
+function afterWriteTick(info) {
+  info.state.afterWriteTickInfo = null;
+  return afterWrite(info.stream, info.state, info.count, info.cb);
+}
+
+function afterWrite(stream, state, count, cb) {
+  const needDrain = !state.ending && !stream.destroyed && state.length === 0 && state.needDrain;
+  if (needDrain) {
+    state.needDrain = false;
+    stream.emit("drain");
+  }
+  while (count-- > 0) {
+    state.pendingcb--;
+    cb(null);
+  }
+  if (state.destroyed) errorBuffer(state);
+  finishMaybe(stream, state);
+}
+
+function errorBuffer(state) {
+  if (state.writing) return;
+  const buffered = state.buffered.splice(0);
+  for (const { chunk, callback } of buffered) {
+    state.length -= state.objectMode ? 1 : chunk.length;
+    callback(state.errored ?? nodeError(Error, "ERR_STREAM_DESTROYED", "Cannot call write after a stream was destroyed"));
+  }
+  for (const cb of state[kOnFinished].splice(0)) {
+    cb(state.errored ?? nodeError(Error, "ERR_STREAM_DESTROYED", "Cannot call end after a stream was destroyed"));
+  }
+}
+
+function onwriteError(stream, state, er, cb) {
+  --state.pendingcb;
+  cb(er);
+  errorBuffer(state);
+  errorOrDestroyW(stream, er);
+}
+
+function clearBuffer(stream, state) {
+  if (state.corked || state.bufferProcessing || state.destroyed || !state.constructed) return;
+  const buffered = state.buffered;
+  if (buffered.length === 0) return;
+  state.bufferProcessing = true;
+  if (buffered.length > 1 && stream._writev) {
+    state.pendingcb -= buffered.length - 1;
+    const callbacks = buffered.map((b) => b.callback);
+    const callback = (err) => {
+      for (const c of callbacks) c(err);
+    };
+    const chunks = buffered.map(({ chunk, encoding }) => ({ chunk, encoding }));
+    state.buffered = [];
+    doWrite(stream, state, true, state.length, chunks, "", callback);
+  } else {
+    let i = 0;
+    while (i < buffered.length) {
+      const { chunk, encoding, callback } = buffered[i++];
+      doWrite(stream, state, false, state.objectMode ? 1 : chunk.length, chunk, encoding, callback);
+      if (state.writing) break;
+    }
+    state.buffered = buffered.slice(i);
+  }
+  state.bufferProcessing = false;
+}
+
+function needFinish(state) {
+  return state.ending && !state.destroyed && state.constructed && state.length === 0 && !state.errored &&
+    state.buffered.length === 0 && !state.finished && !state.writing && !state.errorEmitted && !state.closeEmitted;
+}
+
+function callFinal(stream, state) {
+  let called = false;
+  function onFinish(err) {
+    if (called) return errorOrDestroyW(stream, nodeError(Error, "ERR_MULTIPLE_CALLBACK", "Callback called multiple times"));
+    called = true;
+    state.pendingcb--;
+    if (err) {
+      for (const cb of state[kOnFinished].splice(0)) cb(err);
+      errorOrDestroyW(stream, err, state.sync);
+    } else if (needFinish(state)) {
+      state.prefinished = true;
+      stream.emit("prefinish");
+      state.pendingcb++;
+      process.nextTick(finish, stream, state);
+    }
+  }
+  state.sync = true;
+  state.pendingcb++;
+  try {
+    stream._final(onFinish);
+  } catch (err) {
+    onFinish(err);
+  }
+  state.sync = false;
+}
+
+function prefinish(stream, state) {
+  if (!state.prefinished && !state.finalCalled) {
+    if (typeof stream._final === "function" && !state.destroyed) {
+      state.finalCalled = true;
+      callFinal(stream, state);
+    } else {
+      state.prefinished = true;
+      stream.emit("prefinish");
+    }
+  }
+}
+
+function finishMaybe(stream, state, sync) {
+  if (needFinish(state)) {
+    prefinish(stream, state);
+    if (state.pendingcb === 0) {
+      if (sync) {
+        state.pendingcb++;
+        process.nextTick(() => {
+          if (needFinish(state)) finish(stream, state);
+          else state.pendingcb--;
+        });
+      } else if (needFinish(state)) {
+        state.pendingcb++;
+        finish(stream, state);
+      }
+    }
+  }
+}
+
+function finish(stream, state) {
+  state.pendingcb--;
+  state.finished = true;
+  for (const cb of state[kOnFinished].splice(0)) cb(null);
+  stream.emit("finish");
+  if (state.autoDestroy) {
+    const rState = stream._readableState;
+    const autoDestroy = !rState || (rState.autoDestroy && (rState.endEmitted || rState.readable === false));
+    if (autoDestroy) stream.destroy();
   }
 }
 

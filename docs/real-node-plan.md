@@ -17336,3 +17336,35 @@ via `go.work`.
   `cmd/noderati/main_test.go`, with every expectation checked against real
   Node. Checking them caught two wrong expectations of my own. `go vet`
   and the full suite are clean.
+
+## Round 151: Node's builtin export surface - every named export now links, and the commonly used ones are real (events, child_process, timers, os, util, assert, buffer, readline, Writable)
+
+**Why.** Pulling the latest paserati made ES module linking strict: `import { exec } from "node:child_process"` is a SyntaxError when the module has no `exec`. Go-declared modules are opaque to the linker and never had the problem; the JS shims did. Compared against real Node (v26.3.0), about 520 export names were missing across the builtins, so vite and vitest (which import `exec`, `once`, `finished`...) stopped loading at all.
+
+**The safety net (`node_exports.go`, generated `node_exports_gen.go`).** `gen_node_exports.mjs` records every named export of every builtin, as the real Node reports it. `augmentShimExports` parses a shim and appends a named export for each missing name: the default export's own property if it has one, else a stub that throws `ERR_NODERATI_NOT_IMPLEMENTED` naming the API, else `undefined`. Only named exports are added, so `if (fs.glob)` feature detection and `require()` still see exactly what is implemented. `setNativeExport` does the same for Go-declared modules.
+
+**Real implementations, each diffed against Node:**
+- **events:** `once`/`on` (promise and async-iterator forms, AbortSignal, `close` events), `errorMonitor`, `captureRejections` and `Symbol.for("nodejs.rejection")`, `getEventListeners`, static `listenerCount`, `init`.
+- **child_process:** `spawnSync` rebuilt (`input`, `timeout`/`killSignal`, `maxBuffer`, `shell`, `encoding`, `stdio`, ENOENT/ETIMEDOUT/ENOBUFS errors, Node's exact result shape), `exec`/`execFile`/`execSync`/`execFileSync` ported from `lib/child_process.js`, including `util.promisify` support. A child's env no longer gains a `PWD` (an `os/exec` quirk).
+- **timers:** `setInterval`/`clearInterval` did not exist at all. Timeout objects now carry Node's shape (`ref`/`unref`/`hasRef`/`refresh`/`close`, `Symbol.toPrimitive`, `Symbol.dispose`, `_idleTimeout`...), and timers with equal deadlines fire in creation order (the runtime's own order is random: paserati#564). `node:timers/promises` added.
+- **os:** `totalmem`/`freemem`/`uptime`/`loadavg`/`userInfo`/`networkInterfaces`/`getPriority`/`setPriority`/`version`/`machine`/`availableParallelism`/`devNull` and the full `os.constants` (errno, signals, priority, dlopen), read per OS with pure Go (`x/sys/unix`, `/proc`; `dscl` for the macOS login shell). **No cgo.**
+- **util:** `parseArgs`, `callbackify`, `styleText`, `aborted`, `isDeepStrictEqual`, `getSystemErrorName`/`Message`/`Map`, `promisify.custom`, `_extend`, `toUSVString`, and the whole `util.types` set, read from the engine's own tags and slots. The JS-implemented ones load lazily (`lazy_jsmodule.go`) so startup is unchanged.
+- **assert:** the Go module compared through `ToString()` (so `strictEqual(1, "1")` passed). Replaced by a port of Node's `assert.js`, `assertion_error.js` and `comparisons.js`: `deepEqual`/`deepStrictEqual`, `throws`/`rejects`/`doesNotThrow`, `match`, `ifError`, `AssertionError`, `assert/strict`, and Node's `+ actual - expected` diff messages, including `assert.ok`'s source-line message.
+- **buffer:** `isUtf8`, `isAscii`, `transcode`, `atob`/`btoa`, `constants`, `kMaxLength`... (`Buffer.isEncoding` too).
+- **readline:** a real line splitter (crlf handling, final unterminated line, `for await`), `question`, `readline/promises`, `cursorTo`/`moveCursor`/`clearLine`/`clearScreenDown`.
+- **console:** the default export is the global console, so its methods are named exports.
+- **stream.Writable:** was a stub (no `write`/`final`/`destroy` options, no buffering, no `drain`, synchronous `finish`). Rewritten after `lib/internal/streams/writable.js`: option callbacks, write queue, `highWaterMark`/`drain`, `cork`/`writev`, `construct`, `destroy`, `end` callbacks, async `finish`/`close`. `new Writable().write()` now throws `ERR_METHOD_NOT_IMPLEMENTED` synchronously, as Node does (the old test had encoded the opposite).
+
+**Bugs found along the way (all in noderati):**
+- `process.nextTick(fn, ...args)` kept a slice aliasing the VM's argument window, so the arguments were garbage by the time the tick ran (`setTimeout` already copied).
+- `setTimeout(fn)` with no delay panicked (`args[2:]`).
+- `v8.serialize` read a Date's time value and boxed primitives as own properties; paserati's #525 moved them to internal slots, so they serialized as `{}`.
+- paserati now ships a native `Event`; `installEventGlobals` returned early and so never defined `CustomEvent`/`EventTarget`/`MessageEvent`. Now installed per global, and `dispatchEvent` works with native Events.
+- `lazy_js.go`: a `_js.go` file name is a GOOS=js build constraint, so Go silently skipped it.
+
+**paserati issues filed:** #561 (`await type`), #562 (local export vs `export *` order), #563 (computed-key function name), #564 (timer order), #565 (`isPrototypeOf` with a function receiver), #566 (`throw null` in async), #567 (AbortSignal's event). All closed upstream within the round.
+
+**Status.**
+- Pass: chokidar, marked, esbuild, express and fetch (identical to Node); tar create/extract round trip; vite dev server loads and serves again.
+- vitest loads and starts, then every worker RPC times out at 60s. The visible `TypeError: undefined is not a function` is vite-node's `Error.prepareStackTrace` hook calling V8 CallSite methods (`getFileName` & co) that noderati doesn't provide; it masks the actual timeout. Also missing: `process.getBuiltinModule`. Next target.
+- `TestIPCChannelJSONFramingAndDisconnect` is order-sensitive in-process (socket reader vs send callback) and failed once in ~13 full runs; it predates this round.

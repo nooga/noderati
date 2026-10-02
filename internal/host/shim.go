@@ -83,7 +83,7 @@ func (r *JSShimResolver) Resolve(specifier string, _ string) (*modules.ResolvedM
 	return &modules.ResolvedModule{
 		Specifier:    specifier,
 		ResolvedPath: "noderati-shim:" + canonical,
-		Source:       io.NopCloser(strings.NewReader(source)),
+		Source:       io.NopCloser(strings.NewReader(augmentShimExports(canonical, source))),
 		Resolver:     r.Name(),
 	}, nil
 }

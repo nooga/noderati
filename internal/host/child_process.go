@@ -1,7 +1,6 @@
 package host
 
 import (
-	"bytes"
 	"io"
 	"os"
 	"os/exec"
@@ -54,12 +53,11 @@ func installChildProcessNatives(p *driver.Paserati) {
 		return
 	}
 
-	obj.SetOwn("__noderatiSpawnSync", vm.NewNativeFunction(2, false, "__noderatiSpawnSync", func(args []vm.Value) (vm.Value, error) {
+	obj.SetOwn("__noderatiSpawnSync", vm.NewNativeFunction(3, false, "__noderatiSpawnSync", func(args []vm.Value) (vm.Value, error) {
 		if len(args) < 1 {
 			return vm.Undefined, nil
 		}
-		command, cmdArgs := parseSpawnCommandArgs(args[0], args[1])
-		return runSpawnSync(command, cmdArgs), nil
+		return spawnSyncNative(vmInst, args[0].ToString(), stringArrayFromValue(argAt(args, 1)), argAt(args, 2)), nil
 	}))
 
 	obj.SetOwn("__noderatiFork", vm.NewNativeFunction(3, false, "__noderatiFork", func(args []vm.Value) (vm.Value, error) {
@@ -83,11 +81,6 @@ func installChildProcessNatives(p *driver.Paserati) {
 	}))
 }
 
-func parseSpawnCommandArgs(commandVal, argsVal vm.Value) (string, []string) {
-	command := commandVal.ToString()
-	return command, stringArrayFromValue(argsVal)
-}
-
 func stringArrayFromValue(v vm.Value) []string {
 	if v == vm.Undefined || v == vm.Null {
 		return nil
@@ -100,27 +93,6 @@ func stringArrayFromValue(v vm.Value) []string {
 		return out
 	}
 	return nil
-}
-
-func runSpawnSync(command string, args []string) vm.Value {
-	cmd := exec.Command(command, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	status := 0
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			status = ee.ExitCode()
-		} else {
-			status = 1
-		}
-	}
-	obj := vm.NewObject(vm.Undefined).AsPlainObject()
-	obj.SetOwn("status", vm.NumberValue(float64(status)))
-	obj.SetOwn("stdout", vm.NewString(stdout.String()))
-	obj.SetOwn("stderr", vm.NewString(stderr.String()))
-	return vm.NewValueFromPlainObject(obj)
 }
 
 // spawnOptions is what child_process.spawn's real Node signature accepts as
@@ -202,7 +174,7 @@ func parseSpawnOptions(v vm.Value) spawnOptions {
 	if cwdVal, ok := obj.GetOwn("cwd"); ok && !cwdVal.IsUndefined() && cwdVal.Type() != vm.TypeNull {
 		opts.cwd = cwdVal.ToString()
 	}
-	if envVal, ok := obj.GetOwn("env"); ok {
+	if envVal, ok := obj.GetOwn("env"); ok && envVal.Type() == vm.TypeObject {
 		if envObj := envVal.AsPlainObject(); envObj != nil {
 			keys := envObj.OwnKeys()
 			env := make([]string, 0, len(keys))
@@ -259,8 +231,11 @@ func spawnProcessWith(vmInst *vm.VM, command string, args []string, optsVal vm.V
 	if opts.cwd != "" {
 		cmd.Dir = opts.cwd
 	}
-	if opts.env != nil {
-		cmd.Env = opts.env
+	// An explicit environment (as libuv always passes) also stops os/exec
+	// from adding PWD=<cwd> to it, which Node never does.
+	cmd.Env = opts.env
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
 	}
 	if len(extras.extraEnv) > 0 {
 		if cmd.Env == nil {

@@ -74,6 +74,7 @@ func declareOS(p *driver.Paserati) {
 		m.Function("cpus", cpuInfos)
 		m.Function("endianness", hostEndianness)
 		m.Function("type", hostOSType)
+		installOSExtras(m, p.GetVM())
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:os", "os")

@@ -45,15 +45,25 @@ func installEventGlobals(p *driver.Paserati) {
 	if gobj == nil {
 		return
 	}
-	if _, exists := gobj.GetOwn("Event"); exists {
-		return
+	// Define each global only if the engine doesn't already (paserati now
+	// ships a native Event, with its own toStringTag).
+	define := func(name string, build func() vm.Value) vm.Value {
+		if v, exists := gobj.GetOwn(name); exists && !v.IsUndefined() {
+			return v
+		}
+		v := build()
+		gobj.SetOwn(name, v)
+		if tag, err := vmInst.GetProperty(mustGlobal(vmInst, "Symbol"), "toStringTag"); err == nil {
+			if proto, err := vmInst.GetProperty(v, "prototype"); err == nil && proto.Type() == vm.TypeObject {
+				_ = jsDefineHidden(vmInst, proto, tag, vm.NewString(name))
+			}
+		}
+		return v
 	}
-
-	eventCtor := buildEventConstructor(vmInst, "Event", false)
-	gobj.SetOwn("Event", eventCtor)
-	gobj.SetOwn("CustomEvent", buildEventConstructor(vmInst, "CustomEvent", true))
-	gobj.SetOwn("EventTarget", buildEventTargetConstructor(vmInst))
-	gobj.SetOwn("MessageEvent", buildMessageEventConstructor(vmInst, eventCtor))
+	eventCtor := define("Event", func() vm.Value { return buildEventConstructor(vmInst, "Event", false) })
+	define("CustomEvent", func() vm.Value { return buildEventConstructor(vmInst, "CustomEvent", true) })
+	define("EventTarget", func() vm.Value { return buildEventTargetConstructor(vmInst) })
+	define("MessageEvent", func() vm.Value { return buildMessageEventConstructor(vmInst, eventCtor) })
 }
 
 // buildMessageEventConstructor: an Event whose init dict also carries
@@ -225,13 +235,18 @@ func buildEventTargetConstructor(vmInst *vm.VM) vm.Value {
 				return vm.True, nil
 			}
 			evt := a[0]
-			evtObj := evt.AsPlainObject()
-			evtObj.SetOwn("target", self)
-			evtObj.SetOwn("currentTarget", self)
-			typeVal, _ := evtObj.GetOwn("type")
+			// Own data properties shadow the native Event's read-only
+			// target/currentTarget accessors (and are plain fields on
+			// noderati's own Events).
+			for _, name := range []string{"target", "currentTarget"} {
+				if err := jsDefineAccessorFree(vmInst, evt, name, self); err != nil {
+					return vm.Undefined, err
+				}
+			}
+			typeVal, _ := vmInst.GetProperty(evt, "type")
 			emitOnObject(vmInst, obj, typeVal.ToString(), evt)
-			cancelable, _ := evtObj.GetOwn("cancelable")
-			defaultPrevented, _ := evtObj.GetOwn("defaultPrevented")
+			cancelable, _ := vmInst.GetProperty(evt, "cancelable")
+			defaultPrevented, _ := vmInst.GetProperty(evt, "defaultPrevented")
 			return vm.BooleanValue(!(cancelable.IsTruthy() && defaultPrevented.IsTruthy())), nil
 		}))
 

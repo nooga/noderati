@@ -521,6 +521,18 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 		props.Properties.SetOwn("isBuffer", isBufferFn)
 		props.Properties.SetOwn("byteLength", byteLengthFn)
 		props.Properties.SetOwn("concat", concatFn)
+		// Buffer.isEncoding: Node's normalizeEncoding list, case-insensitive.
+		props.Properties.SetOwn("isEncoding", vm.NewNativeFunction(1, false, "isEncoding", func(args []vm.Value) (vm.Value, error) {
+			if len(args) == 0 || !args[0].IsString() {
+				return vm.False, nil
+			}
+			switch strings.ToLower(args[0].ToString()) {
+			case "utf8", "utf-8", "ucs2", "ucs-2", "utf16le", "utf-16le", "latin1", "binary",
+				"base64", "base64url", "hex", "ascii":
+				return vm.True, nil
+			}
+			return vm.False, nil
+		}))
 		// Buffer.prototype's [[Prototype]] was reparented onto
 		// Uint8Array.prototype above (instance-side inheritance - real
 		// indexed access, iteration, toBase64/fromHex, etc.), but the

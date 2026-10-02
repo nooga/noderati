@@ -56,12 +56,13 @@ var nativeRequireNames = map[string]bool{
 	// this time on purpose rather than found the hard way - the same
 	// require() gap net/tls/http/https hit is exactly what this comment
 	// warns about.
-	"async_hooks": true,
-	"console":     true,
-	"timers":      true,
-	"dns":         true,
-	"zlib":        true,
-	"util/types":  true,
+	"async_hooks":     true,
+	"console":         true,
+	"timers":          true,
+	"timers/promises": true,
+	"dns":             true,
+	"zlib":            true,
+	"util/types":      true,
 	// http2 (declareHTTP2, round 94) added directly here too, same
 	// deliberate reason async_hooks's own comment above gives - a JS-
 	// shim-backed module (like stream/http/https before it) still needs

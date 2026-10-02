@@ -80,8 +80,15 @@ class Console {
   }
 }
 
+// As in Node, require("console") is the global console itself, carrying
+// the Console class; its methods are the module's named exports.
+const console = globalThis.console;
+if (!("Console" in console)) {
+  Object.defineProperty(console, "Console", { value: Console, writable: true, configurable: true, enumerable: false });
+}
+
 export { Console };
-export default { Console };
+export default console;
 `
 
 func declareConsole() {

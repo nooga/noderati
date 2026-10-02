@@ -61,13 +61,13 @@ func v8Classify(v vm.Value) string {
 		return "uncloneable:#<Object>"
 	case vm.TypeObject:
 		obj := v.AsPlainObject()
-		if _, ok := obj.GetOwn("__timestamp__"); ok {
+		if _, ok := obj.GetInternal("__timestamp__"); ok {
 			return "date"
 		}
-		if _, ok := obj.GetOwn("[[ErrorData]]"); ok {
+		if _, ok := obj.GetInternal("[[ErrorData]]"); ok {
 			return "error"
 		}
-		if pv, ok := obj.GetOwn("[[PrimitiveValue]]"); ok {
+		if pv, ok := obj.GetInternal("[[PrimitiveValue]]"); ok {
 			return "boxed:" + v8Classify(pv)
 		}
 		return "object"

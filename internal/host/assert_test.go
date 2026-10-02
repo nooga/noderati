@@ -8,7 +8,6 @@ import (
 
 func newWithAssert(argv []string) *driver.Paserati {
 	p := New(argv)
-	declareAssert(p)
 	p.SetSkipTypeCheck(true)
 	return p
 }
