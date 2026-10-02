@@ -172,3 +172,29 @@ func setNativeExport(p *driver.Paserati, module, name string, value vm.Value) {
 		def.AsPlainObject().SetOwn(name, value)
 	}
 }
+
+// installFSRealpathNative gives fs.realpath / fs.realpathSync their
+// `.native` variants, as in Node (vite resolves every file through
+// fs.realpathSync.native). Both behave the same here: Go's
+// filepath.EvalSymlinks is already the OS-level resolution.
+func installFSRealpathNative(p *driver.Paserati) {
+	vmInst := p.GetVM()
+	rec, err := p.LoadModule("fs", ".")
+	if err != nil {
+		return
+	}
+	for _, name := range []string{"realpathSync", "realpath"} {
+		orig, ok := rec.GetExportValues()[name]
+		if !ok || !orig.IsCallable() {
+			continue
+		}
+		name, orig := name, orig
+		wrapped := vm.NewNativeFunctionWithProps(2, true, name, func(args []vm.Value) (vm.Value, error) {
+			return vmInst.Call(orig, vmInst.GetThis(), args)
+		})
+		if props := wrapped.AsNativeFunctionWithProps(); props != nil && props.Properties != nil {
+			props.Properties.SetOwn("native", wrapped)
+		}
+		setNativeExport(p, "fs", name, wrapped)
+	}
+}

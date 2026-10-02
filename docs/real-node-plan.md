@@ -17368,3 +17368,15 @@ via `go.work`.
 - Pass: chokidar, marked, esbuild, express and fetch (identical to Node); tar create/extract round trip; vite dev server loads and serves again.
 - vitest loads and starts, then every worker RPC times out at 60s. The visible `TypeError: undefined is not a function` is vite-node's `Error.prepareStackTrace` hook calling V8 CallSite methods (`getFileName` & co) that noderati doesn't provide; it masks the actual timeout. Also missing: `process.getBuiltinModule`. Next target.
 - `TestIPCChannelJSONFramingAndDisconnect` is order-sensitive in-process (socket reader vs send callback) and failed once in ~13 full runs; it predates this round.
+
+## Round 152: vitest runs real tests - the "RPC timeout" was `fs.realpathSync.native` missing; one paserati bug (#577) left in the failure report
+
+Round 151 ended with every vitest worker RPC timing out at 60s. Instrumenting the main process (a temporary logger in vitest's `fetch` RPC handler, restored afterwards) showed the main side was not hung: `fetch` of the test file threw inside vite's `getRealPath`, which calls `fs.realpathSync.native(...)`. noderati had no `.native`, so vite hit `undefined is not a function`, and the error then went through the same broken `Error.prepareStackTrace` path (below), so the RPC reply never reached the worker and the worker timed out waiting.
+
+**Fix.** `fs.realpathSync.native` and `fs.realpath.native` (`installFSRealpathNative`), reachable from the named exports, the default export and CJS `require("fs")`.
+
+**Result.** `startVitest` on `examples/vitest-sample.test.js` now collects and runs both tests in about 10s: 1 passed, 1 failed, the same counts as real Node. The failing test's message differs: Node prints `expected 2 to be 3 // Object.is equality` with a diff; noderati prints `TypeError: undefined is not a function`.
+
+**Remaining cause, filed as [paserati#577](https://github.com/nooga/paserati/issues/577).** chai's `AssertionError` calls `Error.captureStackTrace`, which runs vite-node's `Error.prepareStackTrace` (a copy of source-map-support). That clones each call site with `Object.getOwnPropertyNames(Object.getPrototypeOf(frame))`, because V8 keeps the CallSite methods on a shared `CallSite.prototype`. paserati builds them as own properties of a plain object, so the clone has no methods and `CallSiteToString` throws. Fix belongs in paserati's `newCallSite` (`pkg/vm/stack_trace_api.go`).
+
+**Also learned:** `process.getBuiltinModule` is still missing (not needed for this).

@@ -280,3 +280,19 @@ func TestFsWatchFileMatchesNodeSequence(t *testing.T) {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}
 }
+
+// vite resolves every file through fs.realpathSync.native; Node has the
+// .native variant on both realpath and realpathSync, reachable from the
+// default export, the named export and CJS require("fs") alike.
+func TestFsRealpathNative(t *testing.T) {
+	got := runScriptString(t, `
+		import fs, { realpathSync } from "node:fs";
+		import { createRequire } from "node:module";
+		const c = createRequire(import.meta.url)("fs");
+		[typeof fs.realpathSync.native, typeof realpathSync.native, typeof c.realpathSync.native,
+			typeof fs.realpath.native, fs.realpathSync.native(".") === fs.realpathSync(".")].join(",")
+	`)
+	if want := "function,function,function,function,true"; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
