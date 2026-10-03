@@ -1294,7 +1294,10 @@ func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal, tabl
 		}
 	}
 
-	mod, err := rt.InstantiateModule(ctx, compiled, wazero.NewModuleConfig())
+	// wazero calls an exported _start by default (a WASI convention); the JS API
+	// runs only the module's start section and leaves _start to the embedder,
+	// e.g. Go/TinyGo's wasm_exec.js calls it from go.run() after wiring memory.
+	mod, err := rt.InstantiateModule(ctx, compiled, wazero.NewModuleConfig().WithStartFunctions())
 	if err != nil {
 		rt.Close(ctx)
 		return vm.Undefined, throwWasmError(vmInst, errs.linkError, "WebAssembly.Instance: "+err.Error())
