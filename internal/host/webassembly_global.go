@@ -13,6 +13,7 @@ import (
 	"github.com/nooga/paserati/pkg/vm"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/experimental"
 )
 
 // webassembly_global.go implements the core WebAssembly 1.0 (MVP) JS
@@ -308,6 +309,17 @@ func bytesFromBufferSource(v vm.Value) ([]byte, bool) {
 	return nil, false
 }
 
+// newWasmRuntime is the one place a WebAssembly runtime is configured, so
+// validation (compileWasmModule) and instantiation accept the same
+// modules. wazero's default is the 2.0 feature set; tail calls and
+// exception handling are part of the standard every browser engine ships,
+// and modules from toolchains that target them (return_call, try_table)
+// are otherwise rejected at compile time.
+func newWasmRuntime(ctx context.Context) wazero.Runtime {
+	return wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCoreFeatures(
+		api.CoreFeaturesV2|experimental.CoreFeaturesTailCall|experimental.CoreFeaturesExceptionHandling))
+}
+
 // compileWasmModule is the actual `WebAssembly.Module` construction
 // logic, factored out so both `new WebAssembly.Module(bytes)` and the
 // static `WebAssembly.compile(bytes)`/`instantiate(bytes, ...)` async
@@ -324,7 +336,7 @@ func compileWasmModule(vmInst *vm.VM, moduleProtoVal vm.Value, errs wasmErrorCto
 	}
 
 	ctx := context.Background()
-	scratchRT := wazero.NewRuntime(ctx)
+	scratchRT := newWasmRuntime(ctx)
 	_, err := scratchRT.CompileModule(ctx, data)
 	scratchRT.Close(ctx)
 	if err != nil {
@@ -1140,15 +1152,6 @@ func (e *wasmJSCallPanic) Unwrap() error { return e.err }
 // unconditional push is safe specifically because syncOut() always
 // runs immediately before it in this same bracket.
 func makeHostImportTrampoline(vmInst *vm.VM, jsFn vm.Value, params, results []api.ValueType, bridges *[]*wasmMemoryBridge) api.GoFunc {
-	if len(results) > 1 {
-		// Not needed by any real call site this bridge targets (every
-		// wasm_on_* import here is single-result-or-void per
-		// paserati#375's own investigation) - refuse honestly rather
-		// than silently dropping every result past the first.
-		return func(ctx context.Context, stack []uint64) {
-			panic(&wasmJSCallPanic{err: fmt.Errorf("WebAssembly: multi-value function imports are not supported")})
-		}
-	}
 	return func(ctx context.Context, stack []uint64) {
 		args := make([]vm.Value, len(params))
 		for i, t := range params {
@@ -1164,15 +1167,47 @@ func makeHostImportTrampoline(vmInst *vm.VM, jsFn vm.Value, params, results []ap
 		if err != nil {
 			panic(&wasmJSCallPanic{err: err})
 		}
-		if len(results) == 0 {
+		switch len(results) {
+		case 0:
 			return
+		case 1:
+			raw, cerr := jsValueToWazeroArg(vmInst, result, results[0])
+			if cerr != nil {
+				panic(&wasmJSCallPanic{err: cerr})
+			}
+			stack[0] = raw
+		default:
+			if err := multiValueImportResults(vmInst, result, results, stack); err != nil {
+				panic(&wasmJSCallPanic{err: err})
+			}
 		}
-		raw, cerr := jsValueToWazeroArg(vmInst, result, results[0])
-		if cerr != nil {
-			panic(&wasmJSCallPanic{err: cerr})
-		}
-		stack[0] = raw
 	}
+}
+
+// multiValueImportResults converts a multi-result import's JS return value
+// per the WebAssembly JS API: it must be an object whose iteration yields
+// exactly one value per declared result, otherwise a TypeError. This is
+// the mirror of the Array a multi-value export returns to JS.
+func multiValueImportResults(vmInst *vm.VM, result vm.Value, results []api.ValueType, stack []uint64) error {
+	if !result.IsObject() {
+		return vmInst.NewTypeError(fmt.Sprintf("WebAssembly: a multi-value import must return an iterable object, not %s", result.TypeName()))
+	}
+	arrVal, err := vmInst.IterableToArray(result)
+	if err != nil {
+		return err
+	}
+	arr := arrVal.AsArray()
+	if arr.Length() != len(results) {
+		return vmInst.NewTypeError(fmt.Sprintf("WebAssembly: a multi-value import returned %d values, expected %d", arr.Length(), len(results)))
+	}
+	for i, t := range results {
+		raw, cerr := jsValueToWazeroArg(vmInst, arr.Get(i), t)
+		if cerr != nil {
+			return cerr
+		}
+		stack[i] = raw
+	}
+	return nil
 }
 
 // buildWasmInstanceConstructor implements `new WebAssembly.Instance(module,
@@ -1226,7 +1261,7 @@ func instantiateWasmModule(vmInst *vm.VM, instanceProtoVal, memoryProtoVal, tabl
 	wasmBytes := rawBytesAny.([]byte)
 
 	ctx := context.Background()
-	rt := wazero.NewRuntime(ctx)
+	rt := newWasmRuntime(ctx)
 
 	compiled, err := rt.CompileModule(ctx, wasmBytes)
 	if err != nil {
