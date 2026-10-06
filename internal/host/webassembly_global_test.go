@@ -705,3 +705,67 @@ func TestWebAssemblyExecuteSurvivesBufferGrowthBetweenCalls(t *testing.T) {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
 }
+
+// conformanceWasmBytes loads testdata/wasm_conformance.wasm (source:
+// wasm_conformance.wat), which uses tail calls, try_table and a
+// multi-value import - all valid under the WebAssembly JS API, none in
+// the MVP feature set wazero enables by default.
+func conformanceWasmBytes(t *testing.T) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "wasm_conformance.wasm"))
+	if err != nil {
+		t.Fatalf("reading conformance fixture: %v", err)
+	}
+	return data
+}
+
+func runConformanceScript(t *testing.T, script string) string {
+	t.Helper()
+	p := New([]string{"noderati"})
+	p.SetSkipTypeCheck(true)
+	installWasmBytesAsGlobal(t, p, "CONFORMANCE_WASM_BYTES", conformanceWasmBytes(t))
+	val, errs := p.RunCode(script, driver.RunOptions{})
+	if len(errs) > 0 {
+		t.Fatalf("RunCode: %v", errs[0])
+	}
+	return val.ToString()
+}
+
+func TestWebAssemblyTailCallsAndExceptionHandling(t *testing.T) {
+	got := runConformanceScript(t, `
+		const mod = new WebAssembly.Module(CONFORMANCE_WASM_BYTES);
+		const inst = new WebAssembly.Instance(mod, { env: { size: () => [0, 0] } });
+		JSON.stringify({
+			sum: String(inst.exports.sum(1000000)),
+			caught: inst.exports.catch_payload(42),
+		})
+	`)
+	want := `{"sum":"500000500000","caught":42}`
+	if got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+func TestWebAssemblyMultiValueImport(t *testing.T) {
+	got := runConformanceScript(t, `
+		const mod = new WebAssembly.Module(CONFORMANCE_WASM_BYTES);
+		const run = (size) => {
+			try {
+				return new WebAssembly.Instance(mod, { env: { size } }).exports.packed_size();
+			} catch (e) {
+				return e instanceof TypeError ? "TypeError" : "other: " + e;
+			}
+		};
+		JSON.stringify([
+			run(() => [80, 24]),
+			run(function* () { yield 120; yield 40; }),
+			run(() => [80]),
+			run(() => [80, 24, 1]),
+			run(() => 80),
+		])
+	`)
+	want := `[80024,120040,"TypeError","TypeError","TypeError"]`
+	if got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
