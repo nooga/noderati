@@ -314,10 +314,13 @@ func bytesFromBufferSource(v vm.Value) ([]byte, bool) {
 // modules. wazero's default is the 2.0 feature set; tail calls and
 // exception handling are part of the standard every browser engine ships,
 // and modules from toolchains that target them (return_call, try_table)
-// are otherwise rejected at compile time.
+// are otherwise rejected at compile time. Every runtime shares one
+// compilation cache (wasm_cache.go). Its entries are keyed on the module
+// bytes, not the feature set, so all runtimes must keep this one config.
 func newWasmRuntime(ctx context.Context) wazero.Runtime {
 	return wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCoreFeatures(
-		api.CoreFeaturesV2|experimental.CoreFeaturesTailCall|experimental.CoreFeaturesExceptionHandling))
+		api.CoreFeaturesV2|experimental.CoreFeaturesTailCall|experimental.CoreFeaturesExceptionHandling).
+		WithCompilationCache(wasmCompilationCache()))
 }
 
 // compileWasmModule is the actual `WebAssembly.Module` construction
