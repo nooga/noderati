@@ -60,15 +60,6 @@ func (p *ProcessInitializer) InitTypes(ctx *builtins.TypeContext) error {
 	if err := ctx.DefineGlobal("process", processType); err != nil {
 		return err
 	}
-	if err := ctx.DefineGlobal("structuredClone", types.NewSimpleFunction([]types.Type{types.Any}, types.Any)); err != nil {
-		return err
-	}
-	if err := ctx.DefineGlobal("btoa", types.NewSimpleFunction([]types.Type{types.String}, types.String)); err != nil {
-		return err
-	}
-	if err := ctx.DefineGlobal("atob", types.NewSimpleFunction([]types.Type{types.String}, types.String)); err != nil {
-		return err
-	}
 	return ctx.DefineGlobal("global", types.Any)
 }
 
@@ -257,15 +248,6 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 	setupChildIPCFromEnv(vmInstance, processObj, envObj)
 
 	if err := ctx.DefineGlobal("process", vm.NewValueFromPlainObject(processObj)); err != nil {
-		return err
-	}
-	if err := ctx.DefineGlobal("structuredClone", structuredCloneFn(vmInstance)); err != nil {
-		return err
-	}
-	if err := ctx.DefineGlobal("btoa", btoaFn()); err != nil {
-		return err
-	}
-	if err := ctx.DefineGlobal("atob", atobFn()); err != nil {
 		return err
 	}
 	return ctx.DefineGlobal("global", vm.NewValueFromPlainObject(vmInstance.GlobalObject))

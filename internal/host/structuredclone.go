@@ -3,16 +3,62 @@ package host
 import (
 	"fmt"
 
+	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/vm"
 )
 
-func structuredCloneFn(vmInst *vm.VM) vm.Value {
-	return vm.NewNativeFunction(1, false, "structuredClone", func(args []vm.Value) (vm.Value, error) {
-		if len(args) == 0 {
-			return vm.Undefined, nil
+// wrapStructuredClone layers markAsUncloneable support over paserati's own
+// structuredClone global (which covers Map/Set/Date/typed arrays/etc. but
+// knows nothing of node:worker_threads' marker).
+func wrapStructuredClone(p *driver.Paserati) {
+	vmInst := p.GetVM()
+	if vmInst == nil {
+		return
+	}
+	realm := vmInst.CurrentRealm()
+	orig, ok := realm.GetGlobal("structuredClone")
+	if !ok {
+		return
+	}
+	realm.SetGlobal("structuredClone", vm.NewNativeFunction(1, false, "structuredClone", func(args []vm.Value) (vm.Value, error) {
+		if len(args) > 0 && hasUncloneable(args[0], make(map[any]bool)) {
+			return vm.Undefined, fmt.Errorf("DataCloneError: object cannot be cloned")
 		}
-		return structuredCloneValue(vmInst, args[0], make(map[any]vm.Value))
-	})
+		return vmInst.Call(orig, vm.Undefined, args)
+	}))
+}
+
+func hasUncloneable(v vm.Value, seen map[any]bool) bool {
+	if v.Type() == vm.TypeArray {
+		arr := v.AsArray()
+		if seen[arr] {
+			return false
+		}
+		seen[arr] = true
+		for i := 0; i < arr.Length(); i++ {
+			if hasUncloneable(arr.Get(i), seen) {
+				return true
+			}
+		}
+		return false
+	}
+	if v.Type() != vm.TypeObject {
+		return false
+	}
+	obj := v.AsPlainObject()
+	if obj == nil || seen[obj] {
+		return false
+	}
+	seen[obj] = true
+	if marked, ok := obj.GetOwn(uncloneableMarker); ok && marked.IsTruthy() {
+		return true
+	}
+	for _, key := range obj.OwnKeys() {
+		if prop, ok := obj.GetOwn(key); ok && hasUncloneable(prop, seen) {
+			return true
+		}
+	}
+	return false
 }
 
 func structuredCloneValue(vmInst *vm.VM, v vm.Value, seen map[any]vm.Value) (vm.Value, error) {

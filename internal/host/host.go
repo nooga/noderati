@@ -38,6 +38,7 @@ func New(argv []string) *driver.Paserati {
 	installSetImmediate(p)
 	installTimeoutObjects(p)
 	installWorkerThreadsExports(p)
+	wrapStructuredClone(p)
 	p.AddResolver(NewNodeModulesResolver())
 	p.AddResolver(NewPackageImportsResolver())
 	p.AddResolver(NewJSShimResolver())
