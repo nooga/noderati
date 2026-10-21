@@ -381,3 +381,29 @@ Ranked by how often real packages hit each gap:
 9. **`console.table`/`dir`/`timeLog`, and `util.MIMEType`/`parseEnv`.**
 10. **The missing modules, by demand:** `stream/web`, `stream/consumers`,
     `punycode`, `dgram`, `sqlite`, `node:test`, and then the rest.
+
+---
+
+## Progress
+
+Re-measure with `node scripts/apigap/report.mjs` (build `./noderati`
+first). It prints per-module coverage and every missing name.
+
+| Date | Commit | Module API (excl. constants) | Notes |
+|---|---|---|---|
+| 2026-10-21 | `09e7904` | — | inventory written |
+| 2026-10-21 | `cb59254` | 559/1310 (42.7%) | Buffer instances complete; `URL` is paserati's (live `searchParams`) |
+
+Found since the inventory, not visible to a name-only probe:
+
+- `util.inspect` coerces to string: objects print `[object Object]`,
+  `Map` prints `<unknown type 22>`. `console.log` of objects and
+  `util.format('%o')` depend on it.
+- paserati: `JSON.stringify` never uses exponent notation
+  (`JSON.stringify(1.5e-36)` prints 36 zeros, `JSON.stringify(1e21)`
+  prints 22 digits).
+- paserati `URL`: no IDNA (`例え.jp` isn't punycoded), no IPv4 number
+  parsing (`0x7f.1`), `blob:` URLs get a `null` origin, invalid-URL errors
+  lack `code: 'ERR_INVALID_URL'`, non-ASCII in the query isn't
+  percent-encoded, `%7e` gets decoded to `~`, and `..` pops a `file:`
+  URL's Windows drive letter.
