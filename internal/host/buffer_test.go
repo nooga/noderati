@@ -317,3 +317,49 @@ func TestBufferModuleExportsBlobAndFile(t *testing.T) {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
 }
+
+func TestBufferNumericAccessorsMatchNode(t *testing.T) {
+	got := runScriptString(t, `
+		const b = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8, 0xff, 0xfe, 0x80, 0x7f]);
+		const w = Buffer.alloc(16);
+		const errCode = (f) => { try { f(); return "no throw"; } catch (e) { return e.code; } };
+		JSON.stringify([
+			b.readUInt8(8), b.readInt8(8), b.readUInt16LE(0), b.readUint16BE(0), b.readInt16BE(8),
+			b.readUInt32LE(0), b.readInt32BE(8), b.readUIntLE(1, 6), b.readIntBE(6, 6),
+			String(b.readBigUInt64LE(0)), String(b.readBigInt64BE(4)),
+			w.writeUInt32BE(0xdeadbeef, 0), w.toString("hex", 0, 4),
+			w.writeInt16LE(-2, 4), w.readInt16LE(4),
+			w.writeUIntBE(0x123456789abc, 0, 6), w.readUIntBE(0, 6),
+			w.writeBigInt64LE(-5n, 8), String(w.readBigInt64LE(8)),
+			w.writeDoubleLE(Math.PI, 0), w.readDoubleLE(0) === Math.PI,
+			w.writeFloatBE(1.5, 12), w.readFloatBE(12),
+			errCode(() => w.writeUInt8(256)), errCode(() => b.readUInt32LE(9)),
+			errCode(() => Buffer.alloc(2).readUInt32LE()), errCode(() => b.readUInt8("1")),
+			errCode(() => w.writeBigInt64LE(1, 0)),
+		]);
+	`)
+	want := `[255,-1,513,258,-2,67305985,-98177,7722435347202,7735236001919,"578437695752307201","361984555285905535",4,"deadbeef",6,-2,6,20015998343868,16,"-5",8,true,16,1.5,"ERR_OUT_OF_RANGE","ERR_OUT_OF_RANGE","ERR_BUFFER_OUT_OF_BOUNDS","ERR_INVALID_ARG_TYPE",null]`
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestBufferComparisonAndSearchMatchNode(t *testing.T) {
+	got := runScriptString(t, `
+		const h = Buffer.from("hello world hello");
+		JSON.stringify([
+			Buffer.from("ab").equals(Buffer.from("ab")), Buffer.from("ab").equals(new Uint8Array([97])),
+			Buffer.from("a").compare(Buffer.from("b")), Buffer.from("abc").compare(Buffer.from("xbc"), 1, 3, 1, 3),
+			[Buffer.from("c"), Buffer.from("a")].sort(Buffer.compare).map(String),
+			[...Buffer.from([1, 2, 3, 4]).swap16()], [...Buffer.from([1, 2, 3, 4]).swap32()],
+			String(Buffer.alloc(5).fill("ab")), [...Buffer.alloc(4).fill("0102", "hex")], [...Buffer.alloc(4).fill(9, 1, 3)],
+			h.indexOf("o"), h.indexOf("hello", 1), h.indexOf(Buffer.from("wor")), h.indexOf(111), h.indexOf("o", -5),
+			h.lastIndexOf("hello"), h.lastIndexOf("o", 5), h.includes("world"), h.includes("x"),
+			Buffer.from("hi").inspect(), h.hexSlice(0, 2), Buffer.from("x").toLocaleString(),
+		]);
+	`)
+	want := `[true,false,-1,0,["a","c"],[2,1,4,3],[4,3,2,1],"ababa",[1,2,1,2],[0,9,9,0],4,12,6,4,16,12,4,true,false,"<Buffer 68 69>","6865","x"]`
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}

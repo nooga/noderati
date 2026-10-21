@@ -521,6 +521,7 @@ func buildBufferConstructor(vmInst *vm.VM) vm.Value {
 		props.Properties.SetOwn("isBuffer", isBufferFn)
 		props.Properties.SetOwn("byteLength", byteLengthFn)
 		props.Properties.SetOwn("concat", concatFn)
+		installBufferMethods(vmInst, bufferProto, props.Properties, wrapBytes)
 		// Buffer.isEncoding: Node's normalizeEncoding list, case-insensitive.
 		props.Properties.SetOwn("isEncoding", vm.NewNativeFunction(1, false, "isEncoding", func(args []vm.Value) (vm.Value, error) {
 			if len(args) == 0 || !args[0].IsString() {

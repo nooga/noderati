@@ -11,61 +11,6 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// specialSchemes are the schemes WHATWG's URL origin algorithm treats as
-// having a real (tuple) origin — everything else gets the opaque origin
-// "null" (the literal string, matching real Node/browsers), not the
-// scheme://host string a naive implementation might produce.
-var specialSchemes = map[string]bool{
-	"http": true, "https": true, "ws": true, "wss": true,
-	"ftp": true, "file": true,
-}
-
-// jsURL is a read-only snapshot of a WHATWG URL, exposed to JS as the
-// `URL` class. Every field is computed once at construction time (own
-// data properties, per ModuleBuilder.Class/bindStructFields — there is
-// no live getter/setter support, so mutating an instance's properties
-// afterward doesn't recompute href the way real Node's URL does). No
-// `.searchParams` property either — nothing needs a *live* link between
-// a URL instance and a URLSearchParams yet (see urlsearchparams.go for
-// the standalone `new URLSearchParams(...)` class itself, added
-// 2026-09-02).
-type jsURL struct {
-	Href     string `json:"href"`
-	Origin   string `json:"origin"`
-	Protocol string `json:"protocol"`
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Host     string `json:"host"`
-	Hostname string `json:"hostname"`
-	Port     string `json:"port"`
-	Pathname string `json:"pathname"`
-	Search   string `json:"search"`
-	Hash     string `json:"hash"`
-}
-
-func (u *jsURL) ToString() string { return u.Href }
-func (u *jsURL) ToJSON() string   { return u.Href }
-
-// newJSURL parses href as an absolute URL, WHATWG-style: an empty scheme
-// (a relative or otherwise not-obviously-a-URL string) is a hard error,
-// same as real `new URL(str)` without a base. This matters beyond
-// correctness for its own sake — real packages (hosted-git-info's
-// parse-url.js is what surfaced this) construct a URL specifically to
-// detect malformed/non-URL input via the throw, e.g. to fall through to
-// an scp-style-URL correction path. Go's net/url.Parse is far more
-// permissive than WHATWG and rarely errors on its own; the empty-scheme
-// check is what makes this throw where it needs to.
-//
-// The optional `base` second argument (real `new URL(href, base)`) is
-// what makes a *relative* href resolve instead of hard-erroring — needed
-// for e.g. an ESM loader resolving "./helper.ts" against a parent file's
-// URL, found via jiti's own relative-import resolution (see
-// docs/real-node-plan.md's round 50 entry). Resolved via Go's
-// url.URL.ResolveReference, which implements RFC 3986 relative
-// resolution — the same rule WHATWG's URL spec's relative-resolution
-// step is built on, close enough for every real base+relative-path
-// combination found so far (no dot-segment/scheme-relative edge case
-// yet needed a WHATWG-exact implementation).
 // removeDotSegments applies the WHATWG URL path parser's dot-segment
 // rules to an already-escaped absolute path: "." and ".." (in any
 // %2e-encoded spelling) are dropped/pop a segment, a trailing one leaves a
@@ -99,105 +44,10 @@ func isWindowsDriveLetter(s string) bool {
 		((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z'))
 }
 
-func newJSURL(href string, base vm.Value) (*jsURL, error) {
-	var parsed *url.URL
-	var err error
-	// Any base is stringified, as in Node: a URL object's href, or ToString.
-	baseStr := ""
-	if href, ok := hrefFromURLLike(base); ok {
-		baseStr = href
-	} else if !base.IsUndefined() {
-		baseStr = base.ToString()
-	}
-	if baseStr != "" {
-		baseURL, berr := url.Parse(baseStr)
-		if berr != nil || baseURL.Scheme == "" {
-			return nil, fmt.Errorf("Invalid base URL: %s", baseStr)
-		}
-		ref, rerr := url.Parse(href)
-		if rerr != nil {
-			return nil, fmt.Errorf("Invalid URL: %s", href)
-		}
-		parsed = baseURL.ResolveReference(ref)
-	} else {
-		parsed, err = url.Parse(href)
-		if err != nil {
-			return nil, fmt.Errorf("Invalid URL: %s", href)
-		}
-	}
-	if parsed.Scheme == "" {
-		return nil, fmt.Errorf("Invalid URL: %s", href)
-	}
-
-	protocol := parsed.Scheme + ":"
-	origin := "null"
-	if specialSchemes[parsed.Scheme] {
-		origin = protocol + "//" + parsed.Host
-	}
-	// WHATWG's URL parser gives a special-scheme URL with no path
-	// component a single-slash path, never an empty one - real Node:
-	// new URL("http://x").pathname === "/", not "". Go's net/url.Parse
-	// leaves Path empty for "http://x" (no error, just an empty string),
-	// so this needs an explicit normalization step. Found the hard way
-	// while re-probing real undici's fetch() after paserati#302 was
-	// fixed (round 75, docs/real-node-plan.md): undici's own
-	// lib/core/util.js#parseOrigin re-parses the dispatcher's origin
-	// URL and throws InvalidArgumentError('invalid url') unless
-	// pathname === '/' exactly - a real, unconditional check on a real
-	// call path (every request through Pool/Client construction), not
-	// an edge case. Mutating parsed.Path before it feeds Href below
-	// also fixes href (real Node: same URL's .href is
-	// "http://x/", not "http://x") for the same reason.
-	if specialSchemes[parsed.Scheme] && parsed.Path == "" {
-		parsed.Path = "/"
-	}
-	// WHATWG path parsing resolves "." and ".." segments; Go's url.Parse
-	// keeps them verbatim (new URL("file:///a/b/../c").pathname must be
-	// "/a/c").
-	if escaped := parsed.EscapedPath(); strings.HasPrefix(escaped, "/") {
-		if cleaned := removeDotSegments(escaped, parsed.Scheme == "file"); cleaned != escaped {
-			if unescaped, uerr := url.PathUnescape(cleaned); uerr == nil {
-				parsed.Path = unescaped
-				parsed.RawPath = cleaned
-			}
-		}
-	}
-	search := ""
-	if parsed.RawQuery != "" {
-		search = "?" + parsed.RawQuery
-	}
-	hash := ""
-	if parsed.Fragment != "" {
-		hash = "#" + parsed.Fragment
-	}
-	password := ""
-	if pw, ok := parsed.User.Password(); ok {
-		password = pw
-	}
-
-	return &jsURL{
-		Href:     parsed.String(),
-		Origin:   origin,
-		Protocol: protocol,
-		Username: parsed.User.Username(),
-		Password: password,
-		Host:     parsed.Host,
-		Hostname: parsed.Hostname(),
-		Port:     parsed.Port(),
-		Pathname: parsed.Path,
-		Search:   search,
-		Hash:     hash,
-	}, nil
-}
-
-// hrefFromURLLike duck-types v as a URL instance (own `href`+`protocol`
-// string properties - real Node's own internal isURLInstance check is
-// a brand check this host has no equivalent for, since a returned
-// *jsURL value has no reliable link back to the URL class's own
-// prototype; see pathToFileURL's own doc comment), returning its href
-// if so. Shared by fs.go's pathArg (a real fs path argument) and
-// fileURLToPath above (both real Node APIs that accept a URL instance
-// or a string interchangeably).
+// hrefFromURLLike returns a URL instance's href: paserati's WHATWG URL
+// (its [[URLHref]] internal slot), or, duck-typed, any object with own
+// string `href` and `protocol` properties. Shared by fs.go's pathArg and
+// fileURLToPath, both of which accept a URL instance or a string.
 func hrefFromURLLike(v vm.Value) (string, bool) {
 	// vm.Value.AsPlainObject() panics for anything other than
 	// TypeObject (it is not a safe "nil for the wrong type" cast) -
@@ -212,6 +62,9 @@ func hrefFromURLLike(v vm.Value) (string, bool) {
 	obj := v.AsPlainObject()
 	if obj == nil {
 		return "", false
+	}
+	if href, ok := obj.GetInternal("[[URLHref]]"); ok && href.IsString() {
+		return href.ToString(), true
 	}
 	hrefVal, ok := obj.GetOwn("href")
 	if !ok || !hrefVal.IsString() {
@@ -245,9 +98,8 @@ func fileURLStringToPath(fileURL string) (string, error) {
 }
 
 func declareURL(p *driver.Paserati) {
+	vmInst := p.GetVM()
 	p.DeclareModule("url", func(m *driver.ModuleBuilder) {
-		m.Class("URL", &jsURL{}, newJSURL)
-		m.Class("URLSearchParams", &urlSearchParams{}, newURLSearchParams)
 		// Real Node's url.fileURLToPath() accepts a real URL instance or
 		// a string alike - this used to take a plain Go `string`
 		// parameter, so a URL object argument (the exact
@@ -261,7 +113,7 @@ func declareURL(p *driver.Paserati) {
 			}
 			return fileURLStringToPath(fileURLVal.ToString())
 		})
-		m.Function("pathToFileURL", func(p string) (*jsURL, error) {
+		m.Function("pathToFileURL", func(p string) (vm.Value, error) {
 			// Real Node's url.pathToFileURL() returns a real URL
 			// instance, not a plain string - this used to return a bare
 			// Go string, which JS code that calls .href/.pathname/etc.
@@ -280,7 +132,7 @@ func declareURL(p *driver.Paserati) {
 			if !filepath.IsAbs(p) {
 				abs, err := filepath.Abs(p)
 				if err != nil {
-					return nil, err
+					return vm.Undefined, err
 				}
 				p = abs
 			}
@@ -288,7 +140,11 @@ func declareURL(p *driver.Paserati) {
 				Scheme: "file",
 				Path:   filepath.ToSlash(p),
 			}
-			return newJSURL(u.String(), vm.Undefined)
+			ctor, ok := vmInst.GetGlobal("URL")
+			if !ok {
+				return vm.Undefined, fmt.Errorf("pathToFileURL: no URL global")
+			}
+			return vmInst.Construct(ctor, []vm.Value{vm.NewString(u.String())})
 		})
 		m.Function("domainToASCII", func(domain string) (string, error) {
 			return idna.ToASCII(domain)
@@ -339,4 +195,15 @@ func declareURL(p *driver.Paserati) {
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:url", "url")
+}
+
+// installURLExports exports paserati's own WHATWG URL and URLSearchParams
+// globals from node:url, as Node does (require('url').URL === URL).
+func installURLExports(p *driver.Paserati) {
+	vmInst := p.GetVM()
+	for _, name := range []string{"URL", "URLSearchParams"} {
+		if v, ok := vmInst.GetGlobal(name); ok {
+			setNativeExport(p, "url", name, v)
+		}
+	}
 }

@@ -27,7 +27,7 @@ func New(argv []string) *driver.Paserati {
 	installUtilNatives(p)
 	installFSPromisesAlias(p)
 	installFSRealpathNative(p)
-	installURLSearchParamsIteration(p)
+	installURLExports(p)
 	installFileGlobal(p)
 	installMessagePortGlobal(p)
 	installEventGlobals(p)

@@ -26,9 +26,8 @@ type stringDecoder struct {
 }
 
 // newStringDecoder is `new StringDecoder(encoding?)`'s constructor,
-// closed over vmInst the same way newVMScript (vm.go) and newJSURL
-// (url.go) close over host state a plain per-call constructor function
-// has no other way to reach - Write/End need vmInst to pull real bytes
+// closed over vmInst the same way newVMScript (vm.go) closes over host
+// state a plain per-call constructor function has no other way to reach - Write/End need vmInst to pull real bytes
 // out of a Buffer/Uint8Array argument via valueToBytes (net.go).
 func newStringDecoder(vmInst *vm.VM) func(encoding vm.Value) *stringDecoder {
 	return func(encoding vm.Value) *stringDecoder {
