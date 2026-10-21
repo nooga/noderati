@@ -30,9 +30,9 @@ func TestStreamPipelinePromises(t *testing.T) {
 		const src = new Src();
 		const dst = new Dst();
 		const done = pipeline(src, dst);
-		src.emit("data", "a");
-		src.emit("data", "b");
-		src.emit("end");
+		src.push("a");
+		src.push("b");
+		src.push(null);
 		await done;
 		dst.collected
 	`, driver.RunOptions{})
@@ -59,8 +59,8 @@ func TestStreamPipelineCallback(t *testing.T) {
 		const dst = new Dst();
 		const result = await new Promise((resolve, reject) => {
 			pipeline(src, dst, (err) => err ? reject(err) : resolve(dst.collected));
-			src.emit("data", "x");
-			src.emit("end");
+			src.push("x");
+			src.push(null);
 		});
 		result
 	`, driver.RunOptions{})
@@ -233,40 +233,40 @@ func TestStreamTransformSubclassable(t *testing.T) {
 		let result = "";
 		let ended = false;
 		t.on("data", (chunk) => { result += chunk; });
-		t.on("end", () => { ended = true; });
+		const done = new Promise((res) => t.on("end", () => { ended = true; res(); }));
 		t.write("hello ");
 		t.end("world");
-		JSON.stringify({ result, ended })
+		// 'end' is emitted on a later tick in real Node.
+		const before = JSON.stringify({ result, ended });
+		await done;
+		before + " " + JSON.stringify({ result, ended })
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	want := `{"result":"HELLO WORLD","ended":true}`
+	want := `{"result":"HELLO WORLD","ended":false} {"result":"HELLO WORLD","ended":true}`
 	if val.ToString() != want {
 		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
 }
 
-// TestStreamTransformDefaultIsPassthrough checks the base class's own
-// (unoverridden) _transform default - an honest identity pass-through,
-// not a stub that drops data.
-func TestStreamTransformDefaultIsPassthrough(t *testing.T) {
+// TestStreamTransformDefaultThrows checks the base class's own
+// (unoverridden) _transform: real Node throws ERR_METHOD_NOT_IMPLEMENTED
+// synchronously from write() (PassThrough is the identity Transform).
+func TestStreamTransformDefaultThrows(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
 		import { Transform } from "node:stream";
-		const t = new Transform();
-		let result = "";
-		t.on("data", (chunk) => { result += chunk; });
-		t.write("abc");
-		t.end("def");
-		result
+		let code = "";
+		try { new Transform().write("abc"); } catch (e) { code = e.code; }
+		code
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	if val.ToString() != "abcdef" {
-		t.Errorf("got %q, want %q", val.ToString(), "abcdef")
+	if val.ToString() != "ERR_METHOD_NOT_IMPLEMENTED" {
+		t.Errorf("got %q, want %q", val.ToString(), "ERR_METHOD_NOT_IMPLEMENTED")
 	}
 }
 
@@ -356,6 +356,9 @@ func TestStreamDuplexSubclassable(t *testing.T) {
 		import { Duplex, Readable } from "node:stream";
 
 		class Upper extends Duplex {
+			// Like real ChecksumStream: the readable side is push()-fed,
+			// _read only exists (the base one throws, as in Node).
+			_read() {}
 			_write(chunk, _encoding, callback) {
 				this.push(String(chunk).toUpperCase());
 				callback();
