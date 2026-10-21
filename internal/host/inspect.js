@@ -2143,35 +2143,27 @@ export function stripVTControlCharacters(str) {
   return str.replace(ansi, "");
 }
 
-// Buffer's own inspect hook, as lib/buffer.js defines it.
-const BufferCtor = globalThis.Buffer;
-if (typeof BufferCtor === "function" && !Object.prototype.hasOwnProperty.call(BufferCtor.prototype, customInspectSymbol)) {
-  const bufferInspect = function inspectBuffer(recurseTimes, ctx) {
-    const configured = bufferModule?.INSPECT_MAX_BYTES;
-    const max = typeof configured === "number" ? configured : 50;
-    const actualMax = Math.min(max, this.length);
-    const remaining = this.length - max;
-    let str = "";
-    for (let i = 0; i < actualMax; i++) str += (i ? " " : "") + this[i].toString(16).padStart(2, "0");
-    if (remaining > 0) str += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
-    if (ctx) {
-      let extras = false;
-      const obj = { __proto__: null };
-      for (const key of getOwnNonIndexProperties(this, !ctx.showHidden)) {
-        extras = true;
-        obj[key] = this[key];
-      }
-      if (extras) {
-        if (this.length !== 0) str += ", ";
-        str += inspect(obj, { ...ctx, breakLength: Infinity, compact: true }).slice(27, -2);
-      }
+// Buffer.prototype[inspect.custom] (and Buffer.prototype.inspect), as
+// lib/buffer.js defines it; installed on Buffer.prototype from Go.
+export function bufferInspect(recurseTimes, ctx) {
+  const configured = bufferModule?.INSPECT_MAX_BYTES;
+  const max = typeof configured === "number" ? configured : 50;
+  const actualMax = Math.min(max, this.length);
+  const remaining = this.length - max;
+  let str = "";
+  for (let i = 0; i < actualMax; i++) str += (i ? " " : "") + this[i].toString(16).padStart(2, "0");
+  if (remaining > 0) str += ` ... ${remaining} more byte${remaining > 1 ? "s" : ""}`;
+  if (ctx) {
+    let extras = false;
+    const obj = { __proto__: null };
+    for (const key of getOwnNonIndexProperties(this, !ctx.showHidden)) {
+      extras = true;
+      obj[key] = this[key];
     }
-    return `<${this.constructor.name} ${str}>`;
-  };
-  Object.defineProperty(BufferCtor.prototype, customInspectSymbol, {
-    value: bufferInspect,
-    writable: true,
-    configurable: true,
-    enumerable: false,
-  });
+    if (extras) {
+      if (this.length !== 0) str += ", ";
+      str += inspect(obj, { ...ctx, breakLength: Infinity, compact: true }).slice(27, -2);
+    }
+  }
+  return `<${this.constructor.name} ${str}>`;
 }

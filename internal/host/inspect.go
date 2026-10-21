@@ -14,11 +14,18 @@ import (
 //go:embed inspect.js
 var inspectShim string
 
+// utilMoreShim is the rest of node:util (util_more.js): MIMEType,
+// MIMEParams, parseEnv, diff, getCallSites and friends.
+//
+//go:embed util_more.js
+var utilMoreShim string
+
 // declareInspect registers the inspect shim and the engine lookups it
 // needs that plain JS can't do: V8 exposes these to Node's inspect through
 // internalBinding('util').
 func declareInspect(p *driver.Paserati) {
 	registerJSShim("noderati-internal:inspect", inspectShim)
+	registerJSShim("noderati-internal:util-more", utilMoreShim)
 	p.DeclareModule("noderati-internal:inspect-natives", func(m *driver.ModuleBuilder) {
 		// getPromiseDetails(p) -> [state, result]: 0 pending, 1 fulfilled,
 		// 2 rejected (V8's kPending/kFulfilled/kRejected).
@@ -225,4 +232,34 @@ func installUtilInspect(p *driver.Paserati) {
 			def.AsPlainObject().SetOwn(name, v)
 		}
 	}
+
+	// Buffer.prototype[inspect.custom] and its legacy alias .inspect.
+	// (Buffer lives on globalThis's own properties, which GetGlobal
+	// doesn't consult; see wrapBuffer.)
+	var bufCtor vm.Value
+	bufOK := false
+	if gt, ok := vmInst.GetGlobal("globalThis"); ok && gt.AsPlainObject() != nil {
+		bufCtor, bufOK = gt.AsPlainObject().GetOwn("Buffer")
+	}
+	if bufOK {
+		if proto, err := jsReflectGet(vmInst, bufCtor, vm.NewString("prototype")); err == nil && !isNullish(proto) {
+			hook := vm.NewNativeFunction(2, false, "inspect", func(args []vm.Value) (vm.Value, error) {
+				return callInspectExport(p, "bufferInspect", vmInst.GetThis(), args)
+			})
+			for _, key := range []vm.Value{jsSymbolFor(vmInst, "nodejs.util.inspect.custom"), vm.NewString("inspect")} {
+				d := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+				d.SetOwn("value", hook)
+				d.SetOwn("writable", vm.True)
+				d.SetOwn("enumerable", vm.True)
+				d.SetOwn("configurable", vm.True)
+				_, _ = vmInst.Call(defineProperty, vm.Undefined, []vm.Value{proto, key, vm.NewValueFromPlainObject(d)})
+			}
+		}
+	}
+
+	// The rest of node:util (util_more.js), also loaded on first use.
+	installLazyJSExports(p, "util", "noderati-internal:util-more",
+		[]string{"parseEnv", "getCallSites", "diff", "transferableAbortController", "transferableAbortSignal",
+			"setTraceSigInt", "convertProcessSignalToExitCode"},
+		[]string{"MIMEType", "MIMEParams"})
 }
