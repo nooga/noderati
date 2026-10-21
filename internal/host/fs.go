@@ -2,7 +2,6 @@ package host
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -68,58 +67,6 @@ func modeFromFileInfo(info os.FileInfo) uint32 {
 	return mode
 }
 
-var statsProtos sync.Map // *vm.VM -> *vm.PlainObject
-
-// statsPrototype is the shared prototype every Stats object gets: the
-// is*() predicates read this.mode, like real Node's own StatsBase.
-func statsPrototype(vmInst *vm.VM) *vm.PlainObject {
-	if p, ok := statsProtos.Load(vmInst); ok {
-		return p.(*vm.PlainObject)
-	}
-	proto := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
-	for name, bits := range map[string]uint32{
-		"isFile": sIFREG, "isDirectory": sIFDIR, "isSymbolicLink": sIFLNK,
-		"isBlockDevice": sIFBLK, "isCharacterDevice": sIFCHR, "isFIFO": sIFIFO, "isSocket": sIFSOCK,
-	} {
-		want := bits
-		proto.SetOwn(name, vm.NewNativeFunction(0, false, name, func(_ []vm.Value) (vm.Value, error) {
-			obj := vmInst.GetThis().AsPlainObject()
-			if obj == nil {
-				return vm.False, nil
-			}
-			modeVal, _ := obj.Get("mode")
-			return vm.BooleanValue(uint32(modeVal.ToFloat())&sIFMT == want), nil
-		}))
-	}
-	// Real Node (22+) exposes the Date fields as lazy prototype accessors
-	// over the *Ms numbers (so they're absent from Object.keys until used);
-	// the first read, or any write, replaces the accessor with a plain own
-	// enumerable data property.
-	yes := true
-	for _, name := range []string{"atime", "mtime", "ctime", "birthtime"} {
-		field := name
-		getter := vm.NewNativeFunction(0, false, "get "+field, func(_ []vm.Value) (vm.Value, error) {
-			obj := vmInst.GetThis().AsPlainObject()
-			if obj == nil {
-				return vm.Undefined, nil
-			}
-			ms, _ := obj.Get(field + "Ms")
-			date := newJSDate(vmInst, math.Trunc(ms.ToFloat()))
-			obj.DefineOwnProperty(field, date, &yes, &yes, &yes)
-			return date, nil
-		})
-		setter := vm.NewNativeFunction(1, false, "set "+field, func(args []vm.Value) (vm.Value, error) {
-			if obj := vmInst.GetThis().AsPlainObject(); obj != nil {
-				obj.DefineOwnProperty(field, argAt(args, 0), &yes, &yes, &yes)
-			}
-			return vm.Undefined, nil
-		})
-		proto.DefineAccessorProperty(field, getter, true, setter, true, &yes, &yes)
-	}
-	actual, _ := statsProtos.LoadOrStore(vmInst, proto)
-	return actual.(*vm.PlainObject)
-}
-
 func newJSDate(vmInst *vm.VM, ms float64) vm.Value {
 	if dateCtor, ok := vmInst.GetGlobal("Date"); ok {
 		if v, err := vmInst.Construct(dateCtor, []vm.Value{vm.NumberValue(ms)}); err == nil {
@@ -131,39 +78,6 @@ func newJSDate(vmInst *vm.VM, ms float64) vm.Value {
 
 func timeToMs(t time.Time) float64 {
 	return float64(t.UnixNano()) / 1e6
-}
-
-// fsStatsValue builds a real Node-shaped fs.Stats object (every numeric
-// field plus the atime/mtime/ctime/birthtime Dates) from a Go FileInfo.
-// Real packages read far more than size/mtime: tar writes mode/uid/gid/
-// atime/ctime into every header and keys hardlink detection on dev:ino
-// when nlink > 1.
-func fsStatsValue(vmInst *vm.VM, info os.FileInfo) vm.Value {
-	sys, ok := statSysFields(info)
-	if !ok {
-		mt := info.ModTime()
-		sys = statSys{mode: modeFromFileInfo(info), nlink: 1, blksize: 4096, atime: mt, ctime: mt, birthtime: mt}
-		sys.blocks = (info.Size() + 511) / 512
-	}
-	obj := vm.NewObject(vm.NewValueFromPlainObject(statsPrototype(vmInst))).AsPlainObject()
-	num := func(name string, v float64) { obj.SetOwn(name, vm.NumberValue(v)) }
-	num("dev", float64(sys.dev))
-	num("mode", float64(sys.mode))
-	num("nlink", float64(sys.nlink))
-	num("uid", float64(sys.uid))
-	num("gid", float64(sys.gid))
-	num("rdev", float64(sys.rdev))
-	num("blksize", float64(sys.blksize))
-	num("ino", float64(sys.ino))
-	num("size", float64(info.Size()))
-	num("blocks", float64(sys.blocks))
-	for _, t := range []struct {
-		name string
-		at   time.Time
-	}{{"atime", sys.atime}, {"mtime", info.ModTime()}, {"ctime", sys.ctime}, {"birthtime", sys.birthtime}} {
-		num(t.name+"Ms", timeToMs(t.at))
-	}
-	return vm.NewValueFromPlainObject(obj)
 }
 
 var (
@@ -440,11 +354,7 @@ func declareFS(p *driver.Paserati) {
 			}
 			return nil, wrapFsErr(vmInst, "chmod", path, os.Chmod(path, os.FileMode(mode)))
 		})
-		m.Namespace("constants", func(ns *driver.NamespaceBuilder) {
-			for _, c := range fsConstantEntries() {
-				ns.Const(c.Name, c.Value)
-			}
-		})
+		m.Const("constants", fsConstantsObject(vmInst))
 		m.Function("readdirSync", func(pathVal vm.Value, opts map[string]interface{}) ([]vm.Value, error) {
 			path, perr := pathArg(vmInst, pathVal)
 			if perr != nil {
@@ -477,7 +387,7 @@ func declareFS(p *driver.Paserati) {
 				}
 				return vm.Undefined, wrapFsErr(vmInst, "stat", path, err)
 			}
-			return fsStatsValue(vmInst, info), nil
+			return fsStatsValueOpt(vmInst, info, bigintRequested(opts)), nil
 		})
 		m.Function("lstatSync", func(pathVal vm.Value, opts ...vm.Value) (vm.Value, error) {
 			path, perr := pathArg(vmInst, pathVal)
@@ -492,7 +402,7 @@ func declareFS(p *driver.Paserati) {
 				}
 				return vm.Undefined, wrapFsErr(vmInst, "lstat", path, err)
 			}
-			return fsStatsValue(vmInst, info), nil
+			return fsStatsValueOpt(vmInst, info, bigintRequested(opts)), nil
 		})
 		m.Function("realpathSync", func(pathVal vm.Value, _ ...interface{}) (string, error) {
 			path, perr := pathArg(vmInst, pathVal)
@@ -501,17 +411,6 @@ func declareFS(p *driver.Paserati) {
 			}
 			resolved, err := filepath.EvalSymlinks(path)
 			return resolved, wrapFsErr(vmInst, "realpath", path, err)
-		})
-		m.Function("copyFileSync", func(srcVal, dstVal vm.Value) (interface{}, error) {
-			src, perr := pathArg(vmInst, srcVal)
-			if perr != nil {
-				return nil, perr
-			}
-			dst, perr := pathArg(vmInst, dstVal)
-			if perr != nil {
-				return nil, perr
-			}
-			return nil, wrapFsErr(vmInst, "copyfile", src, copyFile(src, dst))
 		})
 		m.Function("renameSync", func(oldPathVal, newPathVal vm.Value) (interface{}, error) {
 			oldPath, perr := pathArg(vmInst, oldPathVal)
@@ -522,32 +421,10 @@ func declareFS(p *driver.Paserati) {
 			if perr != nil {
 				return nil, perr
 			}
-			return nil, wrapFsErr(vmInst, "rename", oldPath, os.Rename(oldPath, newPath))
-		})
-		m.Function("rmSync", func(pathVal vm.Value) (interface{}, error) {
-			path, perr := pathArg(vmInst, pathVal)
-			if perr != nil {
-				return nil, perr
-			}
-			return nil, wrapFsErr(vmInst, "rm", path, os.RemoveAll(path))
+			return nil, wrapFsErr(vmInst, "rename", oldPath, withDest(os.Rename(oldPath, newPath), newPath))
 		})
 		declareFSAsync(m, vmInst)
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:fs", "fs")
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = out.ReadFrom(in)
-	return err
 }

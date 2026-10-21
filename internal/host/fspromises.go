@@ -48,21 +48,21 @@ func declareFSPromises(p *driver.Paserati) {
 			}
 			return entries, nil
 		})
-		m.AsyncFunction("stat", func(path string, _ ...interface{}) (vm.Value, error) {
+		m.AsyncFunction("stat", func(path string, opts ...vm.Value) (vm.Value, error) {
 			fsTouch("stat", path)
 			info, err := os.Stat(path)
 			if err != nil {
 				return vm.Undefined, wrapFsErr(vmInst, "stat", path, err)
 			}
-			return fsStatsValue(vmInst, info), nil
+			return fsStatsValueOpt(vmInst, info, bigintRequested(opts)), nil
 		})
-		m.AsyncFunction("lstat", func(path string, _ ...interface{}) (vm.Value, error) {
+		m.AsyncFunction("lstat", func(path string, opts ...vm.Value) (vm.Value, error) {
 			fsTouch("stat", path)
 			info, err := os.Lstat(path)
 			if err != nil {
 				return vm.Undefined, wrapFsErr(vmInst, "lstat", path, err)
 			}
-			return fsStatsValue(vmInst, info), nil
+			return fsStatsValueOpt(vmInst, info, bigintRequested(opts)), nil
 		})
 		m.AsyncFunction("access", func(path string, _ ...interface{}) (interface{}, error) {
 			fsTouch("stat", path)
