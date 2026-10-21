@@ -12,7 +12,9 @@ require (
 )
 
 require (
+	github.com/andybalholm/brotli v1.2.6 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
+	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	golang.org/x/text v0.41.0 // indirect
 )
