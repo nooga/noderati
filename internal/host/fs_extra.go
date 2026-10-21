@@ -181,36 +181,7 @@ func declareFSExtra(m *driver.ModuleBuilder, vmInst *vm.VM) {
 	}
 	r.both("copyFile", copyBody)
 
-	r.both("rm", func(args []vm.Value) (string, string, []vm.Value, error) {
-		path, err := pathOf(args, 0)
-		if err != nil {
-			return "rm", "", nil, err
-		}
-		opt := argAt(args, 1)
-		recursive, force := false, false
-		if v, ok := objOption(opt, "recursive"); ok {
-			recursive = v.IsTruthy()
-		}
-		if v, ok := objOption(opt, "force"); ok {
-			force = v.IsTruthy()
-		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			if force && errors.Is(err, os.ErrNotExist) {
-				return "rm", path, nil, nil
-			}
-			return "lstat", path, nil, err
-		}
-		if info.IsDir() {
-			if !recursive {
-				return "rm", path, nil, newFsCodeError(vmInst, "SystemError", "ERR_FS_EISDIR",
-					"Path is a directory: rm returned EISDIR (is a directory) "+path,
-					map[string]vm.Value{"errno": vm.NumberValue(float64(syscall.EISDIR)), "syscall": vm.NewString("rm"), "path": vm.NewString(path), "code": vm.NewString("ERR_FS_EISDIR")})
-			}
-			return "rm", path, nil, os.RemoveAll(path)
-		}
-		return "rm", path, nil, syscall.Unlink(path)
-	})
+	r.both("rm", func(args []vm.Value) (string, string, []vm.Value, error) { return fsRmBody(vmInst, args) })
 
 	m.Function("globSync", func(args ...vm.Value) (vm.Value, error) {
 		return fsGlobValue(vmInst, args)
@@ -355,4 +326,36 @@ func fsGlobValue(vmInst *vm.VM, args []vm.Value) (vm.Value, error) {
 		}
 	}
 	return vm.NewArrayWithArgs(out), nil
+}
+
+// fsRmBody is rm/rmSync/fs.promises.rm: recursive and force as in Node.
+func fsRmBody(vmInst *vm.VM, args []vm.Value) (string, string, []vm.Value, error) {
+	path, err := pathArg(vmInst, argAt(args, 0))
+	if err != nil {
+		return "rm", "", nil, err
+	}
+	opt := argAt(args, 1)
+	recursive, force := false, false
+	if v, ok := objOption(opt, "recursive"); ok {
+		recursive = v.IsTruthy()
+	}
+	if v, ok := objOption(opt, "force"); ok {
+		force = v.IsTruthy()
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if force && errors.Is(err, os.ErrNotExist) {
+			return "rm", path, nil, nil
+		}
+		return "lstat", path, nil, err
+	}
+	if info.IsDir() {
+		if !recursive {
+			return "rm", path, nil, newFsCodeError(vmInst, "SystemError", "ERR_FS_EISDIR",
+				"Path is a directory: rm returned EISDIR (is a directory) "+path,
+				map[string]vm.Value{"errno": vm.NumberValue(float64(syscall.EISDIR)), "syscall": vm.NewString("rm"), "path": vm.NewString(path), "code": vm.NewString("ERR_FS_EISDIR")})
+		}
+		return "rm", path, nil, os.RemoveAll(path)
+	}
+	return "rm", path, nil, syscall.Unlink(path)
 }
