@@ -49,7 +49,7 @@ function callbackify(body, args) {
   const cb = maybeCallback(args[args.length - 1]);
   let res, err = null;
   try { res = body(...args.slice(0, -1)); } catch (e) { err = e; }
-  nextTick(() => err ? cb(err) : cb(null, res));
+  nextTick(() => err ? cb(err) : res === undefined ? cb(null) : cb(null, res));
 }
 function codeError(Ctor, code, message, props) {
   const err = new Ctor(message);
@@ -293,7 +293,7 @@ async function cpAsync(src, dest, options) {
 export function cp(src, dest, options, cb) {
   if (typeof options === "function") { cb = options; options = undefined; }
   maybeCallback(cb);
-  cpAsync(src, dest, options).then(() => cb(null), (err) => cb(err));
+  cpAsync(src, dest, options).then((res) => cb(null, res), (err) => cb(err));
 }
 
 // ---------- mkdtempDisposable / openAsBlob ----------
