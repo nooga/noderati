@@ -166,6 +166,12 @@ func fsWatch(vmInst *vm.VM, args []vm.Value) (vm.Value, error) {
 		}
 		return vm.Undefined, nil
 	}))
+	// Real Node's FSWatcher.start() (an internal the watch() factory
+	// calls) is a no-op on an already-started watcher, which every
+	// watcher handed to user code is.
+	obj.SetOwn("start", vm.NewNativeFunction(0, true, "start", func(_ []vm.Value) (vm.Value, error) {
+		return vm.Undefined, nil
+	}))
 
 	go func() {
 		for {

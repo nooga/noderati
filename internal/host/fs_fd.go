@@ -335,10 +335,10 @@ func fsWriteArgs(vmInst *vm.VM, args []vm.Value) ([]byte, int64, bool, error) {
 }
 
 func fsWritev(f *os.File, bufs vm.Value, position int64) (int, error) {
-	arr := bufs.AsArray()
-	if arr == nil {
+	if bufs.Type() != vm.TypeArray {
 		return 0, errors.New(`The "buffers" argument must be an instance of ArrayBufferView`)
 	}
+	arr := bufs.AsArray()
 	var all []byte
 	for i := 0; i < arr.Length(); i++ {
 		all = append(all, typedArrayLiveBytes(arr.Get(i).AsTypedArray())...)
@@ -351,52 +351,69 @@ func fsFutimes(f *os.File, at, mt time.Time) error {
 	return syscall.Futimes(int(f.Fd()), tv)
 }
 
-func declareFSFd(m *driver.ModuleBuilder, vmInst *vm.VM) {
-	cbErr := func(cb vm.Value, syscallName, path string, err error, results ...vm.Value) {
-		if err != nil {
-			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, syscallName, path, err))})
-			return
-		}
-		scheduleCallback(vmInst, cb, append([]vm.Value{vm.Null}, results...))
+// fsBody is the shared body of a sync/callback fs pair: it returns the
+// syscall name and path(s) for error reporting, the results, and an error.
+type fsBody func(args []vm.Value) (string, string, []vm.Value, error)
+
+// fsRegistrar registers callback-style and Sync fs functions sharing one
+// Go body.
+type fsRegistrar struct {
+	m      *driver.ModuleBuilder
+	vmInst *vm.VM
+}
+
+func (r fsRegistrar) cbErr(cb vm.Value, syscallName, path string, err error, results ...vm.Value) {
+	if err != nil {
+		scheduleCallback(r.vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(r.vmInst, syscallName, path, err))})
+		return
 	}
-	// asyncFn registers a callback-style function whose body is the same
-	// Go code as its Sync twin: do the work, then hand (err, ...results)
-	// to the callback on the next tick.
-	asyncFn := func(name string, body func(args []vm.Value) (string, string, []vm.Value, error)) {
-		m.Function(name, func(all ...vm.Value) (vm.Value, error) {
-			args, cb, err := splitCallback(vmInst, all)
-			if err != nil {
-				return vm.Undefined, err
-			}
-			syscallName, path, results, err := body(args)
-			// Already-built JS errors are argument-validation failures,
-			// which real Node throws synchronously instead of calling back.
+	scheduleCallback(r.vmInst, cb, append([]vm.Value{vm.Null}, results...))
+}
+
+// asyncFn registers a callback-style function whose body is the same
+// Go code as its Sync twin: do the work, then hand (err, ...results)
+// to the callback on the next tick.
+func (r fsRegistrar) asyncFn(name string, body fsBody) {
+	r.m.Function(name, func(all ...vm.Value) (vm.Value, error) {
+		args, cb, err := splitCallback(r.vmInst, all)
+		if err != nil {
+			return vm.Undefined, err
+		}
+		syscallName, path, results, err := body(args)
+		// Already-built JS errors are argument-validation failures,
+		// which real Node throws synchronously instead of calling back.
+		if _, ok := err.(*fsSystemError); ok {
+			return vm.Undefined, err
+		}
+		r.cbErr(cb, syscallName, path, err, results...)
+		return vm.Undefined, nil
+	})
+}
+
+func (r fsRegistrar) syncFn(name string, body fsBody) {
+	r.m.Function(name, func(args ...vm.Value) (vm.Value, error) {
+		syscallName, path, results, err := body(args)
+		if err != nil {
 			if _, ok := err.(*fsSystemError); ok {
 				return vm.Undefined, err
 			}
-			cbErr(cb, syscallName, path, err, results...)
-			return vm.Undefined, nil
-		})
-	}
-	syncFn := func(name string, body func(args []vm.Value) (string, string, []vm.Value, error)) {
-		m.Function(name, func(args ...vm.Value) (vm.Value, error) {
-			syscallName, path, results, err := body(args)
-			if err != nil {
-				if _, ok := err.(*fsSystemError); ok {
-					return vm.Undefined, err
-				}
-				return vm.Undefined, wrapFsErr(vmInst, syscallName, path, err)
-			}
-			if len(results) > 0 {
-				return results[0], nil
-			}
-			return vm.Undefined, nil
-		})
-	}
-	both := func(name string, body func(args []vm.Value) (string, string, []vm.Value, error)) {
-		asyncFn(name, body)
-		syncFn(name+"Sync", body)
-	}
+			return vm.Undefined, wrapFsErr(r.vmInst, syscallName, path, err)
+		}
+		if len(results) > 0 {
+			return results[0], nil
+		}
+		return vm.Undefined, nil
+	})
+}
+
+func (r fsRegistrar) both(name string, body fsBody) {
+	r.asyncFn(name, body)
+	r.syncFn(name+"Sync", body)
+}
+
+func declareFSFd(m *driver.ModuleBuilder, vmInst *vm.VM) {
+	r := fsRegistrar{m: m, vmInst: vmInst}
+	asyncFn, syncFn, both := r.asyncFn, r.syncFn, r.both
 	pathOf := func(args []vm.Value, i int) (string, error) {
 		return pathArg(vmInst, argAt(args, i))
 	}
@@ -434,7 +451,7 @@ func declareFSFd(m *driver.ModuleBuilder, vmInst *vm.VM) {
 		if err != nil {
 			return "fstat", "", nil, err
 		}
-		return "fstat", "", []vm.Value{fsStatsValue(vmInst, info)}, nil
+		return "fstat", "", []vm.Value{fsStatsValueOpt(vmInst, info, bigintRequested(args[1:]))}, nil
 	})
 	asyncFn("read", func(args []vm.Value) (string, string, []vm.Value, error) {
 		fd, err := fdArg(vmInst, argAt(args, 0))
@@ -660,7 +677,7 @@ func declareFSFd(m *driver.ModuleBuilder, vmInst *vm.VM) {
 		if err != nil {
 			return "rename", from, nil, err
 		}
-		return "rename", from, nil, os.Rename(from, to)
+		return "rename", from, nil, withDest(os.Rename(from, to), to)
 	})
 	asyncFn("unlink", func(args []vm.Value) (string, string, []vm.Value, error) {
 		path, err := pathOf(args, 0)
@@ -678,7 +695,7 @@ func declareFSFd(m *driver.ModuleBuilder, vmInst *vm.VM) {
 		if err != nil {
 			return "symlink", target, nil, err
 		}
-		return "symlink", target, nil, os.Symlink(target, path)
+		return "symlink", target, nil, withDest(os.Symlink(target, path), path)
 	})
 	both("link", func(args []vm.Value) (string, string, []vm.Value, error) {
 		existing, err := pathOf(args, 0)
@@ -689,7 +706,7 @@ func declareFSFd(m *driver.ModuleBuilder, vmInst *vm.VM) {
 		if err != nil {
 			return "link", existing, nil, err
 		}
-		return "link", existing, nil, os.Link(existing, newPath)
+		return "link", existing, nil, withDest(os.Link(existing, newPath), newPath)
 	})
 	syncFn("readlinkSync", func(args []vm.Value) (string, string, []vm.Value, error) {
 		path, err := pathOf(args, 0)

@@ -27,11 +27,11 @@ func declareFSPromises(p *driver.Paserati) {
 			}
 			return vm.NewString(encodeBufferBytes(b, encoding)), nil
 		})
-		m.AsyncFunction("writeFile", func(path string, data vm.Value, _ ...interface{}) (interface{}, error) {
+		m.AsyncFunction("writeFile", func(path string, data vm.Value, _ ...interface{}) (vm.Value, error) {
 			// Same fix as fs.go's writeFileSync: accept a real
 			// Buffer/TypedArray `data` argument (not just a string) and
 			// write its raw bytes.
-			return nil, wrapFsErr(vmInst, "open", path, os.WriteFile(path, valueToBytes(vmInst, data), 0644))
+			return vm.Undefined, wrapFsErr(vmInst, "open", path, os.WriteFile(path, valueToBytes(vmInst, data), 0644))
 		})
 		m.AsyncFunction("mkdir", func(path string, opts ...vm.Value) (vm.Value, error) {
 			first, err := fsMkdir(path, argAt(opts, 0))
@@ -48,35 +48,33 @@ func declareFSPromises(p *driver.Paserati) {
 			}
 			return entries, nil
 		})
-		m.AsyncFunction("stat", func(path string, _ ...interface{}) (vm.Value, error) {
+		m.AsyncFunction("stat", func(path string, opts ...vm.Value) (vm.Value, error) {
 			fsTouch("stat", path)
 			info, err := os.Stat(path)
 			if err != nil {
 				return vm.Undefined, wrapFsErr(vmInst, "stat", path, err)
 			}
-			return fsStatsValue(vmInst, info), nil
+			return fsStatsValueOpt(vmInst, info, bigintRequested(opts)), nil
 		})
-		m.AsyncFunction("lstat", func(path string, _ ...interface{}) (vm.Value, error) {
+		m.AsyncFunction("lstat", func(path string, opts ...vm.Value) (vm.Value, error) {
 			fsTouch("stat", path)
 			info, err := os.Lstat(path)
 			if err != nil {
 				return vm.Undefined, wrapFsErr(vmInst, "lstat", path, err)
 			}
-			return fsStatsValue(vmInst, info), nil
+			return fsStatsValueOpt(vmInst, info, bigintRequested(opts)), nil
 		})
-		m.AsyncFunction("access", func(path string, _ ...interface{}) (interface{}, error) {
+		m.AsyncFunction("access", func(path string, _ ...interface{}) (vm.Value, error) {
 			fsTouch("stat", path)
 			_, err := os.Stat(path)
-			return nil, wrapFsErr(vmInst, "access", path, err)
+			return vm.Undefined, wrapFsErr(vmInst, "access", path, err)
 		})
-		m.AsyncFunction("unlink", func(path string) (interface{}, error) {
-			return nil, wrapFsErr(vmInst, "unlink", path, os.Remove(path))
+		m.AsyncFunction("unlink", func(path string) (vm.Value, error) {
+			return vm.Undefined, wrapFsErr(vmInst, "unlink", path, os.Remove(path))
 		})
-		m.AsyncFunction("rm", func(path string, _ ...interface{}) (interface{}, error) {
-			if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
-				return nil, wrapFsErr(vmInst, "rm", path, err)
-			}
-			return nil, nil
+		m.AsyncFunction("rm", func(args ...vm.Value) (vm.Value, error) {
+			sc, path, _, err := fsRmBody(vmInst, args)
+			return vm.Undefined, wrapFsErr(vmInst, sc, path, err)
 		})
 		m.AsyncFunction("realpath", func(path string, _ ...interface{}) (string, error) {
 			resolved, err := filepath.EvalSymlinks(path)

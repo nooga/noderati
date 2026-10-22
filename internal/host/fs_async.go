@@ -143,6 +143,7 @@ func findAsyncCallback(opts []vm.Value) vm.Value {
 func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 	declareFSFd(m, vmInst)
 	declareFSWatch(m, vmInst)
+	declareFSExtra(m, vmInst)
 	m.Function("readFile", func(path string, opts ...vm.Value) (vm.Value, error) {
 		// Real Node's fs.readFile(path, [options], callback) - the
 		// callback is always the *last* argument, whether or not an
@@ -220,7 +221,7 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "stat", path, err))})
 			return vm.Undefined, nil
 		}
-		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, fsStatsValue(vmInst, info)})
+		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, fsStatsValueOpt(vmInst, info, bigintRequested(opts))})
 		return vm.Undefined, nil
 	})
 	// lstat added alongside stat (docs/real-node-plan.md, Round 122): real
@@ -240,7 +241,7 @@ func declareFSAsync(m *driver.ModuleBuilder, vmInst *vm.VM) {
 			scheduleCallback(vmInst, cb, []vm.Value{fsErrToVM(wrapFsErr(vmInst, "lstat", path, err))})
 			return vm.Undefined, nil
 		}
-		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, fsStatsValue(vmInst, info)})
+		scheduleCallback(vmInst, cb, []vm.Value{vm.Null, fsStatsValueOpt(vmInst, info, bigintRequested(opts))})
 		return vm.Undefined, nil
 	})
 	// readdir was entirely missing - found chasing real vite under
