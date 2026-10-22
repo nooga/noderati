@@ -120,3 +120,20 @@ func TestPerfHooksObserverDelivery(t *testing.T) {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}
 }
+
+// Expected values produced by real Node v26.
+func TestPerformancePrototypeEnumerationAndConstantsMatchNode(t *testing.T) {
+	got := runScriptString(t, `
+		import { performance, constants } from "node:perf_hooks";
+		const before = Object.keys(Object.getPrototypeOf(performance)).join(" ");
+		performance.mark("m");
+		const after = [];
+		for (const k in performance) if (!["addEventListener", "removeEventListener", "dispatchEvent"].includes(k)) after.push(k);
+		JSON.stringify([before, after.join(" "), Object.keys(constants).length, constants.NODE_PERFORMANCE_MILESTONE_LOOP_EXIT, constants.NODE_PERFORMANCE_ENTRY_TYPE_DNS])
+	`)
+	keys := "clearMarks clearMeasures clearResourceTimings getEntries getEntriesByName getEntriesByType mark measure now setResourceTimingBufferSize timeOrigin toJSON onresourcetimingbufferfull"
+	want := `["` + keys + `","` + keys + `",25,6,4]`
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}

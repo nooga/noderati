@@ -32,6 +32,12 @@ var perfHooksGlobals = []string{
 
 // perfForwardedMethods are Performance.prototype methods (plus the
 // EventTarget ones) that load the shim on first use.
+var perfEnumerableMembers = []string{
+	"clearMarks", "clearMeasures", "clearResourceTimings", "getEntries", "getEntriesByName",
+	"getEntriesByType", "mark", "measure", "now", "setResourceTimingBufferSize", "timeOrigin",
+	"toJSON", "onresourcetimingbufferfull",
+}
+
 var perfForwardedMethods = []string{
 	"clearMarks", "clearMeasures", "clearResourceTimings", "getEntries", "getEntriesByName",
 	"getEntriesByType", "mark", "measure", "setResourceTimingBufferSize", "toJSON",
@@ -63,14 +69,15 @@ func installPerfHooksGlobals(p *driver.Paserati) {
 	})
 	timeOrigin := vm.NumberValue(float64(processStartTime.UnixNano()) / 1e6)
 
-	proto := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+	// The EventTarget layer, as in Node: Performance.prototype's parent.
+	etProto := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+	proto := vm.NewObject(vm.NewValueFromPlainObject(etProto)).AsPlainObject()
 	instance := vm.NewObject(vm.NewValueFromPlainObject(proto)).AsPlainObject()
 	instVal := vm.NewValueFromPlainObject(instance)
-	proto.SetOwnNonEnumerable("now", nowFn)
 	yes, no := true, false
-	proto.DefineAccessorProperty("timeOrigin", vm.NewNativeFunction(0, false, "get timeOrigin", func(_ []vm.Value) (vm.Value, error) {
+	timeOriginGetter := vm.NewNativeFunction(0, false, "get timeOrigin", func(_ []vm.Value) (vm.Value, error) {
 		return timeOrigin, nil
-	}), true, vm.Undefined, false, &yes, &yes)
+	})
 	forward := func(name string) vm.Value {
 		return vm.NewNativeFunction(0, false, name, func(args []vm.Value) (vm.Value, error) {
 			if err := load(); err != nil {
@@ -83,11 +90,7 @@ func installPerfHooksGlobals(p *driver.Paserati) {
 			return vmInst.Call(fn, instVal, args)
 		})
 	}
-	for _, name := range perfForwardedMethods {
-		proto.SetOwnNonEnumerable(name, forward(name))
-	}
-	for _, name := range []string{"nodeTiming", "onresourcetimingbufferfull"} {
-		name := name
+	lazyAccessor := func(name string, enumerable bool) {
 		getter := vm.NewNativeFunction(0, false, "get "+name, func(_ []vm.Value) (vm.Value, error) {
 			if err := load(); err != nil {
 				return vm.Undefined, err
@@ -100,8 +103,35 @@ func installPerfHooksGlobals(p *driver.Paserati) {
 			}
 			return vm.Undefined, vmInst.SetProperty(instVal, name, argAt(args, 0))
 		})
-		proto.DefineAccessorProperty(name, getter, true, setter, true, &yes, &yes)
+		proto.DefineAccessorProperty(name, getter, true, setter, true, &enumerable, &yes)
 	}
+	// Same enumerable members, in the same order, as Node's
+	// Performance.prototype (for-in over performance lists them).
+	enumerable := map[string]bool{}
+	for _, name := range perfEnumerableMembers {
+		enumerable[name] = true
+		switch name {
+		case "now":
+			proto.SetOwn("now", nowFn)
+		case "timeOrigin":
+			proto.DefineAccessorProperty("timeOrigin", timeOriginGetter, true, vm.Undefined, false, &yes, &yes)
+		case "onresourcetimingbufferfull":
+			lazyAccessor(name, true)
+		default:
+			proto.SetOwn(name, forward(name))
+		}
+	}
+	for _, name := range []string{"addEventListener", "removeEventListener", "dispatchEvent"} {
+		enumerable[name] = true
+		etProto.SetOwn(name, forward(name))
+	}
+	for _, name := range perfForwardedMethods {
+		if !enumerable[name] {
+			proto.SetOwnNonEnumerable(name, forward(name))
+		}
+	}
+	lazyAccessor("nodeTiming", false)
+	_ = no
 
 	native := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
 	native.SetOwn("now", nowFn)
@@ -616,7 +646,9 @@ class Performance extends EventTarget {
   set onresourcetimingbufferfull(v) { onresourcetimingbufferfull = v; }
 }
 Object.defineProperty(Performance.prototype, toStringTag, { value: "Performance", configurable: true });
-for (const k of ["timeOrigin", "nodeTiming", "onresourcetimingbufferfull"]) {
+// Node's Performance.prototype members are enumerable (for-in lists them).
+for (const k of ["clearMarks", "clearMeasures", "clearResourceTimings", "getEntries", "getEntriesByName", "getEntriesByType",
+  "mark", "measure", "now", "setResourceTimingBufferSize", "timeOrigin", "toJSON", "onresourcetimingbufferfull"]) {
   const d = Object.getOwnPropertyDescriptor(Performance.prototype, k);
   d.enumerable = true;
   Object.defineProperty(Performance.prototype, k, d);
@@ -626,8 +658,11 @@ for (const k of ["timeOrigin", "nodeTiming", "onresourcetimingbufferfull"]) {
 let performance = __native.instance;
 if (performance) {
   const fresh = new Performance(kInternal);
+  // EventTarget's internal state, kept out of for-in and Object.keys.
   for (const key of Reflect.ownKeys(fresh)) {
-    Object.defineProperty(performance, key, Object.getOwnPropertyDescriptor(fresh, key));
+    const d = Object.getOwnPropertyDescriptor(fresh, key);
+    d.enumerable = false;
+    Object.defineProperty(performance, key, d);
   }
   Object.setPrototypeOf(performance, Performance.prototype);
 } else {
@@ -841,6 +876,12 @@ const constants = {
   NODE_PERFORMANCE_GC_FLAGS_FORCED: 4, NODE_PERFORMANCE_GC_FLAGS_SYNCHRONOUS_PHANTOM_PROCESSING: 8,
   NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE: 16, NODE_PERFORMANCE_GC_FLAGS_ALL_EXTERNAL_MEMORY: 32,
   NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE: 64,
+  NODE_PERFORMANCE_ENTRY_TYPE_GC: 0, NODE_PERFORMANCE_ENTRY_TYPE_HTTP: 1, NODE_PERFORMANCE_ENTRY_TYPE_HTTP2: 2,
+  NODE_PERFORMANCE_ENTRY_TYPE_NET: 3, NODE_PERFORMANCE_ENTRY_TYPE_DNS: 4, NODE_PERFORMANCE_ENTRY_TYPE_QUIC: 5,
+  NODE_PERFORMANCE_MILESTONE_TIME_ORIGIN_TIMESTAMP: 0, NODE_PERFORMANCE_MILESTONE_TIME_ORIGIN: 1,
+  NODE_PERFORMANCE_MILESTONE_ENVIRONMENT: 2, NODE_PERFORMANCE_MILESTONE_NODE_START: 3,
+  NODE_PERFORMANCE_MILESTONE_V8_START: 4, NODE_PERFORMANCE_MILESTONE_LOOP_START: 5,
+  NODE_PERFORMANCE_MILESTONE_LOOP_EXIT: 6, NODE_PERFORMANCE_MILESTONE_BOOTSTRAP_COMPLETE: 7,
 };
 
 return {
