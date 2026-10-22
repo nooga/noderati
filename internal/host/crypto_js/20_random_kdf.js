@@ -171,7 +171,12 @@ function getRandomValues(data) {
     throw domException("The data argument must be an integer-type TypedArray", "TypeMismatchError");
   }
   if (data.byteLength > 65536) {
-    throw domException("The requested length exceeds 65,536 bytes", "QuotaExceededError");
+    const msg = "The requested length exceeds 65,536 bytes";
+    if (typeof QuotaExceededError === "function") throw new QuotaExceededError(msg);
+    const e = domException(msg, "QuotaExceededError");
+    e.quota = null;
+    e.requested = null;
+    throw e;
   }
   if (data.byteLength > 0) binding.randomFill(data, 0, data.byteLength);
   return data;
