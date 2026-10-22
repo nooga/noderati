@@ -85,8 +85,13 @@ func shimModuleExports(p *driver.Paserati, spec string, rec vm.ModuleRecord) (ma
 // value on first read; the named export, which must exist before any code
 // runs, is a forwarding function (constructing, for classes).
 func installLazyJSExports(p *driver.Paserati, module, spec string, functions, classes []string) {
+	installLazyJSExportsFrom(p, module, &lazyJSModule{p: p, spec: spec}, functions, classes)
+}
+
+// installLazyJSExportsFrom is installLazyJSExports with a caller-owned
+// lazyJSModule, for callers that also read the shim's exports themselves.
+func installLazyJSExportsFrom(p *driver.Paserati, module string, lazy *lazyJSModule, functions, classes []string) {
 	vmInst := p.GetVM()
-	lazy := &lazyJSModule{p: p, spec: spec}
 	rec, err := p.LoadModule(module, ".")
 	if err != nil {
 		return
@@ -126,12 +131,21 @@ func installLazyJSExports(p *driver.Paserati, module, spec string, functions, cl
 	}
 	for _, name := range classes {
 		name := name
-		add(name, vm.NewConstructorWithProps(0, true, name, func(args []vm.Value) (vm.Value, error) {
+		var forward vm.Value
+		forward = vm.NewConstructorWithProps(0, true, name, func(args []vm.Value) (vm.Value, error) {
 			cls, err := lazy.get(name)
 			if err != nil {
 				return vm.Undefined, err
 			}
+			// Share the real prototype so instanceof against the
+			// forwarder (a named ESM import) holds.
+			if fp := forward.AsNativeFunctionWithProps(); fp != nil && fp.Properties != nil {
+				if proto, err := vmInst.GetProperty(cls, "prototype"); err == nil {
+					fp.Properties.SetOwnNonEnumerable("prototype", proto)
+				}
+			}
 			return vmInst.Construct(cls, args)
-		}))
+		})
+		add(name, forward)
 	}
 }

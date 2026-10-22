@@ -1,11 +1,13 @@
 package host
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/nooga/paserati/pkg/builtins"
 	"github.com/nooga/paserati/pkg/driver"
+	perrors "github.com/nooga/paserati/pkg/errors"
 	"github.com/nooga/paserati/pkg/vm"
 )
 
@@ -120,15 +122,144 @@ func declareVM(p *driver.Paserati) {
 		})
 
 		m.Class("Script", &vmScript{}, newVMScript(p, vmInstance))
+		m.Const("constants", vmConstants(vmInstance))
 
 		m.Default(nil)
 	})
 	_ = p.DeclareModuleAlias("node:vm", "vm")
+	registerJSShim("noderati-internal:vm-extra", vmExtraShim)
 }
+
+// vmConstants is vm.constants: a frozen null-prototype object of the two
+// importModuleDynamically sentinels.
+func vmConstants(vmInstance *vm.VM) vm.Value {
+	obj := vm.NewObject(vm.Null).AsPlainObject()
+	obj.SetOwn("USE_MAIN_CONTEXT_DEFAULT_LOADER", vm.NewSymbol("vm_dynamic_import_main_context_default"))
+	obj.SetOwn("DONT_CONTEXTIFY", vm.NewSymbol("vm_context_no_contextify"))
+	v := vm.NewValueFromPlainObject(obj)
+	if objectCtor, ok := vmInstance.GetGlobal("Object"); ok {
+		if freeze, err := vmInstance.GetProperty(objectCtor, "freeze"); err == nil {
+			_, _ = vmInstance.Call(freeze, objectCtor, []vm.Value{v})
+		}
+	}
+	return v
+}
+
+// installVMExtras adds the JS-implemented parts of node:vm.
+func installVMExtras(p *driver.Paserati) {
+	vmInstance := p.GetVM()
+	if gt, ok := vmInstance.GetGlobal("globalThis"); ok && gt.AsPlainObject() != nil {
+		// __noderatiVMCallIn(context, fn, thisArg, args): a function
+		// compiled in a context looks its globals up in that context's
+		// realm, so it has to be called inside it too.
+		gt.AsPlainObject().SetOwnNonEnumerable("__noderatiVMCallIn", vm.NewNativeFunction(4, false, "callIn", func(args []vm.Value) (vm.Value, error) {
+			realm := vmLookupContext(argAt(args, 0))
+			var callArgs []vm.Value
+			if a := argAt(args, 3); a.Type() == vm.TypeArray {
+				for i := 0; i < a.AsArray().Length(); i++ {
+					callArgs = append(callArgs, a.AsArray().Get(i))
+				}
+			}
+			if realm == nil {
+				return vmInstance.Call(argAt(args, 1), argAt(args, 2), callArgs)
+			}
+			var callErr error
+			res := vmInstance.WithRealmValue(realm, func() vm.Value {
+				v, err := vmInstance.Call(argAt(args, 1), argAt(args, 2), callArgs)
+				callErr = err
+				return v
+			})
+			return res, callErr
+		}))
+	}
+	installLazyJSExports(p, "vm", "noderati-internal:vm-extra",
+		[]string{"compileFunction", "createScript", "measureMemory"}, nil)
+}
+
+// compileFunction builds the function from source (with one nested
+// "with" per contextExtensions entry, which is how those objects' members
+// come into scope) and evaluates it in the parsing context.
+const vmExtraShim = `import vm from "vm";
+
+function received(v) {
+  if (v == null) return " Received " + v;
+  if (typeof v === "function") return " Received function " + (v.name || "<anonymous>");
+  if (typeof v === "object") return " Received an instance of " + ((v.constructor && v.constructor.name) || "Object");
+  return " Received type " + typeof v + " (" + (typeof v === "string" ? "'" + v + "'" : String(v)) + ")";
+}
+function codedError(Ctor, code, message) {
+  const err = new Ctor(message);
+  err.code = code;
+  return err;
+}
+function invalidArgType(name, expected, v) {
+  const what = '"' + name + '" ' + (name.includes(".") ? "property" : "argument");
+  return codedError(TypeError, "ERR_INVALID_ARG_TYPE", "The " + what + " must be " + expected + "." + received(v));
+}
+
+export function compileFunction(code, params, options = {}) {
+  if (typeof code !== "string") throw invalidArgType("code", "of type string", code);
+  if (params === undefined) params = [];
+  if (!Array.isArray(params)) throw invalidArgType("params", "an instance of Array", params);
+  params.forEach((p, i) => { if (typeof p !== "string") throw invalidArgType("params[" + i + "]", "of type string", p); });
+  if (options === null || typeof options !== "object") throw invalidArgType("options", "of type object", options);
+  const { contextExtensions = [], parsingContext } = options;
+  if (!Array.isArray(contextExtensions)) throw invalidArgType("options.contextExtensions", "an instance of Array", contextExtensions);
+  contextExtensions.forEach((e, i) => {
+    if (e === null || typeof e !== "object") throw invalidArgType("options.contextExtensions[" + i + "]", "of type object", e);
+  });
+  if (parsingContext !== undefined && !vm.isContext(parsingContext)) {
+    throw invalidArgType("options.parsingContext", "an instance of Context", parsingContext);
+  }
+  let src = "(function (__noderatiExt) {";
+  for (let i = 0; i < contextExtensions.length; i++) src += " with (__noderatiExt[" + i + "])";
+  src += " { return function (" + params.join(", ") + ") {\n" + code + "\n}; } })";
+  if (parsingContext === undefined) return vm.runInThisContext(src)(contextExtensions);
+  const callIn = globalThis.__noderatiVMCallIn;
+  const fn = callIn(parsingContext, vm.runInContext(src, parsingContext), undefined, [contextExtensions]);
+  const wrapped = function (...args) { return callIn(parsingContext, fn, this, args); };
+  Object.defineProperties(wrapped, {
+    name: { value: "", configurable: true },
+    length: { value: params.length, configurable: true },
+  });
+  return wrapped;
+}
+
+export function createScript(code, options) {
+  return new vm.Script(code, options);
+}
+
+export function measureMemory(options = {}) {
+  if (options === null || typeof options !== "object") throw invalidArgType("options", "of type object", options);
+  const { mode = "summary", execution = "default" } = options;
+  if (mode !== "summary" && mode !== "detailed") {
+    throw codedError(TypeError, "ERR_INVALID_ARG_VALUE", "The property 'options.mode' must be one of: 'summary', 'detailed'. Received " + (typeof mode === "string" ? "'" + mode + "'" : String(mode)));
+  }
+  if (execution !== "default" && execution !== "eager") {
+    throw codedError(TypeError, "ERR_INVALID_ARG_VALUE", "The property 'options.execution' must be one of: 'default', 'eager'. Received '" + execution + "'");
+  }
+  const used = process.memoryUsage().heapUsed;
+  const estimate = { jsMemoryEstimate: used, jsMemoryRange: [used, process.memoryUsage().heapTotal] };
+  const result = mode === "summary" ? { total: estimate } : { total: estimate, current: estimate, other: [] };
+  return Promise.resolve(result);
+}
+
+export default { compileFunction, createScript, measureMemory };
+`
 
 func vmEval(p *driver.Paserati, code string) (vm.Value, error) {
 	val, errs := p.IndirectEvalCode(code)
 	if len(errs) > 0 {
+		var syn *perrors.SyntaxError
+		if errors.As(errs[0], &syn) {
+			// Thrown as a real JS SyntaxError, as V8 does when compiling.
+			vmInst := p.GetVM()
+			if ctor, ok := vmInst.GetGlobal("SyntaxError"); ok {
+				if exc, err := vmInst.Construct(ctor, []vm.Value{vm.NewString(syn.Msg)}); err == nil {
+					return vm.Undefined, &fsSystemError{exception: exc, message: syn.Msg}
+				}
+			}
+		}
 		return vm.Undefined, errs[0]
 	}
 	return val, nil
@@ -222,6 +353,13 @@ func newVMScript(p *driver.Paserati, vmInstance *vm.VM) func(code string, _ vm.V
 // fix makes the plain (T, error) return propagate correctly on its own;
 // re-verified against the exact syntax-error repro these methods'
 // tests use before removing the workaround.
+
+// CreateCachedData returns the script's "code cache". There is no V8
+// bytecode cache to serialize, so it's the source itself - enough for a
+// caller that stores and later passes it back as options.cachedData.
+func (s *vmScript) CreateCachedData() vm.Value {
+	return wrapBuffer(s.vmInstance, []byte(s.code))
+}
 
 func (s *vmScript) RunInThisContext(_ vm.Value) (vm.Value, error) {
 	return vmEval(s.p, s.code)

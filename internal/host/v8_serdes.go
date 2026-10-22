@@ -815,7 +815,219 @@ const getHeapStatistics = native.getHeapStatistics;
 const setFlagsFromString = native.setFlagsFromString;
 const startupSnapshot = native.startupSnapshot;
 
-const api = { serialize, deserialize, Serializer, Deserializer, DefaultSerializer, DefaultDeserializer, getHeapStatistics, setFlagsFromString, startupSnapshot };
-export { serialize, deserialize, Serializer, Deserializer, DefaultSerializer, DefaultDeserializer, getHeapStatistics, setFlagsFromString, startupSnapshot };
+// --- introspection: shapes match node's; numbers come from Go's runtime ---
+function codedError(Ctor, code, message) {
+  const err = new Ctor(message);
+  err.code = code;
+  return err;
+}
+function received(v) {
+  if (v == null) return " Received " + v;
+  if (typeof v === "function") return " Received function " + (v.name || "<anonymous>");
+  if (typeof v === "object") return " Received an instance of " + ((v.constructor && v.constructor.name) || "Object");
+  return " Received type " + typeof v + " (" + (typeof v === "string" ? "'" + v + "'" : String(v)) + ")";
+}
+function invalidArgType(name, expected, v) {
+  return codedError(TypeError, "ERR_INVALID_ARG_TYPE", 'The "' + name + '" argument must be ' + expected + "." + received(v));
+}
+
+// The value real V8 reports for this build's cache format; any stable
+// 32-bit number would do since nothing here consumes V8 code caches.
+const cachedDataVersionTag = () => 2373636846;
+
+const heapSpaceNames = ["read_only_space", "new_space", "old_space", "code_space", "shared_space", "trusted_space",
+  "shared_trusted_space", "new_large_object_space", "large_object_space", "code_large_object_space",
+  "shared_large_object_space", "shared_trusted_large_object_space", "trusted_large_object_space"];
+function getHeapSpaceStatistics() {
+  const m = native.heapSpaceSizes();
+  return heapSpaceNames.map((space_name) => {
+    const old = space_name === "old_space";
+    return {
+      space_name,
+      space_size: old ? m.heapSys : 0,
+      space_used_size: old ? m.heapAlloc : 0,
+      space_available_size: old ? m.heapSys - m.heapInuse : 0,
+      physical_space_size: old ? m.heapInuse : 0,
+    };
+  });
+}
+function getHeapCodeStatistics() {
+  return { code_and_metadata_size: 0, bytecode_and_metadata_size: 0, external_script_source_size: 0, cpu_profiler_metadata_size: 0 };
+}
+function getCppHeapStatistics(type = "detailed") {
+  if (type !== "brief" && type !== "detailed") {
+    throw codedError(TypeError, "ERR_INVALID_ARG_VALUE", "The argument 'type' must be one of: 'brief', 'detailed'. Received " + (typeof type === "string" ? "'" + type + "'" : String(type)));
+  }
+  return { committed_size_bytes: 0, resident_size_bytes: 0, used_size_bytes: 0, space_statistics: [], type_names: [], detail_level: type };
+}
+
+// A minimal but well-formed .heapsnapshot: just the synthetic root.
+// There is no V8 heap to walk; DevTools and parsers accept it.
+function heapSnapshotJSON() {
+  return JSON.stringify({
+    snapshot: {
+      meta: {
+        node_fields: ["type", "name", "id", "self_size", "edge_count", "detachedness"],
+        node_types: [["hidden", "array", "string", "object", "code", "closure", "regexp", "number", "native", "synthetic",
+          "concatenated string", "sliced string", "symbol", "bigint", "object shape"], "string", "number", "number", "number", "number"],
+        edge_fields: ["type", "name_or_index", "to_node"],
+        edge_types: [["context", "element", "property", "internal", "hidden", "shortcut", "weak"], "string_or_number", "node"],
+        trace_function_info_fields: ["function_id", "name", "script_name", "script_id", "line", "column"],
+        trace_node_fields: ["id", "function_info_index", "count", "size", "children"],
+        sample_fields: ["timestamp_us", "last_assigned_id"],
+        location_fields: ["object_index", "script_id", "line", "column"],
+      },
+      node_count: 1, edge_count: 0, trace_function_count: 0, extra_native_bytes: 0,
+    },
+    nodes: [9, 0, 1, 0, 0, 0],
+    edges: [], trace_function_infos: [], trace_tree: [], samples: [], locations: [],
+    strings: [""],
+  });
+}
+function validateHeapSnapshotOptions(options) {
+  if (options === undefined) return;
+  if (options === null || typeof options !== "object") throw invalidArgType("options", "of type object", options);
+}
+function getHeapSnapshot(options) {
+  validateHeapSnapshotOptions(options);
+  const { Readable } = native.requireBuiltin("stream");
+  const stream = new Readable({ read() {} });
+  stream.push(heapSnapshotJSON());
+  stream.push(null);
+  return stream;
+}
+let heapSnapshotSeq = 0;
+function writeHeapSnapshot(filename, options) {
+  if (filename !== undefined && typeof filename !== "string") throw invalidArgType("path", "of type string or an instance of Buffer or URL", filename);
+  validateHeapSnapshotOptions(options);
+  if (filename === undefined) {
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, "0");
+    filename = "Heap." + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + "." + p2(d.getHours()) +
+      p2(d.getMinutes()) + p2(d.getSeconds()) + "." + process.pid + ".0." + String(++heapSnapshotSeq).padStart(3, "0") + ".heapsnapshot";
+  }
+  native.requireBuiltin("fs").writeFileSync(filename, heapSnapshotJSON());
+  return filename;
+}
+function setHeapSnapshotNearHeapLimit(limit) {
+  if (typeof limit !== "number") throw invalidArgType("limit", "of type number", limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 4294967295) {
+    throw codedError(RangeError, "ERR_OUT_OF_RANGE", 'The value of "limit" is out of range. It must be >= 1 && <= 4294967295. Received ' + limit);
+  }
+}
+// Coverage is collected by V8 itself; with no V8 there is nothing to flush.
+function takeCoverage() {}
+function stopCoverage() {}
+function queryObjects(ctor, options) {
+  if (typeof ctor !== "function") throw invalidArgType("constructor", "of type function", ctor);
+  throw codedError(Error, "ERR_METHOD_NOT_IMPLEMENTED", "The queryObjects() method is not implemented");
+}
+function isStringOneByteRepresentation(content) {
+  if (typeof content !== "string") throw invalidArgType("content", "of type string", content);
+  for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) > 0xff) return false;
+  return true;
+}
+
+// Profiles: valid, empty documents (no sampling profiler exists here).
+class SyncCPUProfileHandle {
+  #start = Date.now() * 1000;
+  #stopped = false;
+  stop() {
+    if (this.#stopped) return undefined;
+    this.#stopped = true;
+    return JSON.stringify({
+      nodes: [{ id: 1, hitCount: 0, callFrame: { functionName: "(root)", lineNumber: -1, columnNumber: -1, scriptId: 0, url: "" }, children: [] }],
+      startTime: this.#start, endTime: Date.now() * 1000, samples: [], timeDeltas: [],
+    });
+  }
+}
+class SyncHeapProfileHandle {
+  #stopped = false;
+  stop() {
+    if (this.#stopped) return undefined;
+    this.#stopped = true;
+    return JSON.stringify({
+      samples: [],
+      head: { selfSize: 0, id: 1, callFrame: { functionName: "(root)", scriptId: "0", url: "", lineNumber: -1, columnNumber: -1 }, children: [] },
+    });
+  }
+}
+const startCpuProfile = () => new SyncCPUProfileHandle();
+const startHeapProfile = () => new SyncHeapProfileHandle();
+
+// promiseHooks: hooks register and unregister as in node, but the engine
+// exposes no promise lifecycle events, so they never fire.
+const promiseHookSets = { init: new Set(), before: new Set(), after: new Set(), settled: new Set() };
+function addPromiseHook(kind, fn) {
+  if (typeof fn !== "function") throw invalidArgType("hook", "of type function", fn);
+  promiseHookSets[kind].add(fn);
+  return () => promiseHookSets[kind].delete(fn);
+}
+const promiseHooks = {
+  createHook({ init, before, after, settled } = {}) {
+    const stops = [];
+    if (init) stops.push(addPromiseHook("init", init));
+    if (before) stops.push(addPromiseHook("before", before));
+    if (after) stops.push(addPromiseHook("after", after));
+    if (settled) stops.push(addPromiseHook("settled", settled));
+    return () => { for (const s of stops) s(); };
+  },
+  onInit: (fn) => addPromiseHook("init", fn),
+  onBefore: (fn) => addPromiseHook("before", fn),
+  onAfter: (fn) => addPromiseHook("after", fn),
+  onSettled: (fn) => addPromiseHook("settled", fn),
+};
+
+function camelHeapStatistics() {
+  const h = getHeapStatistics();
+  return {
+    totalHeapSize: h.total_heap_size, totalHeapSizeExecutable: h.total_heap_size_executable,
+    totalPhysicalSize: h.total_physical_size, totalAvailableSize: h.total_available_size,
+    totalGlobalHandlesSize: 0, usedGlobalHandlesSize: 0, usedHeapSize: h.used_heap_size,
+    heapSizeLimit: h.heap_size_limit, mallocedMemory: h.malloced_memory, externalMemory: 0,
+    peakMallocedMemory: h.peak_malloced_memory,
+  };
+}
+function camelSpaceStatistics() {
+  return getHeapSpaceStatistics().map((s) => ({
+    spaceName: s.space_name, spaceSize: s.space_size, spaceUsedSize: s.space_used_size,
+    spaceAvailableSize: s.space_available_size, physicalSpaceSize: s.physical_space_size,
+  }));
+}
+// GCProfiler reports Go's own collections (each as one mark-sweep cycle).
+class GCProfiler {
+  #startTime = 0;
+  #startGC = -1;
+  #before = null;
+  start() {
+    if (this.#startGC >= 0) return;
+    this.#startTime = Date.now();
+    this.#startGC = native.heapSpaceSizes().numGC;
+    this.#before = { heapStatistics: camelHeapStatistics(), heapSpaceStatistics: camelSpaceStatistics() };
+  }
+  stop() {
+    if (this.#startGC < 0) return undefined;
+    const pauses = native.gcPauses(this.#startGC);
+    const after = { heapStatistics: camelHeapStatistics(), heapSpaceStatistics: camelSpaceStatistics() };
+    const statistics = (pauses || []).map((ns) => ({ gcType: "MarkSweepCompact", cost: ns / 1000, beforeGC: this.#before, afterGC: after }));
+    this.#startGC = -1;
+    return { version: 1, startTime: this.#startTime, statistics, endTime: Date.now() };
+  }
+}
+
+const api = {
+  cachedDataVersionTag, getHeapSnapshot, getHeapStatistics, getHeapSpaceStatistics, getHeapCodeStatistics,
+  getCppHeapStatistics, setFlagsFromString, Serializer, Deserializer, DefaultSerializer, DefaultDeserializer,
+  deserialize, takeCoverage, stopCoverage, serialize, writeHeapSnapshot, promiseHooks, queryObjects,
+  startupSnapshot, setHeapSnapshotNearHeapLimit, GCProfiler, isStringOneByteRepresentation, startCpuProfile,
+  startHeapProfile,
+};
+export {
+  cachedDataVersionTag, getHeapSnapshot, getHeapStatistics, getHeapSpaceStatistics, getHeapCodeStatistics,
+  getCppHeapStatistics, setFlagsFromString, Serializer, Deserializer, DefaultSerializer, DefaultDeserializer,
+  deserialize, takeCoverage, stopCoverage, serialize, writeHeapSnapshot, promiseHooks, queryObjects,
+  startupSnapshot, setHeapSnapshotNearHeapLimit, GCProfiler, isStringOneByteRepresentation, startCpuProfile,
+  startHeapProfile,
+};
 export default api;
 `

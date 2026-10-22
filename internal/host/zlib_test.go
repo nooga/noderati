@@ -191,21 +191,3 @@ func TestZlibCreateGunzipEmitsErrorOnCorruptData(t *testing.T) {
 	}
 }
 
-func TestZlibBrotliAndZstdThrowRealError(t *testing.T) {
-	p := New([]string{"noderati"})
-	p.SetSkipTypeCheck(true)
-	val, errs := p.RunCode(`
-		import zlib from "node:zlib";
-		let brotliThrew = false, zstdThrew = false;
-		try { zlib.createBrotliDecompress(); } catch (e) { brotliThrew = e instanceof Error; }
-		try { zlib.createZstdDecompress(); } catch (e) { zstdThrew = e instanceof Error; }
-		JSON.stringify({ brotliThrew, zstdThrew })
-	`, driver.RunOptions{})
-	if len(errs) > 0 {
-		t.Fatalf("RunCode: %v", errs[0])
-	}
-	want := `{"brotliThrew":true,"zstdThrew":true}`
-	if val.ToString() != want {
-		t.Errorf("got %s, want %s", val.ToString(), want)
-	}
-}

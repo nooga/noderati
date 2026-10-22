@@ -10,7 +10,8 @@ import (
 
 // New builds a Paserati session with Node-like process, timers, and builtins.
 func New(argv []string) *driver.Paserati {
-	inits := append(builtins.GetStandardInitializers(),
+	inits := append([]builtins.BuiltinInitializer{asyncContextInitializer{}}, builtins.GetStandardInitializers()...)
+	inits = append(inits,
 		NewProcessInitializer(argv),
 		driver.NewHostTimerInitializer(),
 	)
@@ -24,6 +25,7 @@ func New(argv []string) *driver.Paserati {
 	installOSConstants(p)
 	installBufferExtras(p)
 	installUtilLazyExtras(p)
+	installVMExtras(p)
 	installUtilNatives(p)
 	installUtilInspect(p)
 	installGlobalConsole(p)
@@ -43,6 +45,8 @@ func New(argv []string) *driver.Paserati {
 	installSetImmediate(p)
 	installTimeoutObjects(p)
 	installWorkerThreadsExports(p)
+	installPerfHooksGlobals(p)
+	installAsyncContextAPI(p)
 	wrapStructuredClone(p)
 	p.AddResolver(NewNodeModulesResolver())
 	p.AddResolver(NewPackageImportsResolver())

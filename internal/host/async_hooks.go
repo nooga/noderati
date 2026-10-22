@@ -1,132 +1,261 @@
 package host
 
-// async_hooks.go implements the one real, reachable piece of node:async_hooks
-// this codebase's actual dependency tree needs: `AsyncResource`, used by
-// real undici (lib/api/api-request.js and its four siblings: pipeline,
-// upgrade, connect, stream) as `class RequestHandler extends AsyncResource`,
-// with `super('UNDICI_REQUEST')` and later `this.runInAsyncScope(fn,
-// thisArg, ...args)` - confirmed by grepping every real async_hooks call
-// site in the vendored package before writing this, not assumed from the
-// module name (round 71/72, docs/real-node-plan.md).
+// async_hooks.go is node:async_hooks on top of async_context.go's frames:
+// every callback the async runtime schedules (promise jobs, nextTick,
+// setImmediate, timers) runs in the frame that was current when it was
+// scheduled, so AsyncLocalStorage stores propagate across setTimeout,
+// promises/await, queueMicrotask and friends; AsyncResource captures a
+// frame at construction and re-enters it in runInAsyncScope/bind.
 //
-// runInAsyncScope really is just `fn.apply(thisArg, args)` for a host with
-// no actual async_hooks instrumentation behind it - that's not a stand-in
-// for missing behavior, it's what the method is specified to do beyond the
-// (unobservable, here) async-context bookkeeping: real Node's own
-// runInAsyncScope doesn't change what runs or when, only what
-// `executionAsyncId()` reports while it runs, and nothing in the reachable
-// call sites above ever calls that. asyncId()/triggerAsyncId()/emitDestroy()
-// are included so the class isn't missing standard members a caller might
-// probe for, but `AsyncResource.bind()` is deliberately not built - its
-// whole point is capturing async context across a later, detached call,
-// which has the identical correctness problem `AsyncLocalStorage` has
-// (see below) and no reachable caller here needs it.
+// A frame's store is an immutable Map (AsyncLocalStorage instance ->
+// value); run()/enterWith() install a copy, never mutate one a scheduled
+// callback may already have captured.
 //
-// `AsyncLocalStorage` was deliberately not exported through round 116.
-// Round 72's own analysis (this comment, until round 117) scoped the
-// question to "is `.run()` ever actually *called* by anything reachable
-// here" - found it wasn't, for pi-coding-agent specifically (neither
-// `AWS_LAMBDA_MAX_CONCURRENCY` nor forced multi-instance mode is ever true
-// for pi, so `@aws/lambda-invoke-store`'s `InvokeStoreMulti` path, the one
-// real consumer in this dependency tree, is never taken) - and concluded
-// there was nothing to build. Round 117 found that scoping missed a real
-// case: running real, unmodified `@aws-sdk/client-s3` directly (not
-// through pi) crashed on *import alone*, with "undefined is not a
-// constructor." `InvokeStoreImpl` (the class `InvokeStoreMulti` wraps) has
-// `static storage = new AsyncLocalStorage();` - a class field initializer,
-// which real JS evaluates the moment the class itself is defined, at
-// module top level, unconditionally - regardless of whether
-// `InvokeStoreMulti` or `InvokeStoreSingle` ends up chosen at runtime, and
-// regardless of whether `.run()` is ever subsequently called at all. So
-// merely *importing* `@aws-sdk/client-s3` (or anything else that
-// transitively pulls in `@aws/lambda-invoke-store`) needs a real,
-// constructible `AsyncLocalStorage` to exist - the gap was never "nothing
-// calls `.run()`," it was "the class definition alone already needs the
-// constructor," which round 72's own scoping never checked.
-//
-// Exported now, with the real API surface (`run`/`getStore`/`enterWith`/
-// `exit`/`disable`), implemented as a plain stack: `run()` pushes the
-// store, invokes the callback, and pops in a `finally`. Round 72's own
-// correctness concern about this shape is real and still true here, not
-// silently swept aside: if `run()`'s own callback is itself async and
-// suspends at an `await`, the `finally` pop fires the instant that pending
-// promise is *returned*, not when the callback's own remaining code
-// (after the `await`) actually resumes - so a *second*, concurrently-
-// interleaved `run()` call on the same storage instance, overlapping with
-// the first one's still-pending continuation, can observe the wrong
-// store. That's a real, known gap (the same one round 72 identified), not
-// fixed by this change - what changed is only that the class now exists
-// at all, so importing a real dependent doesn't crash outright. For the
-// common, non-overlapping case (one `run()` call's whole async chain
-// finishing before a second, unrelated one starts - true for a single
-// in-flight request, which is exactly what `InvokeStoreSingle` is for),
-// this is correct, matching real Node. Filed the actual missing primitive
-// (context propagation across promise continuations, so a real engine-
-// level implementation would be possible) as a genuine paserati feature
-// request rather than papering over it - see docs/real-node-plan.md's
-// round 72 entry; still open, still the right fix for full correctness.
-const asyncHooksShim = `let __asyncResourceIdSeq = 0;
+// createHook's init/before/after/destroy fire for the runtime's own
+// scheduled callbacks (types PROMISE, TickObject, Immediate, Timeout) and
+// for AsyncResource; promiseResolve never fires. See async_context.go for
+// the one known propagation gap (promises settled from host goroutines).
+const asyncHooksShim = `const ctx = globalThis.__noderatiAsyncContext;
+ctx.enable();
 
-class AsyncResource {
-  constructor(type, options) {
-    this.__type = typeof type === "string" ? type : "AsyncResource";
-    let triggerAsyncId = 0;
-    if (typeof options === "number") {
-      triggerAsyncId = options;
-    } else if (options && typeof options === "object" && typeof options.triggerAsyncId === "number") {
-      triggerAsyncId = options.triggerAsyncId;
+function codedError(Ctor, code, message) {
+  const err = new Ctor(message);
+  err.code = code;
+  return err;
+}
+function received(v) {
+  if (v == null) return " Received " + v;
+  if (typeof v === "function") return " Received function " + (v.name || "<anonymous>");
+  if (typeof v === "object") return " Received an instance of " + ((v.constructor && v.constructor.name) || "Object");
+  let s = typeof v === "string" ? "'" + v + "'" : String(v);
+  if (typeof v === "string" && v.length > 28) s = "'" + v.slice(0, 25) + "'...";
+  return " Received type " + typeof v + " (" + s + ")";
+}
+function invalidArgType(name, expected, v) {
+  const what = '"' + name + '" ' + (name.includes(".") ? "property" : "argument");
+  return codedError(TypeError, "ERR_INVALID_ARG_TYPE", "The " + what + " must be " + expected + "." + received(v));
+}
+function validateFunction(v, name) {
+  if (typeof v !== "function") throw invalidArgType(name, "of type function", v);
+}
+function validateString(v, name) {
+  if (typeof v !== "string") throw invalidArgType(name, "of type string", v);
+}
+function validateObject(v, name) {
+  if (v === null || typeof v !== "object") throw invalidArgType(name, "of type object", v);
+}
+
+const executionAsyncId = () => ctx.executionAsyncId();
+const triggerAsyncId = () => ctx.triggerAsyncId();
+const executionAsyncResource = () => ctx.executionAsyncResource();
+
+// --- createHook ---
+const activeHooks = new Set();
+function dispatch(event, asyncId, type, trigger, resource) {
+  for (const hook of Array.from(activeHooks)) {
+    const fn = hook[kCallbacks][event];
+    if (typeof fn !== "function") continue;
+    if (event === "init") fn.call(hook[kCallbacks], asyncId, type, trigger, resource);
+    else fn.call(hook[kCallbacks], asyncId);
+  }
+}
+const kCallbacks = Symbol("callbacks");
+class AsyncHook {
+  constructor({ init, before, after, destroy, promiseResolve }) {
+    for (const [name, fn] of [["init", init], ["before", before], ["after", after], ["destroy", destroy], ["promiseResolve", promiseResolve]]) {
+      if (fn !== undefined && typeof fn !== "function") throw codedError(TypeError, "ERR_ASYNC_CALLBACK", "hook." + name + " must be a function");
     }
-    this.__asyncId = ++__asyncResourceIdSeq;
-    this.__triggerAsyncId = triggerAsyncId;
+    this[kCallbacks] = { init, before, after, destroy, promiseResolve };
   }
-  asyncId() {
-    return this.__asyncId;
+  enable() {
+    if (!activeHooks.has(this)) {
+      activeHooks.add(this);
+      ctx.setHooks(dispatch);
+    }
+    return this;
   }
-  triggerAsyncId() {
-    return this.__triggerAsyncId;
-  }
-  runInAsyncScope(fn, thisArg, ...args) {
-    return fn.apply(thisArg, args);
-  }
-  emitDestroy() {
+  disable() {
+    activeHooks.delete(this);
+    if (activeHooks.size === 0) ctx.setHooks(undefined);
     return this;
   }
 }
+function createHook(fns) {
+  return new AsyncHook(fns || {});
+}
 
-class AsyncLocalStorage {
-  constructor() {
-    this.__stack = [];
+// --- AsyncResource ---
+const kAsyncId = Symbol("asyncId");
+const kTriggerId = Symbol("triggerAsyncId");
+const kStore = Symbol("store");
+const kDestroyed = Symbol("destroyed");
+
+class AsyncResource {
+  constructor(type, opts = {}) {
+    validateString(type, "type");
+    let triggerAsyncId = opts;
+    if (typeof opts !== "number") {
+      triggerAsyncId = opts.triggerAsyncId === undefined ? executionAsyncId() : opts.triggerAsyncId;
+    }
+    if (!Number.isSafeInteger(triggerAsyncId) || triggerAsyncId < -1) {
+      throw codedError(RangeError, "ERR_INVALID_ASYNC_ID", "Invalid triggerAsyncId value: " + triggerAsyncId);
+    }
+    this[kAsyncId] = ctx.newAsyncId();
+    this[kTriggerId] = triggerAsyncId;
+    this[kStore] = ctx.getStore();
+    if (activeHooks.size) dispatch("init", this[kAsyncId], type, triggerAsyncId, this);
   }
-  run(store, callback, ...args) {
-    this.__stack.push(store);
+  runInAsyncScope(fn, thisArg, ...args) {
+    if (activeHooks.size) dispatch("before", this[kAsyncId]);
     try {
-      return callback(...args);
+      return ctx.runInFrame(this[kAsyncId], this[kTriggerId], this[kStore], this, fn, thisArg, args);
     } finally {
-      this.__stack.pop();
+      if (activeHooks.size) dispatch("after", this[kAsyncId]);
     }
   }
-  exit(callback, ...args) {
-    const saved = this.__stack;
-    this.__stack = [];
-    try {
-      return callback(...args);
-    } finally {
-      this.__stack = saved;
+  emitDestroy() {
+    if (!this[kDestroyed]) {
+      this[kDestroyed] = true;
+      if (activeHooks.size) dispatch("destroy", this[kAsyncId]);
     }
+    return this;
   }
-  enterWith(store) {
-    this.__stack.push(store);
+  asyncId() { return this[kAsyncId]; }
+  triggerAsyncId() { return this[kTriggerId]; }
+  bind(fn, thisArg) {
+    validateFunction(fn, "fn");
+    let bound;
+    if (thisArg === undefined) {
+      const resource = this;
+      bound = function (...args) {
+        return resource.runInAsyncScope(fn, this, ...args);
+      };
+    } else {
+      bound = this.runInAsyncScope.bind(this, fn, thisArg);
+    }
+    Object.defineProperties(bound, {
+      length: { configurable: true, enumerable: false, value: fn.length, writable: false },
+      asyncResource: { configurable: true, enumerable: true, value: this, writable: true },
+    });
+    return bound;
   }
-  disable() {
-    this.__stack = [];
-  }
-  getStore() {
-    return this.__stack.length ? this.__stack[this.__stack.length - 1] : undefined;
+  static bind(fn, type, thisArg) {
+    type = type || fn.name || "bound-anonymous-fn";
+    return (new AsyncResource(type)).bind(fn, thisArg);
   }
 }
 
-export { AsyncResource, AsyncLocalStorage };
-export default { AsyncResource, AsyncLocalStorage };
+// --- AsyncLocalStorage ---
+function withStore(als, value) {
+  const prev = ctx.getStore();
+  const next = new Map(prev);
+  next.set(als, value);
+  return next;
+}
+
+class AsyncLocalStorage {
+  #name;
+  #defaultValue;
+  #disabled = false;
+  constructor(options = {}) {
+    validateObject(options, "options");
+    this.#defaultValue = options.defaultValue;
+    this.#name = options.name === undefined ? "" : String(options.name);
+  }
+  get name() { return this.#name; }
+  static bind(fn) {
+    validateFunction(fn, "fn");
+    return AsyncResource.bind(fn);
+  }
+  static snapshot() {
+    const store = ctx.getStore();
+    return function runInAsyncScope(fn, ...args) {
+      const prev = ctx.getStore();
+      ctx.setStore(store);
+      try {
+        return fn.apply(this, args);
+      } finally {
+        ctx.setStore(prev);
+      }
+    };
+  }
+  disable() {
+    this.#disabled = true;
+    const cur = ctx.getStore();
+    if (cur && cur.has(this)) {
+      const next = new Map(cur);
+      next.delete(this);
+      ctx.setStore(next);
+    }
+  }
+  getStore() {
+    if (this.#disabled) return undefined;
+    const m = ctx.getStore();
+    if (!m || !m.has(this)) return this.#defaultValue;
+    return m.get(this);
+  }
+  enterWith(store) {
+    this.#disabled = false;
+    ctx.setStore(withStore(this, store));
+  }
+  run(store, callback, ...args) {
+    this.#disabled = false;
+    const prev = ctx.getStore();
+    ctx.setStore(withStore(this, store));
+    try {
+      return Reflect.apply(callback, null, args);
+    } finally {
+      ctx.setStore(prev);
+    }
+  }
+  exit(callback, ...args) {
+    return this.run(undefined, callback, ...args);
+  }
+  withScope(store) {
+    return new RunScope(this, store);
+  }
+}
+
+class RunScope {
+  #storage;
+  #previousStore;
+  #disposed = false;
+  constructor(storage, store) {
+    this.#storage = storage;
+    this.#previousStore = ctx.getStore();
+    storage.enterWith(store);
+  }
+  [Symbol.dispose]() {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    ctx.setStore(this.#previousStore);
+  }
+}
+
+const asyncWrapProviders = Object.freeze(Object.assign(Object.create(null), {
+  NONE: 0, DIRHANDLE: 1, DNSCHANNEL: 2, ELDHISTOGRAM: 3, FILEHANDLE: 4, FILEHANDLECLOSEREQ: 5, BLOBREADER: 6,
+  FSEVENTWRAP: 7, FSREQCALLBACK: 8, FSREQPROMISE: 9, GETADDRINFOREQWRAP: 10, GETNAMEINFOREQWRAP: 11,
+  HEAPSNAPSHOT: 12, HTTP2SESSION: 13, HTTP2STREAM: 14, HTTP2PING: 15, HTTP2SETTINGS: 16,
+  HTTPINCOMINGMESSAGE: 17, HTTPCLIENTREQUEST: 18, LOCKS: 19, JSSTREAM: 20, JSUDPWRAP: 21, MESSAGEPORT: 22,
+  PIPECONNECTWRAP: 23, PIPESERVERWRAP: 24, PIPEWRAP: 25, PROCESSWRAP: 26, PROMISE: 27, QUERYWRAP: 28,
+  QUIC_ENDPOINT: 29, QUIC_LOGSTREAM: 30, QUIC_SESSION: 31, QUIC_STREAM: 32, QUIC_UDP: 33, SHUTDOWNWRAP: 34,
+  SIGNALWRAP: 35, STATWATCHER: 36, STREAMPIPE: 37, TCPCONNECTWRAP: 38, TCPSERVERWRAP: 39, TCPWRAP: 40,
+  TTYWRAP: 41, UDPSENDWRAP: 42, UDPWRAP: 43, SIGINTWATCHDOG: 44, WORKER: 45, WORKERCPUPROFILE: 46,
+  WORKERCPUUSAGE: 47, WORKERHEAPPROFILE: 48, WORKERHEAPSNAPSHOT: 49, WORKERHEAPSTATISTICS: 50, WRITEWRAP: 51,
+  ZLIB: 52, CHECKPRIMEREQUEST: 53, PBKDF2REQUEST: 54, KEYPAIRGENREQUEST: 55, KEYGENREQUEST: 56,
+  KEYEXPORTREQUEST: 57, ARGON2REQUEST: 58, CIPHERREQUEST: 59, DERIVEBITSREQUEST: 60, HASHREQUEST: 61,
+  RANDOMBYTESREQUEST: 62, RANDOMPRIMEREQUEST: 63, SCRYPTREQUEST: 64, SIGNREQUEST: 65, TLSWRAP: 66,
+  VERIFYREQUEST: 67,
+}));
+
+export {
+  AsyncLocalStorage, createHook, executionAsyncId, triggerAsyncId, executionAsyncResource,
+  asyncWrapProviders, AsyncResource,
+};
+export default {
+  AsyncLocalStorage, createHook, executionAsyncId, triggerAsyncId, executionAsyncResource,
+  asyncWrapProviders, AsyncResource,
+};
 `
 
 func declareAsyncHooks() {
