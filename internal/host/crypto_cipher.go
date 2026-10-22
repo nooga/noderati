@@ -162,7 +162,7 @@ func newBlock(spec *cipherSpec, key []byte) (cipher.Block, error) {
 	case "des3":
 		return des.NewTripleDESCipher(key)
 	case "des2":
-		k := append(append(append([]byte{}, key[:16]...)), key[:8]...)
+		k := append(append([]byte{}, key[:16]...), key[:8]...)
 		return des.NewTripleDESCipher(k)
 	}
 	return nil, errors.New("no block cipher")

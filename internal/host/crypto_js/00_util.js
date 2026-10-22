@@ -163,6 +163,12 @@ function toU8(v) {
   return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
 }
 
+function compareBytes(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
 function toBuf(v) {
   if (Buffer.isBuffer(v)) return v;
   const u = toU8(v);
