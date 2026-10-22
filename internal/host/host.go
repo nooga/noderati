@@ -85,6 +85,7 @@ func installModules(p *driver.Paserati) {
 	declareConsole()
 	declareTimers()
 	declareDNS()
+	declareDgram()
 	installDNSNatives(p)
 	declareZlib()
 	installZlibNatives(p)
