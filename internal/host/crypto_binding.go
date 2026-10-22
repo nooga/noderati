@@ -236,6 +236,7 @@ func installCryptoBinding(p *driver.Paserati) {
 	b.installHash()
 	b.installRandomAndKDF()
 	b.installCipher()
+	b.installKeys()
 	gt.AsPlainObject().SetOwnNonEnumerable("__noderatiCrypto", vm.NewValueFromPlainObject(b.obj))
 }
 

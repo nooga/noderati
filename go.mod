@@ -3,6 +3,7 @@ module github.com/nooga/noderati
 go 1.27.1
 
 require (
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
 	github.com/fsnotify/fsnotify v1.10.0
 	github.com/nooga/paserati v0.0.0
 	github.com/tetratelabs/wazero v1.12.0
@@ -13,6 +14,7 @@ require (
 )
 
 require (
+	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	golang.org/x/text v0.41.0 // indirect

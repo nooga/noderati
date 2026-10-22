@@ -102,8 +102,10 @@ class AsymmetricKeyObject extends KeyObject {
   get asymmetricKeyDetails() {
     const d = keyInfo(this).details;
     if (!d) return {};
-    const out = { ...d };
-    if (out.publicExponent !== undefined) out.publicExponent = BigInt(out.publicExponent);
+    const out = {};
+    for (const k of ["modulusLength", "publicExponent", "hashAlgorithm", "mgf1HashAlgorithm", "saltLength", "divisorLength", "namedCurve"]) {
+      if (d[k] !== undefined) out[k] = k === "publicExponent" ? BigInt(d[k]) : d[k];
+    }
     return out;
   }
 
