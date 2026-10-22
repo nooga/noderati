@@ -44,6 +44,7 @@ type timerState struct {
 	scheduledAt time.Time
 	deadline    time.Time
 	fire        func() // runs the callback (and reschedules an interval)
+	fireInCtx   func() // fire, inside the async context schedule() captured
 	wake        func() // what the runtime timer calls: drains every due timer in order
 	obj         *vm.PlainObject
 }
@@ -55,6 +56,9 @@ var timerAsyncIDs atomic.Int64
 func (t *timerState) schedule(delay time.Duration) {
 	t.scheduledAt = time.Now()
 	t.deadline = t.scheduledAt.Add(delay)
+	// One runtime timer's wake drains every due timer, so each timer
+	// carries its own async context rather than the waking one's.
+	t.fireInCtx = bindAsyncContext(t.rt, "Timeout", func() { t.fire() })
 	if t.refed {
 		t.id = t.rt.ScheduleTimer(delay, t.wake)
 	} else {
@@ -129,7 +133,7 @@ func installTimeoutObjects(p *driver.Paserati) {
 			// An earlier callback may have cleared or refreshed this one.
 			if !t.destroyed && !t.deadline.After(now) {
 				rt.CancelTimer(t.id)
-				t.fire()
+				t.fireInCtx()
 			}
 		}
 	}

@@ -151,19 +151,10 @@ func TestAsyncLocalStorageSyncRunAndGetStore(t *testing.T) {
 	}
 }
 
-// TestAsyncLocalStorageDoesNotSurviveAcrossAwait pins down, as an actual
-// checked assertion rather than just a doc comment's claim, the exact
-// known limitation this implementation has: getStore() called from a
-// run() callback's own continuation *after* an internal await no longer
-// sees the store, because the stack-based run()'s own `finally` pop fires
-// the instant the still-pending promise is returned, not when the
-// callback's remaining code actually resumes. If this ever starts
-// passing "req-1" for the post-await value, either the implementation
-// changed to something genuinely correct (update this test to expect the
-// real value and delete this comment) or something coincidental is
-// masking the gap - either way this test existing means that change gets
-// noticed instead of silently happening.
-func TestAsyncLocalStorageDoesNotSurviveAcrossAwait(t *testing.T) {
+// TestAsyncLocalStorageSurvivesAcrossAwait: the store is still visible in
+// a run() callback's continuation after an await (async_context.go's
+// frames), matching real Node.
+func TestAsyncLocalStorageSurvivesAcrossAwait(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
@@ -180,8 +171,8 @@ func TestAsyncLocalStorageDoesNotSurviveAcrossAwait(t *testing.T) {
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])
 	}
-	want := `{"beforeAwait":"req-1"}`
+	want := `{"beforeAwait":"req-1","afterAwait":"req-1"}`
 	if val.ToString() != want {
-		t.Errorf("got %s, want %s (afterAwait should be the known-missing case - see this test's own doc comment)", val.ToString(), want)
+		t.Errorf("got %s, want %s", val.ToString(), want)
 	}
 }
