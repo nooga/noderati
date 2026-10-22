@@ -93,8 +93,12 @@ function eos(stream, options, callback) {
 
   callback = once(callback);
 
+  // noderati's host-native duplex-like objects (e.g. zlib.createGunzip's
+  // Go-pumped decoder) carry neither stream state, never clear .writable
+  // and never emit 'finish': for those, 'end'/'close' means done.
+  const hostNative = !wState && !rState;
   const onlegacyfinish = () => {
-    if (!stream.writable) onfinish();
+    if (!stream.writable || hostNative) onfinish();
   };
   const onfinish = () => {
     writableFinished = true;

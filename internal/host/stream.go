@@ -103,9 +103,20 @@ export const pipeline = promises.pipeline;
 export default promises;
 `
 
-const streamConsumersShim = `async function blob(stream) {
+const streamConsumersShim = `import Stream from "stream";
+
+// Host-native emitter streams (http.IncomingMessage) may lack
+// [Symbol.asyncIterator]; read those through Readable's iterator, which
+// wraps a stream without read().
+function iterable(stream) {
+  if (stream && typeof stream[Symbol.asyncIterator] !== "function" && typeof stream.on === "function") {
+    return Stream.Readable.prototype.iterator.call(stream);
+  }
+  return stream;
+}
+async function blob(stream) {
   const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
+  for await (const chunk of iterable(stream)) chunks.push(chunk);
   return new Blob(chunks);
 }
 async function arrayBuffer(stream) {
@@ -121,7 +132,7 @@ async function bytes(stream) {
 async function text(stream) {
   const dec = new TextDecoder();
   let str = "";
-  for await (const chunk of stream) {
+  for await (const chunk of iterable(stream)) {
     if (typeof chunk === "string") str += chunk;
     else str += dec.decode(chunk, { stream: true });
   }
