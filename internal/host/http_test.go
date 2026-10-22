@@ -199,13 +199,18 @@ func TestHTTPRequestConstructionErrorEmitsError(t *testing.T) {
 	p.SetSkipTypeCheck(true)
 	val, errs := p.RunCode(`
 		import { request } from "node:http";
+		// An invalid method throws synchronously in real node
+		// (ERR_INVALID_HTTP_TOKEN); a request Go's net/http can't even
+		// build (unparseable host) must still surface as an 'error' event.
+		let threw = "";
+		try { request({ hostname: "localhost", port: 80, path: "/", method: "BAD METHOD" }); } catch (e) { threw = e.code; }
 		let gotError = false;
 		await new Promise((resolve) => {
-			const req = request({ hostname: "localhost", port: 80, path: "/", method: "BAD METHOD" }, () => resolve());
+			const req = request({ hostname: "bad host%zz", port: 80, path: "/" }, () => resolve());
 			req.on("error", () => { gotError = true; resolve(); });
 			req.end();
 		});
-		gotError
+		threw === "ERR_INVALID_HTTP_TOKEN" && gotError
 	`, driver.RunOptions{})
 	if len(errs) > 0 {
 		t.Fatalf("RunCode: %v", errs[0])

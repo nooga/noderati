@@ -3,10 +3,13 @@ package host
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -277,7 +280,17 @@ func doHTTPRequest(vmInst *vm.VM, scheme string, optsVal vm.Value) vm.Value {
 			if hobj := hv.AsPlainObject(); hobj != nil {
 				for _, k := range hobj.OwnKeys() {
 					if val, ok := hobj.GetOwn(k); ok {
-						httpReq.Header.Set(k, val.ToString())
+						if strings.EqualFold(k, "host") {
+							httpReq.Host = val.ToString()
+							continue
+						}
+						for i, hv := range headerValuesFromValue(val) {
+							if i == 0 {
+								httpReq.Header.Set(k, hv)
+							} else {
+								httpReq.Header.Add(k, hv)
+							}
+						}
 					}
 				}
 			}
@@ -285,8 +298,37 @@ func doHTTPRequest(vmInst *vm.VM, scheme string, optsVal vm.Value) vm.Value {
 	}
 
 	transport := transportFromAgentOption(opts)
-	if scheme == "https" && transport.TLSClientConfig == nil {
-		transport.TLSClientConfig = &tls.Config{ServerName: host}
+	if scheme == "https" {
+		// Per-request TLS options (ca / rejectUnauthorized / servername)
+		// get a dedicated transport so they never leak into a shared one.
+		insecure := !getBoolOpt(opts, "rejectUnauthorized", true)
+		var roots *x509.CertPool
+		if cas := pemListOpt(vmInst, opts, "ca"); len(cas) > 0 {
+			roots = x509.NewCertPool()
+			for _, c := range cas {
+				roots.AppendCertsFromPEM(c)
+			}
+		}
+		sn := getStrOpt(opts, "servername", "")
+		if insecure || roots != nil || sn != "" {
+			t := transport.Clone()
+			t.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecure, RootCAs: roots, ServerName: sn}
+			transport = t
+		} else if dr := currentDefaultRoots(); dr != nil {
+			t := transport.Clone()
+			t.TLSClientConfig = &tls.Config{RootCAs: dr}
+			transport = t
+		}
+	}
+
+	if sp := getStrOpt(opts, "socketPath", ""); sp != "" {
+		t := transport.Clone()
+		t.Proxy = nil
+		t.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sp)
+		}
+		transport = t
 	}
 
 	trace := &httptrace.ClientTrace{
@@ -309,7 +351,7 @@ func doHTTPRequest(vmInst *vm.VM, scheme string, optsVal vm.Value) vm.Value {
 
 	reqObj.SetOwn("write", vm.NewNativeFunction(1, true, "write", func(a []vm.Value) (vm.Value, error) {
 		if len(a) > 0 && !a[0].IsUndefined() {
-			bodyCh <- []byte(a[0].ToString())
+			bodyCh <- append([]byte(nil), valueToBytes(vmInst, a[0])...)
 		}
 		if len(a) > 1 && a[1].IsCallable() {
 			cb := a[1]
@@ -325,8 +367,8 @@ func doHTTPRequest(vmInst *vm.VM, scheme string, optsVal vm.Value) vm.Value {
 			rt.ScheduleNextTick(func() { _, _ = vmInst.Call(cb, vm.Undefined, nil) })
 			return reqSelf, nil
 		}
-		if len(a) > 0 && !a[0].IsUndefined() {
-			bodyCh <- []byte(a[0].ToString())
+		if len(a) > 0 && !a[0].IsUndefined() && a[0].Type() != vm.TypeNull {
+			bodyCh <- append([]byte(nil), valueToBytes(vmInst, a[0])...)
 		}
 		close(bodyCh)
 		if len(a) > 1 && a[1].IsCallable() {
@@ -354,7 +396,7 @@ func doHTTPRequest(vmInst *vm.VM, scheme string, optsVal vm.Value) vm.Value {
 		resp, err := client.Do(httpReq)
 		if err != nil {
 			rt.ScheduleNextTick(func() {
-				emitOnObject(vmInst, reqObj, "error", errorValueFromGo(vmInst, err))
+				emitOnObject(vmInst, reqObj, "error", httpClientErrorValue(vmInst, err, host))
 			})
 			return
 		}
@@ -378,10 +420,31 @@ func buildIncomingMessage(vmInst *vm.VM, resp *http.Response) *vm.PlainObject {
 	obj.SetOwn("statusMessage", vm.NewString(strings.TrimPrefix(resp.Status, strconv.Itoa(resp.StatusCode)+" ")))
 	obj.SetOwn("httpVersion", vm.NewString(strings.TrimPrefix(resp.Proto, "HTTP/")))
 	headersObj := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
-	for k, vs := range resp.Header {
-		headersObj.SetOwn(strings.ToLower(k), vm.NewString(strings.Join(vs, ", ")))
+	raw := vm.NewArray()
+	keys := make([]string, 0, len(resp.Header))
+	for k := range resp.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		vs := resp.Header[k]
+		lk := strings.ToLower(k)
+		if lk == "set-cookie" {
+			arr := vm.NewArray()
+			for _, v := range vs {
+				arr.AsArray().Append(vm.NewString(v))
+			}
+			headersObj.SetOwn(lk, arr)
+		} else {
+			headersObj.SetOwn(lk, vm.NewString(strings.Join(vs, ", ")))
+		}
+		for _, v := range vs {
+			raw.AsArray().Append(vm.NewString(k))
+			raw.AsArray().Append(vm.NewString(v))
+		}
 	}
 	obj.SetOwn("headers", vm.NewValueFromPlainObject(headersObj))
+	obj.SetOwn("rawHeaders", raw)
 	return obj
 }
 
@@ -418,6 +481,68 @@ func pumpHTTPResponseBody(vmInst *vm.VM, resp *http.Response, stream *vm.PlainOb
 			return
 		}
 	}
+}
+
+// httpClientErrorValue shapes a net/http client failure like node's
+// ("connect ECONNREFUSED 127.0.0.1:1", "getaddrinfo ENOTFOUND host",
+// "socket hang up") using the net shim's own error builders.
+func httpClientErrorValue(vmInst *vm.VM, err error, host string) vm.Value {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		ev := errorValueFromGo(vmInst, errors.New("getaddrinfo ENOTFOUND "+dnsErr.Name))
+		if o := ev.AsPlainObject(); ev.Type() == vm.TypeObject && o != nil {
+			o.SetOwn("errno", vm.NumberValue(-3008))
+			o.SetOwn("code", vm.NewString("ENOTFOUND"))
+			o.SetOwn("syscall", vm.NewString("getaddrinfo"))
+			o.SetOwn("hostname", vm.NewString(dnsErr.Name))
+		}
+		return ev
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		info := netErrInfo(err, "connect")
+		if fn := jsNetInternal(vmInst, "exceptionWithHostPort"); fn.IsCallable() && opErr.Addr != nil {
+			h, p, serr := net.SplitHostPort(opErr.Addr.String())
+			args := []vm.Value{info.toValue(vmInst), vm.NewString("connect"), vm.NewString(opErr.Addr.String())}
+			if serr == nil {
+				pn, _ := strconv.Atoi(p)
+				args = []vm.Value{info.toValue(vmInst), vm.NewString("connect"), vm.NewString(h), vm.NumberValue(float64(pn))}
+			}
+			if v, cerr := vmInst.Call(fn, vm.Undefined, args); cerr == nil {
+				return v
+			}
+		}
+	}
+	var cve *tls.CertificateVerificationError
+	if errors.As(err, &cve) {
+		code, msg := "", ""
+		var hne x509.HostnameError
+		if errors.As(err, &hne) {
+			code, msg = "ERR_TLS_CERT_ALTNAME_INVALID", "Hostname/IP does not match certificate's altnames: Host: "+hne.Host+". is not in the cert's altnames: "+subjectAltName(hne.Certificate)
+		} else {
+			code, msg = verifyChain(cve.UnverifiedCertificates, nil, false)
+			if code == "" {
+				code, msg = "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "unable to verify the first certificate"
+			}
+			switch code {
+			case "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+				msg += "; if the root CA is installed locally, try running Node.js with --use-system-ca"
+			}
+		}
+		ev := errorValueFromGo(vmInst, errors.New(msg))
+		if o := ev.AsPlainObject(); ev.Type() == vm.TypeObject && o != nil {
+			o.SetOwn("code", vm.NewString(code))
+		}
+		return ev
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(err.Error(), "connection reset") {
+		ev := errorValueFromGo(vmInst, errors.New("socket hang up"))
+		if o := ev.AsPlainObject(); ev.Type() == vm.TypeObject && o != nil {
+			o.SetOwn("code", vm.NewString("ECONNRESET"))
+		}
+		return ev
+	}
+	return errorValueFromGo(vmInst, err)
 }
 
 func errorValueFromGo(vmInst *vm.VM, err error) vm.Value {

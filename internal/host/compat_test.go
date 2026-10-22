@@ -423,23 +423,17 @@ func TestCJSNamedExportValid(t *testing.T) {
 func TestNodeMissingResolver(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
-	_, errs := p.RunCode(`import "node:dgram"`, driver.RunOptions{})
+	_, errs := p.RunCode(`import "node:no_such_builtin"`, driver.RunOptions{})
 	if len(errs) == 0 {
-		t.Fatal("expected error for missing node:dgram")
+		t.Fatal("expected error for missing node:no_such_builtin")
 	}
-	// This asserts noderati's own message shape, not a byte-exact match
-	// to real Node: node:dgram is a real Node builtin (just not one
-	// noderati implements - node:net/node:tls were the same kind of gap
-	// until round 69, docs/real-node-plan.md), so real Node doesn't
-	// error on this import at all. NodeMissingResolver's doc comment
-	// (nodemissing.go) explains why "No such built-in module" is still
-	// the more honest of the two message shapes available - it's real
-	// Node's actual ERR_UNKNOWN_BUILTIN_MODULE wording (for a name that
-	// genuinely isn't a Node builtin), not ERR_MODULE_NOT_FOUND's
+	// node:dgram used to be the example here until it was implemented;
+	// a name that isn't a Node builtin at all gets real Node's exact
+	// ERR_UNKNOWN_BUILTIN_MODULE wording, not ERR_MODULE_NOT_FOUND's
 	// "Cannot find module" (Node's message for a missing bare/relative
 	// specifier instead - confirmed directly against real Node when this
 	// was fixed, round 64, docs/real-node-plan.md's Phase 4 section).
-	if !strings.Contains(errs[0].Error(), "No such built-in module: node:dgram") {
+	if !strings.Contains(errs[0].Error(), "No such built-in module: node:no_such_builtin") {
 		t.Errorf("error = %q", errs[0].Error())
 	}
 }
@@ -447,12 +441,12 @@ func TestNodeMissingResolver(t *testing.T) {
 func TestMissingNodeBuiltinNamedError(t *testing.T) {
 	p := New([]string{"noderati"})
 	p.SetSkipTypeCheck(true)
-	_, errs := p.RunCode(`import "node:dgram"`, driver.RunOptions{})
+	_, errs := p.RunCode(`import "node:no_such_builtin"`, driver.RunOptions{})
 	if len(errs) == 0 {
-		t.Fatal("expected error for missing node:dgram")
+		t.Fatal("expected error for missing node:no_such_builtin")
 	}
 	msg := errs[0].Error()
-	if !strings.Contains(msg, "No such built-in module: node:dgram") {
+	if !strings.Contains(msg, "No such built-in module: node:no_such_builtin") {
 		t.Errorf("error = %q, want named no-such-built-in-module", msg)
 	}
 }

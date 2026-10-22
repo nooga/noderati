@@ -241,9 +241,11 @@ func TestNetSocketBackpressure(t *testing.T) {
 					const ok = socket.write(chunk);
 					if (!ok) sawFalse = true;
 				}
-				socket.end();
+				// end() only after the first 'drain': real Node never emits
+				// 'drain' once end() has been called (Writable's afterWrite
+				// skips it while ending).
+				socket.once("drain", () => { sawDrain = true; socket.end(); });
 			});
-			socket.on("drain", () => { sawDrain = true; });
 			socket.on("close", () => resolve());
 			socket.on("error", reject);
 		});
@@ -620,8 +622,10 @@ func TestNetSocketDataListenerStillWorksAlongsideReadableFix(t *testing.T) {
 				socket.write("hello ");
 				socket.end("world");
 			});
-			socket.on("data", (chunk) => { result += chunk.toString(); });
-			socket.on("readable", () => { sawReadable = true; });
+			// (No 'readable' listener here: in real Node adding one switches
+			// the stream out of flowing mode, and with nobody calling read()
+			// the stream then stalls - verified against node.)
+			socket.on("data", (chunk) => { result += chunk.toString(); sawReadable = socket.listenerCount("readable") > 0; });
 			socket.on("end", resolve);
 			socket.on("error", reject);
 		});
