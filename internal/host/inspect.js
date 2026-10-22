@@ -214,6 +214,11 @@ Object.defineProperty(inspect, "defaultOptions", {
   },
 });
 
+// inspect[name] = value, for util.inspect's forwarder (inspect.go).
+export function setInspectProperty(name, value) {
+  inspect[name] = value;
+}
+
 const defaultFG = 39;
 const defaultBG = 49;
 inspect.colors = {
@@ -2141,6 +2146,80 @@ export function stripVTControlCharacters(str) {
   }
   if (str.indexOf("\u001B") === -1 && str.indexOf("\u009B") === -1) return str;
   return str.replace(ansi, "");
+}
+
+// Node defines inspect hooks on its web classes (lib/internal/url.js,
+// abort_controller.js, encoding.js); the engine's own
+// versions of these classes get equivalent ones here. Where Node returns
+// `this` past the depth limit (to print the bare, key-less instance), the
+// equivalent string is returned instead: these instances carry own keys.
+function defineInspectHook(proto, fn) {
+  if (proto === null || typeof proto !== "object" || proto === Object.prototype || hasOwn(proto, customInspectSymbol)) return;
+  Object.defineProperty(proto, customInspectSymbol, { value: fn, writable: true, configurable: true, enumerable: false });
+}
+function protoOf(make) {
+  try {
+    return Object.getPrototypeOf(make());
+  } catch {
+    return null;
+  }
+}
+function nameOf(self, fallback) {
+  const ctor = self?.constructor;
+  return typeof ctor === "function" && ctor.name && ctor !== Object ? ctor.name : fallback;
+}
+function webCustomInspect(self, name, obj, depth, options) {
+  if (depth < 0) return `${name} {}`;
+  const opts = Object.assign({}, options, { depth: options.depth === null ? null : options.depth - 1 });
+  return `${name} ${inspect(obj, opts)}`;
+}
+if (typeof globalThis.URL === "function") {
+  defineInspectHook(globalThis.URL.prototype, function (depth, opts) {
+    const name = nameOf(this, "URL");
+    if (typeof depth === "number" && depth < 0) return `${name} {}`;
+    const obj = {};
+    for (const key of ["href", "origin", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "searchParams", "hash"]) {
+      obj[key] = this[key];
+    }
+    return `${name} ${inspect(obj, opts)}`;
+  });
+}
+if (typeof globalThis.URLSearchParams === "function") {
+  defineInspectHook(globalThis.URLSearchParams.prototype, function (recurseTimes, ctx) {
+    if (typeof recurseTimes === "number" && recurseTimes < 0) return ctx.stylize("[Object]", "special");
+    const separator = ", ";
+    const innerOpts = { ...ctx };
+    if (recurseTimes !== null) innerOpts.depth = recurseTimes - 1;
+    const output = [];
+    for (const entry of this) output.push(`${inspect(entry[0], innerOpts)} => ${inspect(entry[1], innerOpts)}`);
+    let length = -separator.length;
+    for (let i = 0; i < output.length; i++) length += stripVTControlCharacters(output[i]).length + separator.length;
+    const name = nameOf(this, "URLSearchParams");
+    if (length > ctx.breakLength) return `${name} {\n  ${output.join(",\n  ")} }`;
+    if (output.length) return `${name} { ${output.join(separator)} }`;
+    return `${name} {}`;
+  });
+}
+if (typeof globalThis.AbortController === "function") {
+  defineInspectHook(globalThis.AbortController.prototype, function (depth, options) {
+    return webCustomInspect(this, "AbortController", { signal: this.signal }, depth, options);
+  });
+  defineInspectHook(protoOf(() => new AbortController().signal), function (depth, options) {
+    return webCustomInspect(this, "AbortSignal", { aborted: this.aborted }, depth, options);
+  });
+}
+if (typeof globalThis.TextEncoder === "function") {
+  defineInspectHook(globalThis.TextEncoder.prototype, function (depth, opts) {
+    if (typeof depth === "number" && depth < 0) return "TextEncoder {}";
+    return inspect({ encoding: this.encoding }, opts);
+  });
+}
+if (typeof globalThis.TextDecoder === "function") {
+  defineInspectHook(globalThis.TextDecoder.prototype, function (depth, opts) {
+    if (typeof depth === "number" && depth < 0) return "TextDecoder {}";
+    const obj = { encoding: this.encoding, fatal: this.fatal, ignoreBOM: this.ignoreBOM };
+    return `${nameOf(this, "TextDecoder")} ${inspect(obj)}`;
+  });
 }
 
 // Buffer.prototype[inspect.custom] (and Buffer.prototype.inspect), as

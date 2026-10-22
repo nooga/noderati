@@ -2,7 +2,6 @@ package host
 
 import (
 	_ "embed"
-	"sync"
 
 	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/vm"
@@ -147,26 +146,10 @@ func declareInspect(p *driver.Paserati) {
 	})
 }
 
-// lazyInspect returns the session's lazily loaded inspect shim.
-func lazyInspect(p *driver.Paserati) *lazyJSModule {
-	inspectModulesMu.Lock()
-	defer inspectModulesMu.Unlock()
-	if l, ok := inspectModules[p]; ok {
-		return l
-	}
-	l := &lazyJSModule{p: p, spec: "noderati-internal:inspect"}
-	inspectModules[p] = l
-	return l
-}
-
-var (
-	inspectModulesMu sync.Mutex
-	inspectModules   = map[*driver.Paserati]*lazyJSModule{}
-)
-
-// callInspectExport calls the shim's export name with args.
+// callInspectExport calls export name of the inspect shim. Loading goes
+// through the module registry, which caches the evaluated shim per session.
 func callInspectExport(p *driver.Paserati, name string, this vm.Value, args []vm.Value) (vm.Value, error) {
-	fn, err := lazyInspect(p).get(name)
+	fn, err := (&lazyJSModule{p: p, spec: "noderati-internal:inspect"}).get(name)
 	if err != nil {
 		return vm.Undefined, err
 	}
@@ -184,9 +167,17 @@ func installUtilInspect(p *driver.Paserati) {
 		return
 	}
 	exports := rec.GetExportValues()
+	lazy := &lazyJSModule{p: p, spec: "noderati-internal:inspect"}
+	call := func(name string, this vm.Value, args []vm.Value) (vm.Value, error) {
+		fn, err := lazy.get(name)
+		if err != nil {
+			return vm.Undefined, err
+		}
+		return vmInst.Call(fn, this, args)
+	}
 	forward := func(name string) vm.Value {
 		return vm.NewNativeFunction(0, true, name, func(args []vm.Value) (vm.Value, error) {
-			return callInspectExport(p, name, vmInst.GetThis(), args)
+			return call(name, vmInst.GetThis(), args)
 		})
 	}
 	inspectFn := forward("inspect")
@@ -206,18 +197,15 @@ func installUtilInspect(p *driver.Paserati) {
 	for _, name := range []string{"defaultOptions", "colors", "styles"} {
 		name := name
 		getter := vm.NewNativeFunction(0, false, "get "+name, func(_ []vm.Value) (vm.Value, error) {
-			real, err := lazyInspect(p).get("inspect")
+			real, err := lazy.get("inspect")
 			if err != nil {
 				return vm.Undefined, err
 			}
 			return jsReflectGet(vmInst, real, vm.NewString(name))
 		})
+		// Assigned from JS: Reflect.set on a function skips its setters.
 		setter := vm.NewNativeFunction(1, false, "set "+name, func(args []vm.Value) (vm.Value, error) {
-			real, err := lazyInspect(p).get("inspect")
-			if err != nil {
-				return vm.Undefined, err
-			}
-			return vmInst.Call(jsGlobalMethod(vmInst, "Reflect", "set"), vm.Undefined, []vm.Value{real, vm.NewString(name), argAt(args, 0)})
+			return call("setInspectProperty", vm.Undefined, []vm.Value{vm.NewString(name), argAt(args, 0)})
 		})
 		define(name, map[string]vm.Value{"get": getter, "set": setter, "enumerable": vm.False, "configurable": vm.True})
 	}
@@ -244,7 +232,7 @@ func installUtilInspect(p *driver.Paserati) {
 	if bufOK {
 		if proto, err := jsReflectGet(vmInst, bufCtor, vm.NewString("prototype")); err == nil && !isNullish(proto) {
 			hook := vm.NewNativeFunction(2, false, "inspect", func(args []vm.Value) (vm.Value, error) {
-				return callInspectExport(p, "bufferInspect", vmInst.GetThis(), args)
+				return call("bufferInspect", vmInst.GetThis(), args)
 			})
 			for _, key := range []vm.Value{jsSymbolFor(vmInst, "nodejs.util.inspect.custom"), vm.NewString("inspect")} {
 				d := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
