@@ -1084,5 +1084,22 @@ Object.defineProperty(Crypto.prototype, Symbol.toStringTag, { value: "Crypto", c
 const webcrypto = Object.create(Crypto.prototype);
 Object.defineProperty(webcrypto, kBrand, { value: "Crypto" });
 
+// WebIDL members are enumerable; re-adding them in node's order also
+// fixes for-in order.
+function webidlMembers(target, order) {
+  const descs = order.map((k) => [k, Object.getOwnPropertyDescriptor(target, k)]);
+  for (const [k, d] of descs) {
+    delete target[k];
+    d.enumerable = true;
+    Object.defineProperty(target, k, d);
+  }
+}
+webidlMembers(SubtleCrypto.prototype, ["encrypt", "decrypt", "sign", "verify", "digest", "generateKey", "deriveKey",
+  "deriveBits", "importKey", "exportKey", "wrapKey", "unwrapKey", "getPublicKey", "encapsulateBits", "encapsulateKey",
+  "decapsulateBits", "decapsulateKey"]);
+webidlMembers(SubtleCrypto, ["supports"]);
+webidlMembers(Crypto.prototype, ["subtle", "getRandomValues", "randomUUID"]);
+webidlMembers(CryptoKey.prototype, ["type", "extractable", "algorithm", "usages"]);
+
 // The Go side reads these to install the web globals lazily.
 binding.webGlobals = { crypto: webcrypto, Crypto, CryptoKey, SubtleCrypto };

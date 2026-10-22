@@ -588,3 +588,39 @@ func TestCryptoWebCryptoParity(t *testing.T) {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}
 }
+
+func TestCryptoCertificateSpkacParity(t *testing.T) {
+	got := runScriptString(t, `
+		import crypto from "node:crypto";
+		const { Certificate } = crypto;
+		const a = "MIG6MGIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASpMZLrHko1ZdAx9aWhKccKxXdArUHXWAfleo3UTgEmw3bNgzaAZWk54da4pHF0wEzlje9z1w5fQzt4O2UIR119FgVoZWxsbzAKBggqhkjOPQQDAgNIADBFAiAa2tAqWspPMscZGYniosOiAz935o1RhccAQmYDFJs6dgIhAP7zY4YZMTx/77ODqRoYCbpQK9nnxjYer1LfsA1YKvg5";
+		const b = "MIICTTCCATUwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDCGe7W7bKkcbK76AdCNIBfLWViP8o23iFHn/koOV81vp9Lf+XjHB1nhJq8yssGCpzaHMWIfBn61m2sBphkSkQ4lcyt+c2cHmx3J8CLmeZjbL43RfjxMSe+H0rVDvzDDW1vUnqyMYJCvSVVFiqGKCtuLg09Ss76l+Y89Oky+bI/njzJWHvolAgrq4km0CkZGxHIH2bTtssQOUPytndKxoR0QvCa7MdZgPFU32S7TCr2rpZletV+huadYQTvYRquemXEPP/7Eq5CFPzYS9gH+r6l41tw6zFJiDg79LOm2vzIkScZsOyI63AMNTqMR2YDVOO/dd1QgMmasawQsqpjWPmFAgMBAAEWDXJzYSBjaGFsbGVuZ2UwDQYJKoZIhvcNAQEEBQADggEBAJx1kGkoVBf8PrgSiAR9AtTY+EO+/FDHqXqk5n9TMSVth6bAeqH8P4YYl4xbyj2yIPqAjwVH9T943NazK5sHj9M7VHPuNRyLZiMAmoah7td7ZBHMyaffkqZ74tOIhCcnbzgOERSvYVy9MOVck1o3XvSssghfeCB8tlruZtnjgyP9YaE18TXbkuBN1sznmrypKTUlWM+ZSJsB2PlHJiFeydhSWI5GhnmjidOzdgUT6O/txXTl1nSEIfmzdN0It4SkKDBjBuWO8KvGFG1VABZIUhYv0FuEirLJl9L1RtnScYD4KtZuQ9ntCKxvCQg0YyHx1I+zKRXiUsJIxE8TZgePLWI=";
+		const out = [];
+		const t = (l, f) => { try { const r = f(); out.push([l, 'OK', Buffer.isBuffer(r) ? 'buf:' + JSON.stringify(r.toString()) : JSON.stringify(r)].join(' ')); } catch (e) { out.push([l, 'ERR', e.name, e.code, e.message].join(' ')); } };
+		for (const [n, s] of [['ec', a], ['rsa', b]]) {
+		  t(n + ' verify', () => Certificate.verifySpkac(Buffer.from(s)));
+		  t(n + ' verify str', () => Certificate.verifySpkac(s));
+		  t(n + ' challenge', () => Certificate.exportChallenge(s));
+		  t(n + ' pubkey', () => Certificate.exportPublicKey(Buffer.from(s)));
+		}
+		const bad = a.slice(0, 40) + 'AAAA' + a.slice(44);
+		t('tampered verify', () => Certificate.verifySpkac(Buffer.from(bad)));
+		t('garbage verify', () => Certificate.verifySpkac(Buffer.from('garbage')));
+		t('garbage challenge', () => Certificate.exportChallenge('garbage'));
+		t('garbage pubkey', () => Certificate.exportPublicKey('garbage'));
+		t('enc', () => Certificate.exportChallenge(Buffer.from(a).toString('hex'), 'hex'));
+		t('bad type', () => Certificate.verifySpkac(1));
+		t('bad type2', () => Certificate.exportChallenge({}));
+		t('inst', () => { const c = Certificate(); return [typeof c.verifySpkac, c instanceof Certificate, c.exportChallenge(a).toString()]; });
+		t('new inst', () => { const c = new Certificate(); return [Object.keys(c), Object.getOwnPropertyNames(Certificate).sort(), Object.getOwnPropertyNames(Certificate.prototype).sort()]; });
+		t('verify empty', () => Certificate.verifySpkac(Buffer.alloc(0)));
+		const en = (o, k) => Object.getOwnPropertyDescriptor(o, k).enumerable;
+		out.push([en(SubtleCrypto.prototype, "digest"), en(Crypto.prototype, "subtle"), en(CryptoKey.prototype, "usages")].join());
+		const ks = []; for (const k in crypto.subtle) ks.push(k); out.push(ks.join());
+		JSON.stringify(out)
+	`)
+	want := `["ec verify OK true","ec verify str OK true","ec challenge OK buf:\"hello\"","ec pubkey OK buf:\"-----BEGIN PUBLIC KEY-----\\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEqTGS6x5KNWXQMfWloSnHCsV3QK1B\\n11gH5XqN1E4BJsN2zYM2gGVpOeHWuKRxdMBM5Y3vc9cOX0M7eDtlCEddfQ==\\n-----END PUBLIC KEY-----\\n\"","rsa verify OK true","rsa verify str OK true","rsa challenge OK buf:\"rsa challenge\"","rsa pubkey OK buf:\"-----BEGIN PUBLIC KEY-----\\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwhnu1u2ypHGyu+gHQjSA\\nXy1lYj/KNt4hR5/5KDlfNb6fS3/l4xwdZ4SavMrLBgqc2hzFiHwZ+tZtrAaYZEpE\\nOJXMrfnNnB5sdyfAi5nmY2y+N0X48TEnvh9K1Q78ww1tb1J6sjGCQr0lVRYqhigr\\nbi4NPUrO+pfmPPTpMvmyP548yVh76JQIK6uJJtApGRsRyB9m07bLEDlD8rZ3SsaE\\ndELwmuzHWYDxVN9ku0wq9q6WZXrVfobmnWEE72EarnplxDz/+xKuQhT82EvYB/q+\\npeNbcOsxSYg4O/Szptr8yJEnGbDsiOtwDDU6jEdmA1Tjv3XdUIDJmrGsELKqY1j5\\nhQIDAQAB\\n-----END PUBLIC KEY-----\\n\"","tampered verify OK false","garbage verify OK false","garbage challenge OK \"\"","garbage pubkey OK \"\"","enc OK buf:\"hello\"","bad type ERR TypeError ERR_INVALID_ARG_TYPE The \"spkac\" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received type number (1)","bad type2 ERR TypeError ERR_INVALID_ARG_TYPE The \"spkac\" argument must be of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView. Received an instance of Object","inst OK [\"function\",true,\"hello\"]","new inst OK [[],[\"exportChallenge\",\"exportPublicKey\",\"length\",\"name\",\"prototype\",\"verifySpkac\"],[\"constructor\",\"exportChallenge\",\"exportPublicKey\",\"verifySpkac\"]]","verify empty OK \"\"","true,true,true","encrypt,decrypt,sign,verify,digest,generateKey,deriveKey,deriveBits,importKey,exportKey,wrapKey,unwrapKey,getPublicKey,encapsulateBits,encapsulateKey,decapsulateBits,decapsulateKey"]`
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}

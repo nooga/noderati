@@ -22,7 +22,7 @@ const cryptoModule = {
   diffieHellman, ECDH, createECDH, DiffieHellman, DiffieHellmanGroup,
   createDiffieHellman, createDiffieHellmanGroup, getDiffieHellman,
   checkPrime, checkPrimeSync, generatePrime, generatePrimeSync, encapsulate, decapsulate,
-  X509Certificate,
+  X509Certificate, Certificate,
   // misc
   timingSafeEqual, constants, getFips, setFips, setEngine, secureHeapUsed,
   webcrypto, subtle,
@@ -49,7 +49,7 @@ export {
   diffieHellman, ECDH, createECDH, DiffieHellman, DiffieHellmanGroup,
   createDiffieHellman, createDiffieHellmanGroup, getDiffieHellman,
   checkPrime, checkPrimeSync, generatePrime, generatePrimeSync, encapsulate, decapsulate,
-  X509Certificate,
+  X509Certificate, Certificate,
   timingSafeEqual, constants, getFips, setFips, setEngine, secureHeapUsed,
   webcrypto, subtle,
 };

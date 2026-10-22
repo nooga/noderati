@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -591,14 +592,17 @@ func checkIssued(child, issuer *x509.Certificate) bool {
 }
 
 func (b *cryptoBinding) x509Verify(x *x509Cert, k *asymKey) bool {
-	alg := x.sigAlg()
-	oid := alg.Algorithm.String()
 	var o certOuter
 	if _, err := asn1.Unmarshal(x.c.Raw, &o); err != nil {
 		return false
 	}
-	sig := o.Sig.RightAlign()
-	tbs := x.c.RawTBSCertificate
+	return b.verifySigAlg(k, o.SigAlg, x.c.RawTBSCertificate, o.Sig.RightAlign())
+}
+
+// verifySigAlg checks an X.509-style signature (AlgorithmIdentifier +
+// signature over tbs) with k.
+func (b *cryptoBinding) verifySigAlg(k *asymKey, alg pkix.AlgorithmIdentifier, tbs, sig []byte) bool {
+	oid := alg.Algorithm.String()
 	if oid == "1.2.840.113549.1.1.10" {
 		if k.rsaPublic() == nil {
 			return false
@@ -732,7 +736,74 @@ func parseX509(data []byte) (*x509.Certificate, error) {
 	return c, nil
 }
 
+type spkacASN struct {
+	PKAC   asn1.RawValue
+	SigAlg pkix.AlgorithmIdentifier
+	Sig    asn1.BitString
+}
+
+type pkacASN struct {
+	SPKI      asn1.RawValue
+	Challenge string `asn1:"ia5"`
+}
+
+// parseSPKAC decodes a base64 Netscape SPKAC.
+func parseSPKAC(data []byte) (*spkacASN, *pkacASN, bool) {
+	clean := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\n' || r == '\r' || r == '\t' {
+			return -1
+		}
+		return r
+	}, string(data))
+	der, err := base64.StdEncoding.DecodeString(clean)
+	if err != nil {
+		if der, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(clean, "=")); err != nil {
+			return nil, nil, false
+		}
+	}
+	var s spkacASN
+	if rest, err := asn1.Unmarshal(der, &s); err != nil || len(rest) > 0 {
+		return nil, nil, false
+	}
+	var p pkacASN
+	if _, err := asn1.Unmarshal(s.PKAC.FullBytes, &p); err != nil {
+		return nil, nil, false
+	}
+	return &s, &p, true
+}
+
 func (b *cryptoBinding) installX509() {
+	// spkac(op, bytes): op is "verify", "challenge" or "pubkey".
+	b.fn("spkac", func(args []vm.Value) (vm.Value, error) {
+		data := b.bytesArg(args, 1)
+		op := strArg(args, 0)
+		if len(data) == 0 {
+			return vm.NewString(""), nil
+		}
+		s, p, ok := parseSPKAC(data)
+		switch op {
+		case "verify":
+			if !ok {
+				return vm.False, nil
+			}
+			k, err := parseSPKI(p.SPKI.FullBytes)
+			return vm.BooleanValue(err == nil && b.verifySigAlg(k, s.SigAlg, s.PKAC.FullBytes, s.Sig.RightAlign())), nil
+		case "challenge":
+			if !ok {
+				return vm.NewString(""), nil
+			}
+			return b.buf([]byte(p.Challenge)), nil
+		case "pubkey":
+			if !ok {
+				return vm.NewString(""), nil
+			}
+			if _, err := parseSPKI(p.SPKI.FullBytes); err != nil {
+				return vm.NewString(""), nil
+			}
+			return b.buf(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: p.SPKI.FullBytes})), nil
+		}
+		return vm.Undefined, nil
+	})
 	b.fn("isIPv6", func(args []vm.Value) (vm.Value, error) {
 		s := strArg(args, 0)
 		ip := net.ParseIP(s)

@@ -161,6 +161,37 @@ function legacyInfoAccess(pairs) {
   return o;
 }
 
+// ---- Certificate (SPKAC) -----------------------------------------------------------
+
+function spkacArg(spkac, encoding) {
+  if (typeof spkac !== "string" && !isAnyArrayBuffer(spkac) && !isArrayBufferView(spkac)) {
+    throw errInvalidArgType("spkac", "of type string or an instance of ArrayBuffer, Buffer, TypedArray, or DataView", spkac);
+  }
+  return getArrayBufferOrView(spkac, "spkac", encoding);
+}
+
+function certVerifySpkac(spkac, encoding) {
+  return binding.spkac("verify", spkacArg(spkac, encoding));
+}
+
+function certExportPublicKey(spkac, encoding) {
+  return binding.spkac("pubkey", spkacArg(spkac, encoding));
+}
+
+function certExportChallenge(spkac, encoding) {
+  return binding.spkac("challenge", spkacArg(spkac, encoding));
+}
+
+function Certificate() {
+  if (!new.target) return new Certificate();
+}
+Certificate.prototype.verifySpkac = certVerifySpkac;
+Certificate.prototype.exportPublicKey = certExportPublicKey;
+Certificate.prototype.exportChallenge = certExportChallenge;
+Certificate.exportChallenge = certExportChallenge;
+Certificate.exportPublicKey = certExportPublicKey;
+Certificate.verifySpkac = certVerifySpkac;
+
 function isIPString(s) {
   if (/^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(s)) return true;
   if (s.indexOf(":") === -1) return false;
