@@ -2,9 +2,9 @@ package host
 
 import (
 	"context"
-	"errors"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"net"
 	"net/http"

@@ -2,9 +2,9 @@ package host
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"log"
-	"crypto/tls"
 	"maps"
 	"net"
 	"net/http"
