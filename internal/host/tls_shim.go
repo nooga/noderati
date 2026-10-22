@@ -707,6 +707,13 @@ function createServer(options, listener) {
   return new Server(options, listener);
 }
 
+
+// paserati: a subclass inherits its parent's name when the parent's name
+// was set with defineProperty (EventEmitter's is) - pin our own names.
+Object.defineProperty(TLSSocket, "name", { value: "TLSSocket", configurable: true });
+Object.defineProperty(Server, "name", { value: "Server", configurable: true });
+Object.defineProperty(SecureContext, "name", { value: "SecureContext", configurable: true });
+
 const tlsModule = {
   CLIENT_RENEG_LIMIT, CLIENT_RENEG_WINDOW,
   SecureContext, Server, TLSSocket, checkServerIdentity, connect, convertALPNProtocols,

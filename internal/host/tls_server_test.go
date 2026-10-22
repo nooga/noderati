@@ -114,3 +114,98 @@ TLSv1.2,TLSv1.3,auto,true,true,true`
 		t.Errorf("mismatch\n got: %s\nwant: %s", got, want)
 	}
 }
+
+// TestHTTPClientServerAndHTTPSMatchNode: expected output captured from real node v26 running the same
+// script against an equivalent certificate.
+func TestHTTPClientServerAndHTTPSMatchNode(t *testing.T) {
+	dir := writeTestCertPEM(t)
+	got := runScriptString(t, strings.ReplaceAll(`import http from "node:http";
+import https from "node:https";
+import net from "node:net";
+import fs from "node:fs";
+const dir = "__DIR__";
+const key = fs.readFileSync(dir + "/key.pem"), cert = fs.readFileSync(dir + "/cert.pem");
+const out = [];
+const handler = (req, res) => {
+  let body = "";
+  req.on("data", (d) => { body += d; });
+  req.on("end", () => {
+    res.setHeader("X-Got", [req.method, req.url, req.headers["x-multi"], req.headers.host === undefined ? "nohost" : "host"].join(" "));
+    res.end("body:" + body);
+  });
+};
+const srv = http.createServer(handler);
+out.push([srv instanceof http.Server, srv instanceof net.Server, srv.keepAliveTimeout, srv.headersTimeout, srv.requestTimeout].join(","));
+await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+const port = srv.address().port;
+const req = http.request({ port, host: "127.0.0.1", method: "POST", path: "/p?q=1", headers: { "X-Multi": ["a", "b"] } });
+out.push([req.headersSent, req.getHeader("host") === "127.0.0.1:" + port].join(","));
+req.write(Buffer.from("he"));
+out.push(req.headersSent);
+try { req.setHeader("x-late", "1"); } catch (e) { out.push(e.code); }
+const res = await new Promise((r) => { req.on("response", r); req.end("llo"); });
+let body = "";
+res.setEncoding("utf8");
+for await (const c of res) body += c;
+out.push([res.statusCode, res.headers["x-got"], body, req.res === res, req.finished].join(","));
+const closed = await new Promise((r) => (req._closed ? r(true) : req.on("close", () => r(true))));
+out.push("req close " + closed);
+// get with URL string
+const body2 = await new Promise((r) => http.get("http://127.0.0.1:" + port + "/g", (res) => { let b = ""; res.on("data", (d) => (b += d)); res.on("end", () => r(b)); }));
+out.push(body2);
+await new Promise((r) => srv.getConnections((e, n) => { out.push("conns:" + (e === null) + ":" + (typeof n)); r(); }));
+srv.closeAllConnections();
+await new Promise((r) => srv.close(r));
+// errors
+const e1 = await new Promise((r) => http.get({ port: 1, host: "127.0.0.1" }).on("error", r));
+out.push([e1.code, e1.message, e1.syscall, e1.address, e1.port].join(","));
+const r2 = http.get({ port: 1, host: "127.0.0.1" });
+const e2 = await new Promise((r) => { r2.on("error", r); r2.destroy(); });
+out.push([e2.code, e2.message].join(","));
+const r3 = http.get({ port: 1, host: "127.0.0.1" });
+let abortEv = false;
+r3.on("abort", () => { abortEv = true; });
+r3.on("error", (e) => out.push("abort error " + e.code));
+r3.abort();
+await new Promise((r) => r3.on("close", r));
+out.push(["aborted", r3.aborted, abortEv, r3.destroyed].join(","));
+try { http.request({ path: "/a b" }); } catch (e) { out.push(e.code); }
+try { http.request({ protocol: "https:" }); } catch (e) { out.push(e.code + ":" + e.message); }
+// https
+const hs = https.createServer({ key, cert }, (req, res) => res.end("secure:" + req.url));
+out.push([hs instanceof https.Server, hs instanceof http.Server].join(","));
+await new Promise((r) => hs.listen(0, "127.0.0.1", r));
+const sbody = await new Promise((r, j) => https.get({ host: "127.0.0.1", port: hs.address().port, path: "/s", ca: cert, servername: "localhost" }, (res) => { let b = ""; res.on("data", (d) => (b += d)); res.on("end", () => r(b)); }).on("error", j));
+out.push(sbody);
+const se = await new Promise((r) => https.get({ host: "127.0.0.1", port: hs.address().port }).on("error", r));
+out.push(se.code);
+await new Promise((r) => hs.close(r));
+// EADDRINUSE on http server
+const a = http.createServer();
+await new Promise((r) => a.listen(0, "127.0.0.1", r));
+const ee = await new Promise((r) => http.createServer().on("error", r).listen(a.address().port, "127.0.0.1"));
+out.push([ee.code, ee.syscall].join(","));
+a.close();
+out.join("\n")
+`, "__DIR__", dir))
+	want := `true,true,5000,60000,300000
+false,true
+true
+ERR_HTTP_HEADERS_SENT
+200,POST /p?q=1 a, b host,body:hello,true,true
+req close true
+body:
+conns:true:number
+ECONNREFUSED,connect ECONNREFUSED 127.0.0.1:1,connect,127.0.0.1,1
+ECONNRESET,socket hang up
+aborted,true,true,true
+ERR_UNESCAPED_CHARACTERS
+ERR_INVALID_PROTOCOL:Protocol "https:" not supported. Expected "http:"
+true,false
+secure:/s
+DEPTH_ZERO_SELF_SIGNED_CERT
+EADDRINUSE,listen`
+	if got != want {
+		t.Errorf("mismatch\n got: %s\nwant: %s", got, want)
+	}
+}

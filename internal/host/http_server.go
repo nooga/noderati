@@ -2,12 +2,17 @@ package host
 
 import (
 	"context"
+	"io"
+	"log"
+	"crypto/tls"
 	"maps"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/nooga/paserati/pkg/driver"
 	"github.com/nooga/paserati/pkg/runtime"
@@ -83,12 +88,104 @@ type httpServerState struct {
 	listener  net.Listener
 	goSrv     *http.Server
 	listening bool
+
+	tlsConf  *tls.Config                 // non-nil for https.Server
+	conns    map[net.Conn]http.ConnState // live connections (ConnState hook)
+	maxHdr   int
+	unrefed  bool
+	opHeld   bool
+	pipeName string
 }
 
-func doHTTPCreateServer(vmInst *vm.VM, requestListener vm.Value) vm.Value {
+func (s *httpServerState) trackConn(c net.Conn, st http.ConnState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conns == nil {
+		s.conns = map[net.Conn]http.ConnState{}
+	}
+	switch st {
+	case http.StateClosed, http.StateHijacked:
+		delete(s.conns, c)
+	default:
+		s.conns[c] = st
+	}
+}
+
+func (s *httpServerState) closeConns(idleOnly bool) {
+	s.mu.Lock()
+	var victims []net.Conn
+	for c, st := range s.conns {
+		if !idleOnly || st == http.StateIdle || st == http.StateNew {
+			if idleOnly && st == http.StateNew {
+				continue
+			}
+			victims = append(victims, c)
+		}
+	}
+	s.mu.Unlock()
+	for _, c := range victims {
+		_ = c.Close()
+	}
+}
+
+func (s *httpServerState) setOpLocked(want bool) {
+	if want == s.opHeld {
+		return
+	}
+	s.opHeld = want
+	if want {
+		s.rt.BeginExternalOp()
+	} else {
+		s.rt.EndExternalOp()
+	}
+}
+
+func numProp(obj *vm.PlainObject, name string) (float64, bool) {
+	v, ok := obj.Get(name)
+	if !ok || !v.IsNumber() {
+		return 0, false
+	}
+	return v.ToFloat(), true
+}
+
+func doHTTPCreateServer(vmInst *vm.VM, requestListener vm.Value, opts *vm.PlainObject) vm.Value {
 	obj := newEventEmitterObject(vmInst)
 	self := vm.NewValueFromPlainObject(obj)
 	srv := &httpServerState{vmInst: vmInst, rt: vmInst.GetAsyncRuntime(), obj: obj, self: self}
+	srv.maxHdr = getIntOpt(opts, "maxHeaderSize", 0)
+	if opts != nil {
+		if v, ok := opts.GetOwn("secureContext"); ok {
+			if ctx := secureCtxFromValue(v); ctx != nil {
+				conf := &tls.Config{Certificates: ctx.certs, NextProtos: []string{"http/1.1"}}
+				if getBoolOpt(opts, "requestCert", false) {
+					conf.ClientAuth = tls.RequestClientCert
+					if getBoolOpt(opts, "rejectUnauthorized", true) {
+						conf.ClientAuth = tls.RequireAndVerifyClientCert
+						conf.ClientCAs = ctx.roots
+					}
+				}
+				srv.tlsConf = conf
+			}
+		}
+	}
+	obj.SetOwn("getConnections", vm.NewNativeFunction(1, false, "getConnections", func(args []vm.Value) (vm.Value, error) {
+		srv.mu.Lock()
+		n := len(srv.conns)
+		srv.mu.Unlock()
+		if len(args) > 0 && args[0].IsCallable() {
+			cb := args[0]
+			srv.rt.ScheduleNextTick(func() { callJSCallback(vmInst, cb, vm.Null, vm.NumberValue(float64(n))) })
+		}
+		return self, nil
+	}))
+	obj.SetOwn("closeAllConnections", vm.NewNativeFunction(0, false, "closeAllConnections", func(_ []vm.Value) (vm.Value, error) {
+		srv.closeConns(false)
+		return vm.Undefined, nil
+	}))
+	obj.SetOwn("closeIdleConnections", vm.NewNativeFunction(0, false, "closeIdleConnections", func(_ []vm.Value) (vm.Value, error) {
+		srv.closeConns(true)
+		return vm.Undefined, nil
+	}))
 
 	if requestListener.IsCallable() {
 		addListener(vmInst, obj, "request", requestListener, false, false)
@@ -114,9 +211,13 @@ func doHTTPCreateServer(vmInst *vm.VM, requestListener vm.Value) vm.Value {
 	obj.SetOwn("address", vm.NewNativeFunction(0, false, "address", func(_ []vm.Value) (vm.Value, error) {
 		srv.mu.Lock()
 		l := srv.listener
+		pipe := srv.pipeName
 		srv.mu.Unlock()
 		if l == nil {
 			return vm.Null, nil
+		}
+		if pipe != "" {
+			return vm.NewString(pipe), nil
 		}
 		return addrObject(vmInst, l.Addr()), nil
 	}))
@@ -124,9 +225,30 @@ func doHTTPCreateServer(vmInst *vm.VM, requestListener vm.Value) vm.Value {
 	// own test harnesses and most app frameworks never call them), kept as
 	// honest no-ops/self-returns rather than left missing entirely, same
 	// spirit as socketObj's cork/uncork in net.go.
-	obj.SetOwn("setTimeout", vm.NewNativeFunction(2, false, "setTimeout", func(_ []vm.Value) (vm.Value, error) { return self, nil }))
-	obj.SetOwn("ref", vm.NewNativeFunction(0, false, "ref", func(_ []vm.Value) (vm.Value, error) { return self, nil }))
-	obj.SetOwn("unref", vm.NewNativeFunction(0, false, "unref", func(_ []vm.Value) (vm.Value, error) { return self, nil }))
+	obj.SetOwn("setTimeout", vm.NewNativeFunction(2, false, "setTimeout", func(args []vm.Value) (vm.Value, error) {
+		for _, a := range args {
+			if a.IsNumber() {
+				obj.SetOwn("timeout", a)
+			} else if a.IsCallable() {
+				addListener(vmInst, obj, "timeout", a, false, false)
+			}
+		}
+		return self, nil
+	}))
+	obj.SetOwn("ref", vm.NewNativeFunction(0, false, "ref", func(_ []vm.Value) (vm.Value, error) {
+		srv.mu.Lock()
+		srv.unrefed = false
+		srv.setOpLocked(srv.listening)
+		srv.mu.Unlock()
+		return self, nil
+	}))
+	obj.SetOwn("unref", vm.NewNativeFunction(0, false, "unref", func(_ []vm.Value) (vm.Value, error) {
+		srv.mu.Lock()
+		srv.unrefed = true
+		srv.setOpLocked(false)
+		srv.mu.Unlock()
+		return self, nil
+	}))
 
 	return self
 }
@@ -142,32 +264,38 @@ func doHTTPCreateServer(vmInst *vm.VM, requestListener vm.Value) vm.Value {
 func (s *httpServerState) doListen(args []vm.Value) vm.Value {
 	port := 0
 	host := ""
+	path := ""
 	var cb vm.Value = vm.Undefined
-	for _, a := range args {
+	for i, a := range args {
 		switch {
 		case a.IsNumber():
-			port = int(a.ToFloat())
+			if i == 0 {
+				port = int(a.ToFloat())
+			}
 		case a.IsCallable():
 			cb = a
 		case a.IsString():
 			str := a.ToString()
-			if n, err := strconv.Atoi(str); err == nil {
+			if n, err := strconv.Atoi(str); err == nil && i == 0 {
 				port = n
+			} else if i == 0 {
+				path = str
 			} else {
 				host = str
 			}
 		default:
-			// AsPlainObject() panics on anything but TypeObject exactly
-			// (unlike AsTypedArray's own nil-safe check) - a bare
-			// Type()==vm.TypeObject guard is required before calling it on
-			// a value of unknown, caller-supplied shape.
-			if a.Type() == vm.TypeObject {
+			if a.Type() == vm.TypeObject && i == 0 {
 				o := a.AsPlainObject()
 				if v, ok := o.GetOwn("port"); ok && v.IsNumber() {
 					port = int(v.ToFloat())
+				} else if ok && v.IsString() {
+					port, _ = strconv.Atoi(v.ToString())
 				}
 				if v, ok := o.GetOwn("host"); ok && v.IsString() {
 					host = v.ToString()
+				}
+				if v, ok := o.GetOwn("path"); ok && v.IsString() {
+					path = v.ToString()
 				}
 			}
 		}
@@ -177,28 +305,66 @@ func (s *httpServerState) doListen(args []vm.Value) vm.Value {
 		addListener(s.vmInst, s.obj, "listening", cb, true, false)
 	}
 
-	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	ln, err := net.Listen("tcp", addr)
+	var ln net.Listener
+	var err error
+	errAddr := host
+	if path != "" {
+		ln, err = net.Listen("unix", path)
+		errAddr = path
+	} else {
+		if host == "localhost" {
+			host = "127.0.0.1"
+		}
+		ln, err = net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+		if errAddr == "" {
+			errAddr = "::"
+		}
+	}
 	if err != nil {
+		info := netErrInfo(err, "listen")
+		if info.code == "UNKNOWN" && strings.Contains(err.Error(), "address already in use") {
+			info = &netErrorInfo{code: "EADDRINUSE", errno: -int(syscall.EADDRINUSE), syscall: "listen"}
+		}
 		s.rt.ScheduleNextTick(func() {
-			emitOnObject(s.vmInst, s.obj, "error", errorValueFromGo(s.vmInst, err))
+			var ev vm.Value
+			if fn := jsNetInternal(s.vmInst, "uvExceptionWithHostPort"); fn.IsCallable() {
+				ev, _ = s.vmInst.Call(fn, vm.Undefined, []vm.Value{info.toValue(s.vmInst), vm.NewString("listen"), vm.NewString(errAddr), vm.NumberValue(float64(port))})
+			}
+			if ev.IsUndefined() {
+				ev = errorValueFromGo(s.vmInst, err)
+			}
+			emitOnObject(s.vmInst, s.obj, "error", ev)
 		})
 		return s.self
 	}
+	if s.tlsConf != nil {
+		ln = tls.NewListener(ln, s.tlsConf)
+	}
 
-	goSrv := &http.Server{Handler: http.HandlerFunc(s.handleRequest)}
+	goSrv := &http.Server{Handler: http.HandlerFunc(s.handleRequest), ConnState: s.trackConn, ErrorLog: log.New(io.Discard, "", 0)}
+	if ms, ok := numProp(s.obj, "headersTimeout"); ok && ms > 0 {
+		goSrv.ReadHeaderTimeout = time.Duration(ms) * time.Millisecond
+	}
+	if ms, ok := numProp(s.obj, "requestTimeout"); ok && ms > 0 {
+		goSrv.ReadTimeout = time.Duration(ms) * time.Millisecond
+	}
+	if ms, ok := numProp(s.obj, "keepAliveTimeout"); ok {
+		if ms > 0 {
+			goSrv.IdleTimeout = time.Duration(ms) * time.Millisecond
+		} else {
+			goSrv.SetKeepAlivesEnabled(false)
+		}
+	}
+	if s.maxHdr > 0 {
+		goSrv.MaxHeaderBytes = s.maxHdr
+	}
 	s.mu.Lock()
 	s.listener = ln
 	s.goSrv = goSrv
 	s.listening = true
+	s.pipeName = path
+	s.setOpLocked(!s.unrefed)
 	s.mu.Unlock()
-
-	// Held for the server's whole listening lifetime - released once
-	// doClose's Shutdown() actually completes, not when close() is merely
-	// called, matching the codebase's existing ref-counting discipline
-	// for "does this keep the process alive" (socketState's own
-	// beginTrackedExternalOp in net.go).
-	s.rt.BeginExternalOp()
 
 	go func() { _ = goSrv.Serve(ln) }()
 
@@ -207,6 +373,20 @@ func (s *httpServerState) doListen(args []vm.Value) vm.Value {
 		emitOnObject(s.vmInst, s.obj, "listening")
 	})
 	return s.self
+}
+
+// jsNetInternal fetches a helper the net shim publishes (error shaping).
+func jsNetInternal(vmInst *vm.VM, name string) vm.Value {
+	gt, ok := vmInst.GetGlobal("globalThis")
+	if !ok {
+		return vm.Undefined
+	}
+	iv, ok := gt.AsPlainObject().Get("__noderatiNetInternals")
+	if !ok || iv.Type() != vm.TypeObject {
+		return vm.Undefined
+	}
+	fn, _ := iv.AsPlainObject().Get(name)
+	return fn
 }
 
 func (s *httpServerState) doClose(cb vm.Value) {
@@ -229,7 +409,9 @@ func (s *httpServerState) doClose(cb vm.Value) {
 
 	go func() {
 		err := goSrv.Shutdown(context.Background())
-		s.rt.EndExternalOp()
+		s.mu.Lock()
+		s.setOpLocked(false)
+		s.mu.Unlock()
 		s.rt.ScheduleNextTick(func() {
 			emitOnObject(s.vmInst, s.obj, "close")
 			if cb.IsCallable() {
@@ -359,10 +541,33 @@ func buildServerIncomingMessage(vmInst *vm.VM, r *http.Request, socketSelf vm.Va
 	obj.SetOwn("httpVersionMinor", vm.NumberValue(float64(minor)))
 
 	headersObj := vm.NewObject(vmInst.ObjectPrototype).AsPlainObject()
+	raw := vm.NewArray()
+	if r.Host != "" {
+		// net/http lifts Host out of the header map; node keeps it there.
+		headersObj.SetOwn("host", vm.NewString(r.Host))
+		raw.AsArray().Append(vm.NewString("Host"))
+		raw.AsArray().Append(vm.NewString(r.Host))
+	}
 	for k, vs := range r.Header {
-		headersObj.SetOwn(strings.ToLower(k), vm.NewString(strings.Join(vs, ", ")))
+		lk := strings.ToLower(k)
+		if lk == "set-cookie" {
+			arr := vm.NewArray()
+			for _, v := range vs {
+				arr.AsArray().Append(vm.NewString(v))
+			}
+			headersObj.SetOwn(lk, arr)
+		} else {
+			headersObj.SetOwn(lk, vm.NewString(strings.Join(vs, ", ")))
+		}
+		for _, v := range vs {
+			raw.AsArray().Append(vm.NewString(k))
+			raw.AsArray().Append(vm.NewString(v))
+		}
 	}
 	obj.SetOwn("headers", vm.NewValueFromPlainObject(headersObj))
+	if _, ok := obj.GetOwn("rawHeaders"); !ok {
+		obj.SetOwn("rawHeaders", raw)
+	}
 
 	obj.SetOwn("socket", socketSelf)
 	obj.SetOwn("connection", socketSelf)
@@ -642,7 +847,14 @@ func declareHTTPCreateServerNative(vmInst *vm.VM, obj *vm.PlainObject) {
 				break
 			}
 		}
-		return doHTTPCreateServer(vmInst, requestListener), nil
+		var opts *vm.PlainObject
+		for _, a := range args {
+			if a.Type() == vm.TypeObject && !a.IsCallable() {
+				opts = a.AsPlainObject()
+				break
+			}
+		}
+		return doHTTPCreateServer(vmInst, requestListener, opts), nil
 	}))
 }
 

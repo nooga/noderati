@@ -1256,6 +1256,14 @@ const Stream = Socket;
 const createConnection = connect;
 const _normalizeArgs = normalizeArgs;
 
+
+// paserati: a subclass inherits its parent's name when the parent's name
+// was set with defineProperty (EventEmitter's is) - pin our own names.
+Object.defineProperty(Socket, "name", { value: "Socket", configurable: true });
+Object.defineProperty(Server, "name", { value: "Server", configurable: true });
+Object.defineProperty(BlockList, "name", { value: "BlockList", configurable: true });
+Object.defineProperty(SocketAddress, "name", { value: "SocketAddress", configurable: true });
+
 globalThis.__noderatiNetInternals = {
   errnoException, exceptionWithHostPort, uvExceptionWithHostPort, makeErr, validatePort, ERR_INVALID_ARG_TYPE,
   ERR_INVALID_ARG_VALUE, validateString, validateFunction, validateBoolean, validateNumber, validateInt32,
