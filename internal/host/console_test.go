@@ -32,19 +32,16 @@ func TestConsoleShimCustomStream(t *testing.T) {
 	}
 }
 
-func TestConsoleShimFallsBackToGlobalConsole(t *testing.T) {
-	p := New([]string{"noderati"})
-	p.SetSkipTypeCheck(true)
-	val, errs := p.RunCode(`
+// As in Node, a Console needs a writable stream.
+func TestConsoleRequiresWritableStream(t *testing.T) {
+	got := runScriptString(t, `
 		import { Console } from "node:console";
-		const logger = new Console({});
-		typeof logger.log === "function"
-	`, driver.RunOptions{})
-	if len(errs) > 0 {
-		t.Fatalf("RunCode: %v", errs[0])
-	}
-	if !val.IsTruthy() {
-		t.Error("expected a Console constructed with no stream to still have a callable .log")
+		let msg;
+		try { new Console({}); } catch (e) { msg = e.code + ": " + e.message; }
+		msg
+	`)
+	if want := "ERR_CONSOLE_WRITABLE_STREAM: Console expects a writable stream instance for stdout"; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
