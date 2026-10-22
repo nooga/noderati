@@ -393,6 +393,43 @@ first). It prints per-module coverage and every missing name.
 |---|---|---|---|
 | 2026-10-21 | `09e7904` | — | inventory written |
 | 2026-10-21 | `cb59254` | 559/1310 (42.7%) | Buffer instances complete; `URL` is paserati's (live `searchParams`) |
+| 2026-10-22 | `78c7409` | 578/1310 (44.1%) | real `util.inspect`/`util.format`, console (incl. `table`), util extras |
+| 2026-10-22 | `2e92146` | 658/1310 (50.2%) | fs and fs/promises complete: file streams, `FileHandle`, `Dir`, `glob`, `cp`, constants |
+| 2026-10-22 | `c32cfaf` | 696/1310 (53.1%) | stream rebuilt: full Duplex/Transform, `finished`, `compose`, iterator helpers, `stream/web`, `stream/consumers` |
+| 2026-10-22 | `0486f31` | 793/1310 (60.5%) | net/tls/https servers, Unix sockets, dns resolver API, `node:dgram`; `new net.Socket()` no longer dials |
+| 2026-10-22 | `36f8228` | 922/1310 (70.4%) | real `worker_threads.Worker`; Brotli/Zstd; perf_hooks, async_hooks, v8, vm complete |
+| 2026-10-22 | `261af01` | 1004/1310 (76.6%) | crypto complete (ciphers, KDFs, keys, sign/verify, X509) and Web Crypto |
+
+The per-module gap lists in sections 1-4 above predate these merges; the
+report script is the current source of truth.
+
+### Not merged yet
+
+Branch `worktree-agent-a77b21f1fc0efd6b9` (process, module system, small
+modules) is unfinished. Its last commit is a WIP. It moves the CommonJS
+loader into `node:module`, adds `require(esm)`, subpath-builtin `require`,
+`import.meta.dirname`/`filename`/`resolve`, most missing `process`
+members and exit/beforeExit events, and the missing modules (`sys`,
+`punycode`, `trace_events`, `inspector`, `sea`, `domain`, `cluster`,
+`node:test`, `wasi`, `repl`). Finish it, then merge; expect conflicts in
+`cjs.go`/`lazy_jsmodule.go` with the stream merge.
+
+### Known open issues
+
+- `process.on("exit")` never fires on normal exit (fixed on the unmerged
+  branch above).
+- `process.nextTick` queued inside a promise callback runs before the rest
+  of the microtask queue (noderati's scheduler, not paserati).
+- Loading `node:stream` costs ~40-60 ms (was ~9 ms); `util.inspect` ~10 ms
+  on first use.
+- Web Crypto lacks ML-DSA, ML-KEM, ChaCha20-Poly1305, Ed448/X448, AES-OCB,
+  KMAC.
+- `worker_threads`: `SHARE_ENV` copies rather than shares; MessagePorts
+  can't be transferred to a worker; worker stdout isn't piped through the
+  parent.
+- http server runs on Go's `net/http`: `maxRequestsPerSocket` isn't
+  enforced, `_connectionListener` throws; `http.WebSocket` is undefined.
+- Several files under `internal/host` aren't `gofmt`-clean.
 
 Found since the inventory, not visible to a name-only probe:
 
@@ -407,3 +444,39 @@ Found since the inventory, not visible to a name-only probe:
   lack `code: 'ERR_INVALID_URL'`, non-ASCII in the query isn't
   percent-encoded, `%7e` gets decoded to `~`, and `..` pops a `file:`
   URL's Windows drive letter.
+
+### paserati bugs found while filling gaps
+
+Each is a one-line repro; noderati works around most of them.
+
+- `instanceof` ignores `Symbol.hasInstance` (hit by four areas; makes
+  `duplex instanceof Writable` false).
+- A subclass inherits a parent `name` set via `defineProperty`:
+  `class P{}; Object.defineProperty(P,"name",{value:"Z"}); class R extends P{}; R.name`
+  is `"Z"`.
+- `Error.captureStackTrace`/`error.stack` lack the `Name: message` first
+  line; `return f()` drops the caller's frame.
+- `for (const {0:k,1:v} of new Map([[1,2]]))` binds `k=false`.
+- `"a\nb".split(/(?<=\n)/)` crashes the VM (slice bounds out of range).
+- `Number.parseInt('12.5')` is `NaN` (global `parseInt` is fine).
+- `Object.defineProperties(o, {[sym]: {value: 1}})` ignores symbol keys.
+- Accessors defined on native functions read back `undefined`;
+  `Reflect.set` doesn't call a setter on a function.
+- `[...{*[Symbol.iterator](){yield 1}}]` throws "Iterator is not an object".
+- Methods get a `prototype` own property.
+- `AggregateError#errors` is enumerable.
+- A lone surrogate in a string literal doesn't match `/[\ud800-\udbff]/`.
+- for-in on a function skips inherited properties.
+- Throwing in a `for await` body reaches `catch` before the async
+  generator's `finally` runs.
+- `JSON.stringify(await rs.getReader().read())` is `{}`.
+- `function f(){return o.m(...mk())}` returns the spread array.
+- `ArrayBuffer.isView(new DataView(new ArrayBuffer(1)))` is `false`.
+- `Object.setPrototypeOf(A, Transform)` changes `A.length`.
+- `Uint8Array.from(new Uint8Array([1,2])).length` is `0`.
+- `DefaultAsyncRuntime.WaitForExternalOp` can miss a wakeup from another
+  goroutine.
+- 32-bit builds fail: `0xFFFFFFFE` overflows `int` (`vm/object.go:1445`,
+  `vm/vm.go:9479`).
+- `JSON.stringify` never uses exponent notation (listed above), and the
+  `URL` issues listed above.
