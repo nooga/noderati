@@ -225,6 +225,15 @@ function addAbortListener(signal, listener) {
   };
 }
 
+function normalizeEncoding(enc) {
+  const e = String(enc ?? "utf8").toLowerCase();
+  switch (e) {
+    case "utf8": case "utf-8": case "": return "utf8";
+    case "ucs2": case "ucs-2": case "utf16le": case "utf-16le": return "utf16le";
+    case "latin1": case "binary": return "latin1";
+    default: return e;
+  }
+}
 function isArrayBufferView(v) { return ArrayBuffer.isView(v); }
 function isUint8Array(v) { return v instanceof Uint8Array; }
 function uint8ArrayToBuffer(chunk) {
