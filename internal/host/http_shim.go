@@ -379,6 +379,7 @@ class ClientRequest extends OutgoingMessage {
     this.parser = null;
     this.maxHeadersCount = null;
     this.reusedSocket = false;
+    this.httpValidation = options.httpValidation;
     this.host = host;
     this.protocol = protocol;
     if (this.agent) {
@@ -642,6 +643,22 @@ class Server {
     srv.maxHeadersCount = null;
     srv.maxHeaderSize = options.maxHeaderSize;
     srv.httpAllowHalfOpen = false;
+    // net.Server/http.Server configuration node keeps on the instance.
+    srv.allowHalfOpen = true;
+    srv.noDelay = Boolean(options.noDelay ?? true);
+    srv.keepAlive = Boolean(options.keepAlive);
+    srv.keepAliveInitialDelay = ~~(options.keepAliveInitialDelay / 1000);
+    srv.highWaterMark = options.highWaterMark ?? 65536;
+    srv.pauseOnConnect = !!options.pauseOnConnect;
+    srv.connectionsCheckingInterval = options.connectionsCheckingInterval ?? 30000;
+    srv.httpValidation = options.httpValidation;
+    srv.insecureHTTPParser = options.insecureHTTPParser;
+    srv.joinDuplicateHeaders = options.joinDuplicateHeaders;
+    srv.rejectNonStandardBodyWrites = options.rejectNonStandardBodyWrites ?? false;
+    srv.requireHostHeader = options.requireHostHeader ?? true;
+    srv.shouldUpgradeCallback = options.shouldUpgradeCallback ?? function() {
+      return this.listenerCount('upgrade') > 0;
+    };
     return srv;
   }
   // The native server installs these as own methods; the prototype
@@ -658,6 +675,20 @@ Object.setPrototypeOf(Server.prototype, net.Server.prototype);
 
 function createServer(options, requestListener) {
   return new Server(options, requestListener);
+}
+// The Go transport already routes through HTTP(S)_PROXY/NO_PROXY from the
+// process environment; this validates a proxy env the way node does but
+// can't re-point the transport at a different one.
+function setGlobalProxyFromEnv(env = process.env) {
+  if (env === null || typeof env !== "object" || Array.isArray(env)) throw ERR_INVALID_ARG_TYPE("proxyEnv", "object", env);
+  const httpProxy = env.http_proxy || env.HTTP_PROXY;
+  const httpsProxy = env.https_proxy || env.HTTPS_PROXY;
+  if (!httpProxy && !httpsProxy) return () => {};
+  for (const p of [httpProxy, httpsProxy]) {
+    if (!p) continue;
+    try { new URL(p); } catch { throw makeErr(Error, "ERR_PROXY_INVALID_CONFIG", p); }
+  }
+  return function restore() {};
 }
 function _connectionListener(socket) {
   throw makeErr(Error, "ERR_METHOD_NOT_IMPLEMENTED", "http._connectionListener is not supported in noderati");
@@ -680,12 +711,12 @@ globalThis.__noderatiHTTPInternals = { ClientRequest, Agent, Server, urlToHttpOp
 
 export {
   Agent, ClientRequest, IncomingMessage, METHODS, OutgoingMessage, STATUS_CODES, Server, ServerResponse,
-  _connectionListener, createServer, get, globalAgent, maxHeaderSize, request, setMaxIdleHTTPParsers,
+  _connectionListener, createServer, get, globalAgent, maxHeaderSize, request, setGlobalProxyFromEnv, setMaxIdleHTTPParsers,
   validateHeaderName, validateHeaderValue, WebSocket, MessageEvent, CloseEvent,
 };
 export default {
   Agent, ClientRequest, IncomingMessage, METHODS, OutgoingMessage, STATUS_CODES, Server, ServerResponse,
-  _connectionListener, createServer, get, globalAgent, maxHeaderSize, request, setMaxIdleHTTPParsers,
+  _connectionListener, createServer, get, globalAgent, maxHeaderSize, request, setGlobalProxyFromEnv, setMaxIdleHTTPParsers,
   validateHeaderName, validateHeaderValue, WebSocket, MessageEvent, CloseEvent,
 };
 `

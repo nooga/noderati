@@ -159,3 +159,36 @@ true,function,function,function,65536,65536,false
 		t.Errorf("mismatch\n got: %s\nwant: %s", got, want)
 	}
 }
+
+// TestHTTPServerConfigFieldsAndRequireMatchNode: expected output captured from real node v26 running the same script.
+func TestHTTPServerConfigFieldsAndRequireMatchNode(t *testing.T) {
+	got := runScriptString(t, `import http from "node:http";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const out = [];
+const keys = ["allowHalfOpen", "connectionsCheckingInterval", "highWaterMark", "httpValidation", "insecureHTTPParser", "joinDuplicateHeaders", "keepAlive", "keepAliveInitialDelay", "noDelay", "pauseOnConnect", "rejectNonStandardBodyWrites", "requireHostHeader"];
+const s = http.createServer();
+out.push(keys.map((k) => k + "=" + String(s[k])).join(" "));
+const s2 = http.createServer({ insecureHTTPParser: true, requireHostHeader: false, noDelay: false, keepAlive: true, keepAliveInitialDelay: 5000, highWaterMark: 100, joinDuplicateHeaders: true, connectionsCheckingInterval: 1000, rejectNonStandardBodyWrites: true });
+out.push(keys.map((k) => k + "=" + String(s2[k])).join(" "));
+out.push(String(s.shouldUpgradeCallback()));
+s.on("upgrade", () => {});
+out.push(String(s.shouldUpgradeCallback()));
+out.push(typeof http.setGlobalProxyFromEnv({}));
+try { http.setGlobalProxyFromEnv({ HTTP_PROXY: "not a url" }); } catch (e) { out.push(e.code + " " + e.message); }
+try { http.setGlobalProxyFromEnv(5); } catch (e) { out.push(e.code); }
+out.push(typeof require("dgram").createSocket + " " + typeof require("node:dns/promises").resolve4);
+out.join("\n")
+`)
+	want := `allowHalfOpen=true connectionsCheckingInterval=30000 highWaterMark=65536 httpValidation=undefined insecureHTTPParser=undefined joinDuplicateHeaders=undefined keepAlive=false keepAliveInitialDelay=0 noDelay=true pauseOnConnect=false rejectNonStandardBodyWrites=false requireHostHeader=true
+allowHalfOpen=true connectionsCheckingInterval=1000 highWaterMark=100 httpValidation=undefined insecureHTTPParser=true joinDuplicateHeaders=true keepAlive=true keepAliveInitialDelay=5 noDelay=false pauseOnConnect=false rejectNonStandardBodyWrites=true requireHostHeader=false
+false
+true
+function
+ERR_PROXY_INVALID_CONFIG not a url
+ERR_INVALID_ARG_TYPE
+function function`
+	if got != want {
+		t.Errorf("mismatch\n got: %s\nwant: %s", got, want)
+	}
+}

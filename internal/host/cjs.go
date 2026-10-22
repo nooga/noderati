@@ -61,6 +61,8 @@ var nativeRequireNames = map[string]bool{
 	"timers":          true,
 	"timers/promises": true,
 	"dns":             true,
+	"dns/promises":    true,
+	"dgram":           true,
 	"zlib":            true,
 	"util/types":      true,
 	// http2 (declareHTTP2, round 94) added directly here too, same
