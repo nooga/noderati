@@ -191,6 +191,9 @@ func (p *ProcessInitializer) InitRuntime(ctx *builtins.RuntimeContext) error {
 		if len(args) > 0 && args[0].IsNumber() {
 			code = int(args[0].ToFloat())
 		}
+		if workerProcessExit(vmInstance, code) {
+			return vm.Undefined, nil
+		}
 		os.Exit(code)
 		return vm.Undefined, nil
 	}))

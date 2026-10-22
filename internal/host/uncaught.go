@@ -38,7 +38,7 @@ var osExit = os.Exit
 // pulling #484 - the crash never reached webpack because it never went
 // through paserati's fixed code path.
 func reportUncaughtCallbackException(vmInst *vm.VM, err error) {
-	if err == nil {
+	if err == nil || workerUncaught(vmInst, err) {
 		return
 	}
 	fmt.Fprintln(os.Stderr, vmInst.FormatUncaughtCallError(err))
