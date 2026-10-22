@@ -15,6 +15,7 @@ const cryptoModule = {
   pbkdf2, pbkdf2Sync, scrypt, scryptSync, hkdf, hkdfSync, argon2, argon2Sync,
   // keys
   KeyObject, createSecretKey, createPublicKey, createPrivateKey,
+  Cipheriv, Decipheriv, createCipheriv, createDecipheriv, getCiphers, getCipherInfo,
   // misc
   timingSafeEqual, constants, getFips, setFips, setEngine, secureHeapUsed,
   webcrypto, subtle,
@@ -34,6 +35,7 @@ export {
   getRandomValues, pseudoRandomBytes, prng, rng,
   pbkdf2, pbkdf2Sync, scrypt, scryptSync, hkdf, hkdfSync, argon2, argon2Sync,
   KeyObject, createSecretKey, createPublicKey, createPrivateKey,
+  Cipheriv, Decipheriv, createCipheriv, createDecipheriv, getCiphers, getCipherInfo,
   timingSafeEqual, constants, getFips, setFips, setEngine, secureHeapUsed,
   webcrypto, subtle,
 };

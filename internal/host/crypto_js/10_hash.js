@@ -14,11 +14,7 @@ function errHashFinalized() {
 }
 
 function hashUpdateData(data, encoding) {
-  if (typeof data === "string") return Buffer.from(data, normalizeEncoding(encoding) || "utf8");
-  if (!isArrayBufferView(data)) {
-    throw errInvalidArgType("data", "of type string or an instance of Buffer, TypedArray, or DataView", data);
-  }
-  return toU8(data);
+  return decodeInput(data, encoding);
 }
 
 function Hash(algorithm, options) {
@@ -34,8 +30,7 @@ function Hash(algorithm, options) {
   self[kState] = { finalized: false };
   return self;
 }
-Object.setPrototypeOf(Hash.prototype, Transform.prototype);
-Object.setPrototypeOf(Hash, Transform);
+inheritStream(Hash, Transform);
 
 Hash.prototype.copy = function copy(options) {
   if (this[kState].finalized) throw errHashFinalized();
@@ -75,8 +70,7 @@ function Hmac(hmac, key, options) {
   self[kState] = { finalized: false };
   return self;
 }
-Object.setPrototypeOf(Hmac.prototype, Transform.prototype);
-Object.setPrototypeOf(Hmac, Transform);
+inheritStream(Hmac, Transform);
 
 Hmac.prototype.update = Hash.prototype.update;
 

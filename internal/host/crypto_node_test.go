@@ -73,3 +73,58 @@ func TestCryptoRandomKDFParity(t *testing.T) {
 		t.Errorf("got  %s\nwant %s", got, want)
 	}
 }
+func TestCryptoCipherParity(t *testing.T) {
+	got := runScriptString(t, `
+		import crypto from "node:crypto";
+		const out = {};
+		const msg = "The quick brown fox jumps over the lazy dog";
+		out.modes = [];
+		for (const m of ["cbc", "ecb", "ctr", "cfb", "cfb8", "cfb1", "ofb", "gcm"]) {
+		  const name = "aes-192-" + m;
+		  const key = Buffer.alloc(24, 7);
+		  const iv = m === "ecb" ? null : Buffer.alloc(m === "gcm" ? 12 : 16, 9);
+		  const c = crypto.createCipheriv(name, key, iv);
+		  if (m === "gcm") c.setAAD(Buffer.from("aad"));
+		  const ct = Buffer.concat([c.update(msg.slice(0, 10)), c.update(msg.slice(10)), c.final()]);
+		  const tag = m === "gcm" ? c.getAuthTag() : null;
+		  const d = crypto.createDecipheriv(name, key, iv);
+		  if (tag) { d.setAAD(Buffer.from("aad")); d.setAuthTag(tag); }
+		  const pt = d.update(ct, undefined, "utf8") + d.final("utf8");
+		  out.modes.push(ct.toString("base64") + (tag ? ":" + tag.toString("hex") : "") + (pt === msg ? "" : " MISMATCH"));
+		}
+		const ccm = crypto.createCipheriv("aes-128-ccm", Buffer.alloc(16, 1), Buffer.alloc(11, 2), { authTagLength: 12 });
+		ccm.setAAD(Buffer.from("hdr"), { plaintextLength: msg.length });
+		out.ccm = ccm.update(msg, "utf8", "hex") + ccm.final("hex") + ":" + ccm.getAuthTag().toString("hex");
+		const cp = crypto.createCipheriv("chacha20-poly1305", Buffer.alloc(32, 1), Buffer.alloc(12, 2), { authTagLength: 16 });
+		out.chachaPoly = cp.update(msg, "utf8", "base64url") + cp.final("base64url") + ":" + cp.getAuthTag().toString("hex");
+		const ch = crypto.createCipheriv("chacha20", Buffer.alloc(32, 3), Buffer.alloc(16, 4));
+		out.chacha = ch.update(msg, "utf8", "hex") + ch.final("hex");
+		out.wrap = crypto.createCipheriv("id-aes256-wrap", Buffer.alloc(32, 1), Buffer.from("a6a6a6a6a6a6a6a6", "hex")).update(Buffer.alloc(24, 5)).toString("hex");
+		out.wrapPad = crypto.createCipheriv("aes128-wrap-pad", Buffer.alloc(16, 1), Buffer.from("a65959a6", "hex")).update(Buffer.alloc(13, 5)).toString("hex");
+		const des = crypto.createCipheriv("des-ede3-cbc", Buffer.alloc(24, 1), Buffer.alloc(8, 2));
+		out.des3 = des.update(msg, "utf8", "hex") + des.final("hex");
+		out.errs = [
+		  () => crypto.createCipheriv("aes-128-cbc", Buffer.alloc(5), Buffer.alloc(16)),
+		  () => crypto.createCipheriv("aes-128-cbc", Buffer.alloc(16), Buffer.alloc(5)),
+		  () => crypto.createCipheriv("nope", Buffer.alloc(16), Buffer.alloc(16)),
+		  () => crypto.createCipheriv("aes-128-ccm", Buffer.alloc(16), Buffer.alloc(12)),
+		  () => { const d = crypto.createDecipheriv("aes-128-cbc", Buffer.alloc(16), Buffer.alloc(16)); d.update(Buffer.alloc(16)); d.final(); },
+		  () => { const c = crypto.createCipheriv("aes-128-cbc", Buffer.alloc(16), Buffer.alloc(16)); c.setAutoPadding(false); c.update("abc"); c.final(); },
+		  () => { const d = crypto.createDecipheriv("aes-128-gcm", Buffer.alloc(16), Buffer.alloc(12)); d.setAuthTag(Buffer.alloc(16)); d.update("aa", "hex"); d.final(); },
+		  () => crypto.createCipheriv("aes-128-gcm", Buffer.alloc(16), Buffer.alloc(12)).getAuthTag(),
+		].map((f) => { try { f(); return "no error"; } catch (e) { return e.name + ":" + (e.code || "") + ":" + e.message; } });
+		out.info = [crypto.getCipherInfo("aes-256-gcm"), crypto.getCipherInfo(419), crypto.getCipherInfo("aes-128-ccm", { ivLength: 7 }), crypto.getCipherInfo("aes-128-cbc", { ivLength: 7 })];
+		const s = crypto.createDecipheriv("aes-128-ctr", Buffer.alloc(16), Buffer.alloc(16));
+		const chunks = [];
+		s.on("data", (d) => chunks.push(d));
+		s.write(Buffer.from("00ff", "hex"));
+		s.end(Buffer.from("10", "hex"));
+		await new Promise((r) => setTimeout(r, 0));
+		out.stream = Buffer.concat(chunks).toString("hex");
+		JSON.stringify(out)
+	`)
+	want := `{"modes":["FjWXSwMXlbySHrdxQk+xsDOkC6xWbcNJnTZZs69Rtbqaoge7mMEzU07Gdkxibb3Q","4zKyZSbHdGWNDkn9Gj+nVeLPJj0cMjix3cozFd6+C0KVOuTxW10gWUyCODgd7CD3","lNZij9e0MGa4UO7gDSsxG/it7b+t9oGyqP0hS7LLMOq6p8Eh8aOMU8ja/w==","lNZij9e0MGa4UO7gDSsxG3NTWpHnxTGX7KBM4Cd3cg/PFrfZPwa0PL/+Xg==","lJfCE40N70VycypiWCGQo+bZF3nrqtdZRpRtiYn/W9sNnMD9rDh77VmL+A==","or68aa33fsjoiN/DLW3a/l7dO7yZarhY9rLM9rCJI+oMLVh39lrjK2RNjQ==","lNZij9e0MGa4UO7gDSsxG53ujEYv6yyG0xeSF+uExzgrm7Fkk4v1rxeoMw==","0EnoKjgGGE08NxbG5sHlPE7a5TdGsfdIi3VFkA+ZMqcao8GclUFk8j+yBQ==:41191da21f9641f0e7c35eef572bab5d"],"ccm":"a37bdd437a2bc3f562549ef19f6a5329babab889a9f99995753c9f56dae6a56f2c498c367c1fbc703bf1cc:7c9a5984d7ed2ee599df286d","chachaPoly":"snSXDvzWgbkaDYuLvPyKCercFC3p3xCjZ6R0y5DkZKi7dtmZWnR_mbKkWA:1cd4b64a561e6272282558b04237042e","chacha":"0894916cb1a1724b6451f8bd91e0115d5a2003cf74fcb42098bbd09b4eab4d0e18801535b8c18d4b4b2bca","wrap":"85d0cc2cded554f89eb523ca8ade0231d52887a1073d64c16a97b52b3d51c684","wrapPad":"0bf103d8eaf785e8775bb2fc4450052e800325553a7275d8","des3":"6700d8cc46c956b200daca4a8d42519553b002a93db71c4ab36c29380da54471d22e72f5fa9f1f6f0cb076550b5296c5","errs":["RangeError:ERR_CRYPTO_INVALID_KEYLEN:Invalid key length","TypeError:ERR_CRYPTO_INVALID_IV:Invalid initialization vector","Error:ERR_CRYPTO_UNKNOWN_CIPHER:Unknown cipher","TypeError:ERR_CRYPTO_INVALID_AUTH_TAG:authTagLength required for aes-128-ccm","Error:ERR_OSSL_BAD_DECRYPT:error:1C800064:Provider routines::bad decrypt","Error:ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH:error:1C80006B:Provider routines::wrong final block length","Error::Unsupported state or unable to authenticate data","Error:ERR_CRYPTO_INVALID_STATE:Invalid state for operation getAuthTag"],"info":[{"mode":"gcm","name":"id-aes256-gcm","nid":901,"keyLength":32,"blockSize":1,"ivLength":12},{"mode":"cbc","name":"aes-128-cbc","nid":419,"keyLength":16,"blockSize":16,"ivLength":16},{"mode":"ccm","name":"id-aes128-ccm","nid":896,"keyLength":16,"blockSize":1,"ivLength":7},null],"stream":"66165b"}`
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}

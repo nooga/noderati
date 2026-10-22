@@ -208,6 +208,16 @@ function encodeOutput(buf, enc) {
   return buf.toString(e);
 }
 
+// inheritStream wires a function constructor under a stream class. The
+// explicit length restore works around paserati reporting the base
+// class's length for F after Object.setPrototypeOf(F, Transform).
+function inheritStream(F, Base) {
+  const len = F.length;
+  Object.setPrototypeOf(F.prototype, Base.prototype);
+  Object.setPrototypeOf(F, Base);
+  if (F.length !== len) Object.defineProperty(F, "length", { value: len, configurable: true });
+}
+
 function defer(fn) {
   if (typeof setImmediate === "function") setImmediate(fn);
   else setTimeout(fn, 0);
