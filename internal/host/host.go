@@ -33,6 +33,7 @@ func New(argv []string) *driver.Paserati {
 	installFSLazyExtras(p)
 	installURLExports(p)
 	installFileGlobal(p)
+	installStreamWebGlobals(p)
 	installMessagePortGlobal(p)
 	installEventGlobals(p)
 	installWebAssemblyGlobal(p)

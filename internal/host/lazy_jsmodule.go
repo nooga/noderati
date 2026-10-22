@@ -26,23 +26,57 @@ func (l *lazyJSModule) get(name string) (vm.Value, error) {
 		if err == nil && rec.GetError() != nil {
 			err = rec.GetError()
 		}
-		if err == nil && len(rec.GetExportValues()) == 0 {
-			if _, loadErrs, runErrs := l.p.RunModuleWithValue(l.spec); len(loadErrs) > 0 {
-				err = loadErrs[0]
-			} else if len(runErrs) > 0 {
-				err = runErrs[0]
-			}
+		var vals map[string]vm.Value
+		if err == nil {
+			vals, err = shimModuleExports(l.p, l.spec, rec)
 		}
 		if err != nil {
 			l.err = fmt.Errorf("noderati: loading %s: %v", l.spec, err)
 		} else {
-			l.exports = rec.GetExportValues()
+			l.exports = vals
 		}
 	}
 	if l.err != nil {
 		return vm.Undefined, l.err
 	}
 	return l.exports[name], nil
+}
+
+// shimModuleExports returns the exports of a text module the host loads
+// directly (require() of a JS shim, lazily loaded shim exports), running it
+// first if nothing has yet. It goes through the VM's own module table
+// (GetModuleExport executes a module at most once) rather than
+// RunModuleWithValue, which interprets the chunk without recording it
+// there: with that, a shim reached both by require() and by an ESM import
+// (the stream/promises shim's own `import Stream from "stream"`, or an ESM
+// app whose CJS dependencies require() the same builtin) had its body run
+// twice over the same bindings - re-creating every top-level function, so
+// instances made from the first run's classes stopped being instanceof the
+// "same" class.
+func shimModuleExports(p *driver.Paserati, spec string, rec vm.ModuleRecord) (map[string]vm.Value, error) {
+	if vals := rec.GetExportValues(); len(vals) > 0 {
+		return vals, nil
+	}
+	vmInst := p.GetVM()
+	names := rec.GetExportNames()
+	if len(names) == 0 {
+		for name := range rec.GetExportIndices() {
+			names = append(names, name)
+		}
+	}
+	vals := make(map[string]vm.Value, len(names))
+	defined := false
+	for _, name := range names {
+		v := vmInst.GetModuleExport("", spec, name)
+		vals[name] = v
+		if !v.IsUndefined() {
+			defined = true
+		}
+	}
+	if len(names) > 0 && !defined {
+		return nil, fmt.Errorf("module %s failed to evaluate", spec)
+	}
+	return vals, nil
 }
 
 // installLazyJSExports adds each of names, implemented by the JS shim spec,

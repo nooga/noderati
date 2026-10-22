@@ -39,6 +39,7 @@ var nativeRequireNames = map[string]bool{
 	"module":      true, "worker_threads": true,
 	"perf_hooks": true, "string_decoder": true,
 	"stream/promises": true, "constants": true,
+	"stream/web": true, "stream/consumers": true,
 	"diagnostics_channel": true,
 	"v8":                  true,
 	"vm":                  true,
@@ -521,16 +522,10 @@ func (l *cjsLoader) requireNative(spec string) (vm.Value, error) {
 	// collection — fixed upstream now, verified via debug instrumentation
 	// that ExportValues comes back populated after this call, so the
 	// fallback was deleted rather than left as unreachable insurance.)
-	if len(rec.GetExportValues()) == 0 {
-		if _, loadErrs, runErrs := l.p.RunModuleWithValue(spec); len(loadErrs) > 0 || len(runErrs) > 0 {
-			if len(loadErrs) > 0 {
-				return vm.Undefined, fmt.Errorf("%s", loadErrs[0].Error())
-			}
-			return vm.Undefined, fmt.Errorf("%s", runErrs[0].Error())
-		}
+	vals, err := shimModuleExports(l.p, spec, rec)
+	if err != nil {
+		return vm.Undefined, err
 	}
-
-	vals := rec.GetExportValues()
 	var ns vm.Value
 	if def, ok := vals["default"]; ok && !def.IsUndefined() && def.Type() != vm.TypeNull {
 		ns = def
