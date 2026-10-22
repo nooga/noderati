@@ -85,6 +85,35 @@ func declareV8(p *driver.Paserati) {
 			ns.Function("setDeserializeMainFunction", func(vm.Value) {})
 		})
 
+		// requireBuiltin loads another builtin on demand, so the v8 module
+		// itself stays cheap to import (jiti requires it at startup).
+		m.Function("requireBuiltin", func(spec string) (vm.Value, error) {
+			return (&lazyJSModule{p: p, spec: spec}).get("default")
+		})
+		m.Function("heapSpaceSizes", func() map[string]float64 {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			return map[string]float64{
+				"heapSys": float64(ms.HeapSys), "heapInuse": float64(ms.HeapInuse), "heapAlloc": float64(ms.HeapAlloc),
+				"stackInuse": float64(ms.StackInuse), "stackSys": float64(ms.StackSys),
+				"numGC": float64(ms.NumGC), "pauseTotalNs": float64(ms.PauseTotalNs),
+			}
+		})
+		// gcPauses(since) returns the pause durations (ns) of every GC
+		// cycle after cycle number since that is still in the runtime's
+		// 256-entry ring.
+		m.Function("gcPauses", func(since float64) []float64 {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			var out []float64
+			for n := uint32(since) + 1; n <= ms.NumGC; n++ {
+				if ms.NumGC-n >= 256 {
+					continue
+				}
+				out = append(out, float64(ms.PauseNs[(n+255)%256]))
+			}
+			return out
+		})
 		m.Default(nil)
 	})
 }
